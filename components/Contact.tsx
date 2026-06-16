@@ -9,7 +9,7 @@ export default function Contact() {
     setStatus('sending')
     const form = e.currentTarget
     const data = new FormData(form)
-    const res = await fetch('https://formspree.io/f/bmethan@gmail.com', {
+    const res = await fetch('https://formspree.io/f/mwvjzyqj', {
       method: 'POST',
       body: data,
       headers: { Accept: 'application/json' },

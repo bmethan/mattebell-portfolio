@@ -85,7 +85,7 @@ export default function About({ settings }: { settings: Settings }) {
           ))}
 
           <a
-            href={settings?.resumeUrl || '/resume.pdf'}
+            href={settings?.resumeUrl || '/mbresume_2026.pdf'}
             download
             style={{
               display: 'inline-flex', alignItems: 'center', gap: 8, marginTop: 28,

@@ -32,7 +32,7 @@ export default function Hero() {
       <p style={{ fontSize: 15, color: 'var(--text-muted)', maxWidth: 580, lineHeight: 1.8, marginBottom: 40 }}>
         Crafting worlds for film and television since 1998.{' '}
         <strong style={{ color: '#b4b2a9', fontWeight: 500 }}>Specialist in lighting and look development</strong>
-        {' '}— and a trusted generalist across the full pipeline, from environment builds and FX to final comp. Bringing vision to screen across 27 years of feature film and episodic television.
+        {', and a trusted generalist across the full pipeline - from environment builds and FX to final comp. Bringing vision to screen across 27 years of feature film and episodic television.'}
       </p>
 
       <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>

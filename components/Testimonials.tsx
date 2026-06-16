@@ -1,6 +1,16 @@
 const DEFAULT_TESTIMONIALS = [
-  { quote: 'One of the most technically rigorous and creatively driven VFX artists I\'ve had the pleasure of working with. The work speaks for itself.', name: 'Your collaborator\'s name', title: 'Director / VFX Supervisor', initials: '—' },
-  { quote: 'Brings an exceptional command of both the technical and artistic sides of production. An invaluable collaborator on any effects-heavy project.', name: 'Your collaborator\'s name', title: 'VFX Producer / Supervisor', initials: '—' },
+  {
+    quote: 'Matt showed excellent Look Development and Lighting skills on Real Steel working in Maya/V-Ray. He was able to quickly hit the ground running and lookdev a large number of photo real robots under an extremely tight deadline. He was given a sequence of 50 shots to setup master lighting and compositing templates, and also managed a small team underneath him. His attitude, pride and attention to detail showed me just how passionate he is about Visual Effects. It\'s been a great pleasure working with Matt — I would highly recommend him to anyone looking for a Senior level Lighting / Look Development Artist.',
+    name: 'Isaac Irvin',
+    title: 'VFX / CG Supervisor & AI Workflow Specialist',
+    initials: 'II',
+  },
+  {
+    quote: 'Matt Bell and I studied at Savannah College of Art and Design and went on to be lighters on various projects at Digital Domain. After 3 features and 1 commercial together I can safely say that Matt knows his stuff. He practically did an entire character sequence on Star Trek by himself: Modeling, Texture, Look-Dev, Lighting... He can cross over 3D packages and has the skills and experience to know which is best suited for the task at hand. Very professional and a good generalist as well. This is a guy who is in it for the love of the art!',
+    name: 'Kevin Sears',
+    title: 'CG Supervisor | Framestore Montreal',
+    initials: 'KS',
+  },
 ]
 
 type Testimonial = { quote: string; name: string; title: string; initials: string }

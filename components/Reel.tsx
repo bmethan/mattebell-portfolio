@@ -1,4 +1,7 @@
+const DEFAULT_REEL = 'https://player.vimeo.com/video/357635744?h=896815367e'
+
 export default function Reel({ reelUrl }: { reelUrl?: string }) {
+  reelUrl = reelUrl || DEFAULT_REEL
   return (
     <section id="reel" style={{ background: 'var(--bg-card)', borderBottom: '0.5px solid var(--border)' }}>
       <div style={{

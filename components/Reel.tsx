@@ -1,4 +1,4 @@
-const DEFAULT_REEL = 'https://player.vimeo.com/video/357635744?h=896815367e'
+const DEFAULT_REEL = 'https://player.vimeo.com/video/357635744?h=896815367e&title=0&byline=0&portrait=0'
 
 export default function Reel({ reelUrl }: { reelUrl?: string }) {
   reelUrl = reelUrl || DEFAULT_REEL

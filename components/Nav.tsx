@@ -19,13 +19,14 @@ export default function Nav({ available }: { available: boolean }) {
           }}>{item}</a>
         ))}
       </div>
-      <div style={{
+      <a href="#contact" style={{
         fontSize: 12, letterSpacing: '0.08em', textTransform: 'uppercase',
         border: '0.5px solid var(--text-ghost)', padding: '8px 20px',
         color: available ? 'var(--accent)' : 'var(--text-muted)',
+        textDecoration: 'none', cursor: 'pointer',
       }}>
         {available ? 'Available for hire' : 'Currently unavailable'}
-      </div>
+      </a>
     </nav>
   )
 }

@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0a0a0b;
+  --bg-alt: #0d0d10;
+  --bg-card: #111114;
+  --bg-teal: #0d1a16;
+  --border: #2a2a2e;
+  --border-subtle: #1e1e22;
+  --border-teal: #0F6E56;
+  --accent: #5DCAA5;
+  --text: #e8e6e0;
+  --text-bright: #f0ede8;
+  --text-muted: #888780;
+  --text-dim: #5F5E5A;
+  --text-ghost: #3a3a3e;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent); color: var(--bg); }
+.work-card:hover { background: var(--bg-card) !important; }

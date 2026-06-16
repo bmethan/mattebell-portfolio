@@ -1,10 +1,10 @@
 const DEFAULT_CARDS = [
-  { title: 'Ready Player One', year: '2018', type: 'Feature film', badge: 'Spielberg', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬' },
-  { title: 'Iron Man 3', year: '2013', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬' },
-  { title: 'Real Steel', year: '2011', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬' },
-  { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬' },
-  { title: 'The Flash', year: '2021–23', type: 'Television series', badge: '', role: 'Sequence Lighting', studio: 'Zoic Studios', icon: '📺' },
-  { title: 'Walmart — Famous Visitors', year: '2021', type: 'Commercial', badge: 'VES Award — Outstanding VFX in a Commercial', role: 'Senior VFX Artist', studio: 'The Mill LA', icon: '📢' },
+  { title: 'Ready Player One', year: '2018', type: 'Feature film', badge: 'Spielberg', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '' },
+  { title: 'Iron Man 3', year: '2013', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '' },
+  { title: 'Real Steel', year: '2011', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬', image: '' },
+  { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬', image: '' },
+  { title: 'The Flash', year: '2021–23', type: 'Television series', badge: '', role: 'Sequence Lighting', studio: 'Zoic Studios', icon: '📺', image: '' },
+  { title: 'Walmart — Famous Visitors', year: '2021', type: 'Commercial', badge: 'VES Award — Outstanding VFX in a Commercial', role: 'Senior VFX Artist', studio: 'The Mill LA', icon: '📢', image: '/images/walmart-famous-visitors.jpg' },
 ]
 
 type Card = {
@@ -14,6 +14,7 @@ type Card = {
   badge?: string
   role: string
   studio: string
+  image?: string
 }
 
 function WorkCard({ card }: { card: Card }) {
@@ -25,8 +26,12 @@ function WorkCard({ card }: { card: Card }) {
         width: '100%', aspectRatio: '16/9', background: 'var(--bg-card)',
         marginBottom: 20, display: 'flex', alignItems: 'center', justifyContent: 'center',
         border: '0.5px solid var(--border-subtle)', fontSize: 28, color: 'var(--border)',
+        overflow: 'hidden', position: 'relative',
       }}>
-        ◻
+        {card.image
+          ? <img src={card.image} alt={card.title} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+          : <span>◻</span>
+        }
       </div>
       <div style={{ position: 'absolute', top: 28, right: 28, fontSize: 11, color: 'var(--text-ghost)', letterSpacing: '0.06em' }}>
         {card.year}

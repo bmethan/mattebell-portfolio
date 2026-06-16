@@ -14,7 +14,13 @@ export default function Contact() {
       body: data,
       headers: { Accept: 'application/json' },
     })
-    setStatus(res.ok ? 'sent' : 'error')
+    if (res.ok) {
+      form.reset()
+      setStatus('sent')
+      setTimeout(() => setStatus('idle'), 5000)
+    } else {
+      setStatus('error')
+    }
   }
 
   return (

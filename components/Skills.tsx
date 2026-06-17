@@ -93,8 +93,8 @@ export default function Skills() {
             {group.skills.map(s => (
               <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                 <span style={{ fontSize: 13, color: '#b4b2a9' }}>{s.name}</span>
-                <div style={{ width: 80, height: 1, background: 'var(--border)' }}>
-                  <div style={{ width: `${s.pct}%`, height: '100%', background: group.rnd ? '#444441' : 'var(--accent)' }} />
+                <div style={{ width: 80, height: 2, background: 'var(--border)' }}>
+                  <div style={{ width: `${s.pct}%`, height: 2, background: group.rnd ? '#444441' : 'var(--accent)' }} />
                 </div>
               </div>
             ))}

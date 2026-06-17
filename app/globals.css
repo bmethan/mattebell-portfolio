@@ -25,3 +25,71 @@ body {
 }
 ::selection { background: var(--accent); color: var(--bg); }
 .work-card:hover { background: var(--bg-card) !important; }
+
+/* ─── Responsive ─────────────────────────────────────────── */
+
+/* Nav */
+.nav-links { display: flex; }
+.nav-hamburger { display: none; }
+.nav-mobile-menu {
+  display: none;
+  flex-direction: column;
+  gap: 0;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: var(--bg);
+  border-bottom: 0.5px solid var(--border);
+  z-index: 100;
+}
+.nav-mobile-menu.open { display: flex; }
+.nav-mobile-menu a {
+  padding: 16px 24px;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-bottom: 0.5px solid var(--border-subtle);
+}
+
+/* Two-col grids that collapse to one */
+.grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); }
+.grid-2col-gap { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; align-items: start; }
+.grid-2col-contact { display: grid; grid-template-columns: 1fr 1fr; gap: 80px; }
+
+/* Four-col grids that collapse */
+.grid-4col { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--border); }
+
+/* Section padding */
+.section-pad { padding: 72px 48px; }
+.nav-pad { padding: 20px 48px; }
+.hero-pad { padding: 80px 48px 64px; }
+.footer-pad { padding: 24px 48px; display: flex; justify-content: space-between; align-items: center; }
+
+@media (max-width: 768px) {
+  /* Nav */
+  .nav-pad { padding: 16px 20px; position: relative; flex-wrap: wrap; }
+  .nav-links { display: none; }
+  .nav-hamburger { display: flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; padding: 4px; color: var(--text-muted); }
+
+  /* Sections */
+  .section-pad { padding: 48px 20px; }
+  .hero-pad { padding: 48px 20px 40px; }
+
+  /* Grids → single column */
+  .grid-2col { grid-template-columns: 1fr; }
+  .grid-2col-gap { grid-template-columns: 1fr; gap: 40px; }
+  .grid-2col-contact { grid-template-columns: 1fr; gap: 40px; }
+  .grid-4col { grid-template-columns: 1fr 1fr; }
+
+  /* Footer */
+  .footer-pad { padding: 24px 20px; flex-direction: column; gap: 16px; text-align: center; }
+
+  /* Reel label bar */
+  .reel-bar { padding: 14px 20px !important; }
+
+  /* Contact name/email row */
+  .contact-name-email { grid-template-columns: 1fr !important; }
+}

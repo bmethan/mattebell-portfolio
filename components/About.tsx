@@ -42,7 +42,7 @@ export default function About({ settings }: { settings: Settings }) {
   ]
 
   return (
-    <section id="about" style={{ padding: '72px 48px', borderBottom: '0.5px solid var(--border)' }}>
+    <section id="about" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
       <div style={{ marginBottom: 40 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
           <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
@@ -51,7 +51,7 @@ export default function About({ settings }: { settings: Settings }) {
         <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em' }}>About & experience</h2>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 64, alignItems: 'start' }}>
+      <div className="grid-2col-gap">
         <div>
           {bio.map((p, i) => (
             <p key={i} style={{ fontSize: 15, color: 'var(--text-muted)', lineHeight: 1.8, marginBottom: 16 }}

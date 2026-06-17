@@ -58,7 +58,7 @@ export default function Work({ cards }: { cards: Card[] }) {
   const display = cards?.length > 0 ? cards : DEFAULT_CARDS
 
   return (
-    <section id="work" style={{ padding: '72px 48px', borderBottom: '0.5px solid var(--border)' }}>
+    <section id="work" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 40 }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
@@ -71,7 +71,7 @@ export default function Work({ cards }: { cards: Card[] }) {
           All credits →
         </a>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
+      <div className="grid-2col">
         {display.map((card, i) => <WorkCard key={i} card={card} />)}
       </div>
     </section>

@@ -24,8 +24,8 @@ export default function Contact() {
   }
 
   return (
-    <section id="contact" style={{ padding: '72px 48px', borderBottom: '0.5px solid var(--border)', background: 'var(--bg-card)' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 80 }}>
+    <section id="contact" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)', background: 'var(--bg-card)' }}>
+      <div className="grid-2col-contact">
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
             <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
@@ -63,7 +63,7 @@ export default function Contact() {
         </div>
 
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div className="contact-name-email" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             {[{ name: 'name', label: 'Name', type: 'text', placeholder: 'Your name' }, { name: 'email', label: 'Email', type: 'email', placeholder: 'your@email.com' }].map(f => (
               <div key={f.name} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <label style={{ fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>{f.label}</label>

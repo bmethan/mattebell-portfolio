@@ -56,7 +56,7 @@ const skillGroups = [
 
 export default function Skills() {
   return (
-    <section id="skills" style={{ padding: '72px 48px', borderBottom: '0.5px solid var(--border)', background: 'var(--bg-alt)' }}>
+    <section id="skills" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)', background: 'var(--bg-alt)' }}>
       <div style={{ marginBottom: 40 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
           <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
@@ -66,7 +66,7 @@ export default function Skills() {
       </div>
 
       {/* Primary disciplines */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 1, background: 'var(--border)', marginBottom: 1 }}>
+      <div className="grid-4col" style={{ marginBottom: 1 }}>
         {primary.map(d => (
           <div key={d.label} style={{ background: 'var(--bg-teal)', padding: '16px 20px' }}>
             <div style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 4 }}>{d.label}</div>
@@ -76,7 +76,7 @@ export default function Skills() {
       </div>
 
       {/* Secondary disciplines */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 1, background: 'var(--border)', marginBottom: 32 }}>
+      <div className="grid-4col" style={{ marginBottom: 32 }}>
         {secondary.map(d => (
           <div key={d} style={{ background: 'var(--bg)', padding: '16px 20px' }}>
             <div style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>{d}</div>
@@ -85,7 +85,7 @@ export default function Skills() {
       </div>
 
       {/* Skill bars */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
+      <div className="grid-2col">
         {skillGroups.map(group => (
           <div key={group.cat} style={{ background: 'var(--bg)', padding: '24px 28px' }}>
             <div style={{ fontSize: 10, letterSpacing: '0.14em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4 }}>{group.cat}</div>

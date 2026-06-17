@@ -26,7 +26,7 @@ export default function Reel({ reelUrl }: { reelUrl?: string }) {
           </div>
         )}
       </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 48px' }}>
+      <div className="reel-bar" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 48px' }}>
         <span style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>2024 Showreel</span>
         <a href="https://vimeo.com/user6348780" target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-dim)', textDecoration: 'none' }}>
           ↓ Download reel

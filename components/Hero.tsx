@@ -8,8 +8,8 @@ const stats = [
 
 export default function Hero() {
   return (
-    <section id="hero" style={{
-      padding: '80px 48px 64px', borderBottom: '0.5px solid var(--border)',
+    <section id="hero" className="hero-pad" style={{
+      borderBottom: '0.5px solid var(--border)',
       position: 'relative', overflow: 'hidden',
     }}>
       {/* grid bg */}

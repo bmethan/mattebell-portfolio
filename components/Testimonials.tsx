@@ -19,7 +19,7 @@ export default function Testimonials({ items }: { items: Testimonial[] }) {
   const display = items?.length > 0 ? items : DEFAULT_TESTIMONIALS
 
   return (
-    <section id="testimonials" style={{ padding: '72px 48px', borderBottom: '0.5px solid var(--border)', background: 'var(--bg-alt)' }}>
+    <section id="testimonials" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)', background: 'var(--bg-alt)' }}>
       <div style={{ marginBottom: 40 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
           <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
@@ -27,7 +27,7 @@ export default function Testimonials({ items }: { items: Testimonial[] }) {
         </div>
         <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em' }}>What collaborators say</h2>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, background: 'var(--border)' }}>
+      <div className="grid-2col">
         {display.map((t, i) => (
           <div key={i} style={{ background: 'var(--bg)', padding: 32 }}>
             <p style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.8, marginBottom: 24, fontStyle: 'italic' }}>

@@ -1,9 +1,6 @@
 export default function Footer() {
   return (
-    <footer style={{
-      padding: '24px 48px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-      borderTop: '0.5px solid var(--border)',
-    }}>
+    <footer className="footer-pad" style={{ borderTop: '0.5px solid var(--border)' }}>
       <div style={{ fontSize: 11, color: 'var(--text-ghost)', letterSpacing: '0.06em' }}>
         &copy; {new Date().getFullYear()} Matthew Bell. All rights reserved.
       </div>

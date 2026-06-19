@@ -8,6 +8,7 @@ import Testimonials from '@/components/Testimonials'
 import Contact from '@/components/Contact'
 import Footer from '@/components/Footer'
 import { getWorkCards, getTestimonials, getSettings } from '@/sanity/lib/client'
+import { getYearsExperience } from '@/lib/yearsExperience'
 
 export const revalidate = 60
 
@@ -18,14 +19,16 @@ export default async function Home() {
     getSettings(),
   ])
 
+  const years = getYearsExperience()
+
   return (
     <main>
       <Nav available={settings?.available ?? true} />
-      <Hero />
+      <Hero years={years} />
       <Reel reelUrl={settings?.reelUrl} />
       <Work cards={workCards} />
       <Skills />
-      <About settings={settings} />
+      <About settings={settings} years={years} />
       <Testimonials items={testimonials} />
       <Contact />
       <Footer />

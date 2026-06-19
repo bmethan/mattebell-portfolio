@@ -26,19 +26,20 @@ type Settings = {
   resumeUrl?: string
 }
 
-const DEFAULT_BIO = [
-  '<strong>Matthew Bell.</strong> Creative Technologist and Senior VFX Artist with 27 years across feature film, episodic television, commercials, and real-time production. Core specialist in lighting and look development — trusted generalist across the full pipeline.',
+const DEFAULT_BIO = (years: number) => [
+  `<strong>Matthew Bell.</strong> Creative Technologist and Senior VFX Artist with ${years} years across feature film, episodic television, commercials, and real-time production. Core specialist in lighting and look development — trusted generalist across the full pipeline.`,
   'Lighting and look development lead on three Oscar-nominated productions — Iron Man 3, Real Steel, and Star Trek — with credits spanning Digital Domain, MPC, The Mill, Method Studios, Zero VFX, Zoic Studios, and more.',
   "Senior artist on the VES Award-winning Walmart 'Famous Visitors' — Outstanding Visual Effects in a Commercial, 2021. Also available for VFX consultation across visualization, real-time pipeline, and UI/UX strategy. Open to remote and on-location engagements worldwide.",
   'Actively exploring generative AI workflows — including ComfyUI and Stable Diffusion pipelines — for pitch development and personal R&D, with an eye toward production integration as the toolset matures.',
 ]
 
-export default function About({ settings }: { settings: Settings }) {
+export default function About({ settings, years }: { settings: Settings; years: number }) {
+  const defaultBio = DEFAULT_BIO(years)
   const bio = [
-    settings?.bio || DEFAULT_BIO[0],
-    settings?.bio2 || DEFAULT_BIO[1],
-    settings?.bio3 || DEFAULT_BIO[2],
-    settings?.bio4 || DEFAULT_BIO[3],
+    settings?.bio || defaultBio[0],
+    settings?.bio2 || defaultBio[1],
+    settings?.bio3 || defaultBio[2],
+    settings?.bio4 || defaultBio[3],
   ]
 
   return (

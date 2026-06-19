@@ -11,6 +11,7 @@ type Card = {
   badge?: string
   role: string
   studio: string
+  icon?: string
   image?: string
   modal?: Modal
 }

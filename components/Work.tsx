@@ -31,9 +31,9 @@ const DEFAULT_CARDS: Card[] = [
     role: 'Senior VFX Artist', studio: 'The Mill LA', icon: '📢',
     image: '/images/walmart-famous-visitors.jpg',
     modal: {
-      blurb: 'This commercial was an absolute blast to work on. I was involved with the LEGO and Blade Runner portions of the spot — and as a lifelong LEGO fan, getting to work on the LEGO characters and spaceship really brought out my inner kid. I was responsible for the look development of the LEGO assets and the Spinner from Blade Runner, as well as the shot lighting for the Spinner and all volumetrics.',
+      blurb: 'This commercial was an absolute blast to work on. I was involved with the LEGO and Blade Runner portions of the spot, and as a lifelong LEGO fan, getting to work on the LEGO characters and spaceship really brought out my inner kid. I was responsible for the look development of the LEGO assets and the Spinner from Blade Runner, as well as the shot lighting for the Spinner and all volumetrics.',
       clips: [
-        { label: 'The Spot', url: VIMEO('1202709086') },
+        { label: 'Commercial Extended Cut', url: VIMEO('1202709086') },
         { label: 'Behind the Scenes', url: VIMEO('1202709087') },
       ],
     },

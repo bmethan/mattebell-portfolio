@@ -59,7 +59,7 @@ function WorkModal({ card, onClose }: { card: Card; onClose: () => void }) {
       onClick={onClose}
       style={{
         position: 'fixed', inset: 0, zIndex: 200,
-        background: 'rgba(0,0,0,0.88)',
+        background: 'var(--overlay)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         padding: '24px',
       }}
@@ -174,7 +174,7 @@ function WorkCard({ card, onClick }: { card: Card; onClick?: () => void }) {
           <div style={{
             position: 'absolute', bottom: 10, right: 10,
             fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase',
-            background: 'rgba(10,10,11,0.8)', color: 'var(--accent)',
+            background: 'var(--overlay-panel)', color: 'var(--accent)',
             border: '0.5px solid var(--border-teal)', padding: '4px 8px',
           }}>
             Learn more

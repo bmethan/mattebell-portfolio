@@ -93,9 +93,9 @@ export default function Skills() {
             <div style={{ fontSize: 11, color: 'var(--text-ghost)', marginBottom: 16, fontStyle: 'italic' }}>{group.desc}</div>
             {group.skills.map(s => (
               <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-                <span style={{ fontSize: 13, color: '#b4b2a9' }}>{s.name}</span>
+                <span style={{ fontSize: 13, color: 'var(--text-soft)' }}>{s.name}</span>
                 <div style={{ width: 80, height: 2, background: 'var(--border)' }}>
-                  <div style={{ width: `${s.pct}%`, height: 2, background: group.rnd ? '#444441' : 'var(--accent)' }} />
+                  <div style={{ width: `${s.pct}%`, height: 2, background: group.rnd ? 'var(--bar-dim)' : 'var(--accent)' }} />
                 </div>
               </div>
             ))}

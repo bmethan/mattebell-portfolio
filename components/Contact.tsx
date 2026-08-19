@@ -48,7 +48,7 @@ export default function Contact() {
             <div key={item.text} style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16, fontSize: 13, color: 'var(--text-muted)' }}>
               <span style={{
                 fontSize: item.icon === 'IMDb' ? 8 : item.icon === 'in' ? 10 : 14,
-                color: item.icon === 'IMDb' ? '#04342C' : 'var(--accent)',
+                color: item.icon === 'IMDb' ? 'var(--on-accent)' : 'var(--accent)',
                 background: item.icon === 'IMDb' ? 'var(--accent)' : 'transparent',
                 padding: item.icon === 'IMDb' ? '1px 3px' : 0,
                 fontWeight: 500,
@@ -81,13 +81,13 @@ export default function Contact() {
             <textarea name="message" placeholder="Tell me about your project..." required rows={5} style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', padding: '10px 14px', fontSize: 13, color: 'var(--text)', outline: 'none', resize: 'none', fontFamily: 'inherit' }} />
           </div>
           <button type="submit" disabled={status === 'sending' || status === 'sent'} style={{
-            background: 'var(--accent)', color: '#04342C', fontSize: 12, letterSpacing: '0.1em',
+            background: 'var(--accent)', color: 'var(--on-accent)', fontSize: 12, letterSpacing: '0.1em',
             textTransform: 'uppercase', padding: 12, fontWeight: 500, border: 'none', cursor: 'pointer',
             fontFamily: 'inherit', marginTop: 4, opacity: status === 'sending' ? 0.7 : 1,
           }}>
             {status === 'sent' ? 'Message sent!' : status === 'sending' ? 'Sending...' : 'Send message'}
           </button>
-          {status === 'error' && <p style={{ fontSize: 12, color: '#e05c5c' }}>Something went wrong. Please email directly at bmethan@gmail.com</p>}
+          {status === 'error' && <p style={{ fontSize: 12, color: 'var(--danger)' }}>Something went wrong. Please email directly at bmethan@gmail.com</p>}
         </form>
       </div>
     </section>

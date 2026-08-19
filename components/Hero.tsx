@@ -66,7 +66,7 @@ export default function Hero({ years }: { years: number }) {
     }}>
       <div style={{
         position: 'absolute', inset: 0, opacity: 0.04, pointerEvents: 'none',
-        backgroundImage: 'linear-gradient(#888 1px, transparent 1px), linear-gradient(90deg, #888 1px, transparent 1px)',
+        backgroundImage: 'linear-gradient(var(--grid-line) 1px, transparent 1px), linear-gradient(90deg, var(--grid-line) 1px, transparent 1px)',
         backgroundSize: '48px 48px',
       }} />
 
@@ -80,14 +80,14 @@ export default function Hero({ years }: { years: number }) {
 
       <p style={{ fontSize: 15, color: 'var(--text-muted)', maxWidth: 580, lineHeight: 1.8, marginBottom: 40 }}>
         Crafting worlds for film and television since 1998.{' '}
-        <strong style={{ color: '#b4b2a9', fontWeight: 500 }}>Specialist in lighting and look development</strong>
+        <strong style={{ color: 'var(--text-soft)', fontWeight: 500 }}>Specialist in lighting and look development</strong>
         {', and a trusted generalist across the full pipeline - from environment builds and FX to final comp. Bringing vision to screen across '}
         {years} years of feature film and episodic television.
       </p>
 
       <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
         <a href="#reel" style={{
-          background: 'var(--accent)', color: '#04342C', fontSize: 12,
+          background: 'var(--accent)', color: 'var(--on-accent)', fontSize: 12,
           letterSpacing: '0.1em', textTransform: 'uppercase', padding: '12px 28px',
           fontWeight: 500, textDecoration: 'none', display: 'inline-block',
         }}>View showreel</a>

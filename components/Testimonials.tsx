@@ -41,7 +41,7 @@ export default function Testimonials({ items }: { items: Testimonial[] }) {
                 fontSize: 11, color: 'var(--text-dim)', fontWeight: 500,
               }}>{t.initials}</div>
               <div>
-                <div style={{ fontSize: 12, fontWeight: 500, color: '#b4b2a9' }}>{t.name}</div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-soft)' }}>{t.name}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{t.title}</div>
               </div>
             </div>

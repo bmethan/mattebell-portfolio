@@ -9,11 +9,18 @@
   --border-subtle: #1e1e22;
   --border-teal: #0F6E56;
   --accent: #5DCAA5;
+  --on-accent: #04342C;
   --text: #e8e6e0;
   --text-bright: #f0ede8;
+  --text-soft: #b4b2a9;
   --text-muted: #888780;
   --text-dim: #5F5E5A;
   --text-ghost: #3a3a3e;
+  --danger: #e05c5c;
+  --bar-dim: #444441;
+  --grid-line: #888;
+  --overlay: rgba(0, 0, 0, 0.88);
+  --overlay-panel: rgba(10, 10, 11, 0.8);
 }
 
 * { box-sizing: border-box; }

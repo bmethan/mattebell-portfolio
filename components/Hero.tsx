@@ -72,7 +72,7 @@ export default function Hero({ years }: { years: number }) {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 24 }}>
         <span style={{ display: 'inline-block', width: 24, height: 1, background: 'var(--accent)' }} />
-        Creative Technologist&nbsp;·&nbsp;VFX Artist
+        Creative Technologist&nbsp;·&nbsp;VFX Artist&nbsp;—
       </div>
 
       <CyclingHero years={years} />

@@ -212,7 +212,8 @@ export default function Work({ cards }: { cards?: Card[] }) {
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
             <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
-            Selected work —
+            Selected work
+            <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
           </div>
           <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em' }}>Featured projects</h2>
         </div>

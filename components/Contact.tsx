@@ -29,7 +29,8 @@ export default function Contact() {
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
             <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
-            Get in touch —
+            Get in touch
+            <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
           </div>
           <h3 style={{ fontSize: 22, fontWeight: 500, color: 'var(--text-bright)', marginBottom: 16, letterSpacing: '-0.01em' }}>
             Let&apos;s make something worth the render time.

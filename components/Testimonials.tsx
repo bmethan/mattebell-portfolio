@@ -23,7 +23,8 @@ export default function Testimonials({ items }: { items: Testimonial[] }) {
       <div style={{ marginBottom: 40 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
           <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
-          Testimonials —
+          Testimonials
+          <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
         </div>
         <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em' }}>What collaborators say</h2>
       </div>

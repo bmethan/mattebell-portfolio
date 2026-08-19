@@ -39,7 +39,7 @@ export default function Contact() {
           </p>
           {[
             { icon: '✉', text: 'bmethan@gmail.com', href: 'mailto:bmethan@gmail.com' },
-            { icon: '📍', text: 'San Antonio, TX — open to remote & on-location', href: null },
+            { icon: '📍', text: 'San Antonio, TX, open to remote and on-location', href: null },
             { icon: 'in', text: 'linkedin.com/in/mattebell', href: 'https://linkedin.com/in/mattebell' },
             { icon: 'IMDb', text: 'Matthew Bell on IMDb', href: 'https://www.imdb.com/name/nm2998873/' },
             { icon: '▶', text: 'vimeo.com/user6348780', href: 'https://vimeo.com/user6348780' },
@@ -86,7 +86,7 @@ export default function Contact() {
           }}>
             {status === 'sent' ? 'Message sent!' : status === 'sending' ? 'Sending...' : 'Send message'}
           </button>
-          {status === 'error' && <p style={{ fontSize: 12, color: '#e05c5c' }}>Something went wrong — please email directly at bmethan@gmail.com</p>}
+          {status === 'error' && <p style={{ fontSize: 12, color: '#e05c5c' }}>Something went wrong. Please email directly at bmethan@gmail.com</p>}
         </form>
       </div>
     </section>

@@ -42,7 +42,7 @@ const skillGroups = [
     rnd: false,
   },
   {
-    cat: 'Generative AI', desc: 'Active R&D — pitch & personal projects',
+    cat: 'Generative AI', desc: 'Active R&D, pitch and personal projects',
     skills: [
       { name: 'ComfyUI', pct: 80 },
       { name: 'Stable Diffusion', pct: 80 },
@@ -50,7 +50,7 @@ const skillGroups = [
       { name: 'Flux / LoRA training', pct: 70 },
     ],
     rnd: true,
-    note: 'Explored in pitch development and personal R&D. Node-based workflow experience from Houdini and Nuke transfers directly — production integration actively developing.',
+    note: 'Explored in pitch development and personal R&D. Node-based workflow experience from Houdini and Nuke transfers directly. Production integration actively developing.',
   },
 ]
 

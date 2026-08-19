@@ -26,8 +26,8 @@ const DEFAULT_CARDS: Card[] = [
   { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬', image: '/images/startrekcard.jpg' },
   { title: 'Legends of Tomorrow', year: '2021–23', type: 'Television series', badge: '', role: 'Sequence Lighting', studio: 'Zoic Studios', icon: '📺', image: '/images/lotcard.jpg' },
   {
-    title: 'Walmart — Famous Visitors', year: '2021', type: 'Commercial',
-    badge: 'VES Award — Outstanding VFX in a Commercial',
+    title: 'Walmart: Famous Visitors', year: '2021', type: 'Commercial',
+    badge: 'VES Award: Outstanding VFX in a Commercial',
     role: 'Senior VFX Artist', studio: 'The Mill LA', icon: '📢',
     image: '/images/walmart-famous-visitors.jpg',
     modal: {

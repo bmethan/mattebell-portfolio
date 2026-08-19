@@ -1,6 +1,6 @@
 const DEFAULT_TESTIMONIALS = [
   {
-    quote: 'Matt showed excellent Look Development and Lighting skills on Real Steel working in Maya/V-Ray. He was able to quickly hit the ground running and lookdev a large number of photo real robots under an extremely tight deadline. He was given a sequence of 50 shots to setup master lighting and compositing templates, and also managed a small team underneath him. His attitude, pride and attention to detail showed me just how passionate he is about Visual Effects. It\'s been a great pleasure working with Matt — I would highly recommend him to anyone looking for a Senior level Lighting / Look Development Artist.',
+    quote: 'Matt showed excellent Look Development and Lighting skills on Real Steel working in Maya/V-Ray. He was able to quickly hit the ground running and lookdev a large number of photo real robots under an extremely tight deadline. He was given a sequence of 50 shots to setup master lighting and compositing templates, and also managed a small team underneath him. His attitude, pride and attention to detail showed me just how passionate he is about Visual Effects. It\'s been a great pleasure working with Matt, and I would highly recommend him to anyone looking for a Senior level Lighting / Look Development Artist.',
     name: 'Isaac Irvin',
     title: 'VFX / CG Supervisor & AI Workflow Specialist',
     initials: 'II',

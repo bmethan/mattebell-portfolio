@@ -42,15 +42,15 @@ const skillGroups = [
     rnd: false,
   },
   {
-    cat: 'Generative AI', desc: 'Active R&D, pitch and personal projects',
+    cat: 'Generative AI', desc: 'Creative Technologist, Active R&D',
     skills: [
-      { name: 'ComfyUI', pct: 80 },
-      { name: 'Stable Diffusion', pct: 80 },
-      { name: 'ControlNet', pct: 75 },
-      { name: 'Flux / LoRA training', pct: 70 },
+      { name: 'Image', tools: 'FLUX.2 · Qwen-Image · Z-Image', pct: 100 },
+      { name: 'Video', tools: 'Seedance 2 · Kling 3.0 · Veo 3.1 · LTX-2.5 · Wan', pct: 95 },
+      { name: '3D', tools: 'TRELLIS 2 · Hunyuan 3D · Gaussian splats', pct: 90 },
+      { name: 'Orchestration', tools: 'ComfyUI · LoRAs & control adapters · agents via MCP', pct: 100 },
     ],
-    rnd: true,
-    note: 'Explored in pitch development and personal R&D. Node-based workflow experience from Houdini and Nuke transfers directly. Production integration actively developing.',
+    rnd: false,
+    note: 'Strong node-based workflow fluency, carried directly from Houdini and Nuke. Used in pitch development and look exploration, with production integration actively developing.',
   },
 ]
 
@@ -92,9 +92,14 @@ export default function Skills() {
             <div style={{ fontSize: 10, letterSpacing: '0.14em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4 }}>{group.cat}</div>
             <div style={{ fontSize: 11, color: 'var(--text-ghost)', marginBottom: 16, fontStyle: 'italic' }}>{group.desc}</div>
             {group.skills.map(s => (
-              <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-                <span style={{ fontSize: 13, color: 'var(--text-soft)' }}>{s.name}</span>
-                <div style={{ width: 80, height: 2, background: 'var(--border)' }}>
+              <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 'tools' in s ? 14 : 10 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, color: 'var(--text-soft)' }}>{s.name}</div>
+                  {'tools' in s && (
+                    <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 3, lineHeight: 1.5 }}>{s.tools}</div>
+                  )}
+                </div>
+                <div style={{ width: 80, height: 2, background: 'var(--border)', flexShrink: 0 }}>
                   <div style={{ width: `${s.pct}%`, height: 2, background: group.rnd ? 'var(--bar-dim)' : 'var(--accent)' }} />
                 </div>
               </div>

@@ -50,7 +50,6 @@ const skillGroups = [
       { name: 'Orchestration', tools: 'ComfyUI · LoRAs & control adapters · agents via MCP', pct: 100 },
     ],
     rnd: false,
-    note: 'Strong node-based workflow fluency, carried directly from Houdini and Nuke. Used in pitch development and look exploration, with production integration actively developing.',
   },
 ]
 
@@ -104,11 +103,6 @@ export default function Skills() {
                 </div>
               </div>
             ))}
-            {group.note && (
-              <div style={{ fontSize: 11, color: 'var(--text-ghost)', marginTop: 16, fontStyle: 'italic', lineHeight: 1.6, paddingTop: 16, borderTop: '0.5px solid var(--border-subtle)' }}>
-                {group.note}
-              </div>
-            )}
           </div>
         ))}
       </div>

@@ -77,11 +77,14 @@ export default function Skills() {
 
       {/* Secondary disciplines */}
       <div className="grid-4col" style={{ marginBottom: 32 }}>
-        {secondary.map(d => (
-          <div key={d} style={{ background: 'var(--bg)', padding: '16px 20px' }}>
-            <div style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>{d}</div>
-          </div>
-        ))}
+        {secondary.map(d => {
+          const accent = d === 'Generative AI / R&D'
+          return (
+            <div key={d} style={{ background: accent ? 'var(--bg-teal)' : 'var(--bg)', padding: '16px 20px' }}>
+              <div style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: accent ? 'var(--accent)' : 'var(--text-dim)' }}>{d}</div>
+            </div>
+          )
+        })}
       </div>
 
       {/* Skill bars */}

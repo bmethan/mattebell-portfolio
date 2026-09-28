@@ -81,7 +81,8 @@ export default function Skills() {
           const accent = d === 'Generative AI / R&D'
           return (
             <div key={d} style={{ background: accent ? 'var(--bg-teal)' : 'var(--bg)', padding: '16px 20px' }}>
-              <div style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: accent ? 'var(--accent)' : 'var(--text-dim)' }}>{d}</div>
+              <div style={{ fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: accent ? 'var(--accent)' : 'var(--text-dim)', marginBottom: accent ? 4 : 0 }}>{d}</div>
+              {accent && <div style={{ fontSize: 11, color: 'var(--text-ghost)' }}>Creative Technologist</div>}
             </div>
           )
         })}

@@ -69,6 +69,7 @@ export default function LookdevLab() {
   const [labels, setLabels] = useState<{ x: number; y: number }[]>([])
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
   const [paused, setPaused] = useState(false)
+  const [ready, setReady] = useState(false)
 
   useEffect(() => {
     labRef.current = lab
@@ -81,7 +82,8 @@ export default function LookdevLab() {
     engineRef.current?.setState(patch)
   }
 
-  // Create the renderer only when the section approaches the viewport; pause it when offscreen.
+  // Create the renderer once the page is idle (or earlier, if the section comes into view first), so its
+  // shaders compile in the background before anyone scrolls here. It only renders while on screen.
   useEffect(() => {
     const section = sectionRef.current
     const frame = frameRef.current
@@ -107,56 +109,78 @@ export default function LookdevLab() {
     }
 
     let visible = false
-    let contextLost = false
+    let started = false
     let io: IntersectionObserver | null = null
+
+    const fallback = () => {
+      engine?.dispose()
+      engine = null
+      engineRef.current = null
+      setMode('fallback')
+      io?.disconnect()
+    }
 
     const create = () => {
       try {
-        engine = new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
-        engineRef.current = engine
+        const e = new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
+        engine = e
+        engineRef.current = e
         if (process.env.NODE_ENV !== 'production') {
-          ;(window as unknown as { __lookdev?: LookdevEngine }).__lookdev = engine
+          ;(window as unknown as { __lookdev?: LookdevEngine }).__lookdev = e
         }
         setMode('live')
         layout()
-        engine.setVisible(visible)
+        e.setVisible(visible)
+        e.whenReady.then(
+          ok => {
+            if (ok && engine === e) setReady(true)
+          },
+          err => {
+            console.error(err)
+            if (engine === e) fallback()
+          },
+        )
       } catch (err) {
         console.error(err)
-        engine = null
-        engineRef.current = null
-        setMode('fallback')
-        io?.disconnect()
+        fallback()
       }
+    }
+
+    const start = () => {
+      if (started) return
+      started = true
+      if (LookdevEngine.detect()) create()
+      else fallback()
     }
 
     // GPU resets (driver updates, sleep and wake) lose the WebGL context. Pause behind the still frame and
     // rebuild everything when the browser restores it.
     const onContextLost = () => {
-      contextLost = true
       engine?.dispose()
       engine = null
       engineRef.current = null
+      setReady(false)
       setPaused(true)
     }
     const onContextRestored = () => {
-      contextLost = false
       setPaused(false)
-      if (visible) create()
+      create()
     }
     canvas.addEventListener('webglcontextrestored', onContextRestored)
+
+    let cancelIdle: () => void
+    if ('requestIdleCallback' in window) {
+      const id = requestIdleCallback(start, { timeout: 4000 })
+      cancelIdle = () => cancelIdleCallback(id)
+    } else {
+      const id = setTimeout(start, 2000)
+      cancelIdle = () => clearTimeout(id)
+    }
 
     io = new IntersectionObserver(
       entries => {
         visible = entries.some(en => en.isIntersecting)
-        if (visible && !engine && !contextLost) {
-          if (!LookdevEngine.detect()) {
-            setMode('fallback')
-            io?.disconnect()
-            return
-          }
-          create()
-          return
-        }
+        if (visible) start()
         engine?.setVisible(visible)
       },
       { rootMargin: '200px 0px' },
@@ -165,6 +189,7 @@ export default function LookdevLab() {
     const ro = new ResizeObserver(layout)
     ro.observe(frame)
     return () => {
+      cancelIdle()
       io?.disconnect()
       ro.disconnect()
       canvas.removeEventListener('webglcontextrestored', onContextRestored)
@@ -181,7 +206,7 @@ export default function LookdevLab() {
   }
 
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (lab.furnace) return
+    if (lab.furnace || !ready) return
     dragging.current = true
     e.currentTarget.setPointerCapture(e.pointerId)
     engineRef.current?.setInteracting(true)
@@ -196,7 +221,7 @@ export default function LookdevLab() {
     engineRef.current?.setInteracting(false)
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
-    if (lab.furnace) return
+    if (lab.furnace || !ready) return
     const s = 0.08
     let { keyAz, keyEl } = lab
     if (e.key === 'ArrowLeft') keyAz -= s
@@ -238,7 +263,7 @@ export default function LookdevLab() {
             alt="Path traced lookdev reference balls: an 18% gray card ball, a chromium ball and a clear coated car paint ball under a three point softbox rig"
             fill
             sizes="(max-width: 768px) 100vw, 1200px"
-            style={{ objectFit: 'cover' }}
+            style={{ objectFit: 'contain' }}
           />
         ) : (
           <canvas
@@ -256,13 +281,18 @@ export default function LookdevLab() {
           />
         )}
 
-        {mode === 'live' && paused && (
+        {mode !== 'fallback' && !ready && (
           <>
-            <Image src="/lookdev/poster.jpg" alt="" fill sizes="(max-width: 768px) 100vw, 1200px" style={{ objectFit: 'cover' }} />
-            <div className="lab-hud lab-hud-left">Renderer paused. It resumes when the browser restores graphics.</div>
+            {/* contain: the camera keeps a fixed horizontal extent, so the still lines up with the live frame */}
+            <Image src="/lookdev/poster.jpg" alt="" fill sizes="(max-width: 768px) 100vw, 1200px" style={{ objectFit: 'contain' }} />
+            <div className="lab-hud lab-hud-left">
+              {paused
+                ? 'Renderer paused. It resumes when the browser restores graphics.'
+                : 'Still frame. The live renderer is compiling its shaders.'}
+            </div>
           </>
         )}
-        {mode === 'live' && !paused && (
+        {mode === 'live' && ready && (
           <>
             <div className="sr-only" aria-live="polite">
               {`Key light at ${deg(lab.keyAz)} degrees azimuth, ${deg(lab.keyEl)} degrees elevation`}
@@ -292,7 +322,7 @@ export default function LookdevLab() {
       </div>
 
       {mode !== 'fallback' && (
-        <div className="lab-controls">
+        <fieldset className="lab-controls" disabled={!ready}>
           <div className="lab-row">
             <Group label="Lights">
               <Pill on={lab.key} onClick={() => update({ key: !lab.key })}>Key</Pill>
@@ -387,7 +417,7 @@ export default function LookdevLab() {
               </span>
             )}
           </div>
-        </div>
+        </fieldset>
       )}
 
       <div className="lab-methods">

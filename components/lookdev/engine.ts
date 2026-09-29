@@ -62,6 +62,29 @@ const VIEW_ID: Record<View, number> = { aces: 0, agx: 1, neutral: 2, standard: 3
 
 export const TARGET_SPP = 1024
 const HALF_FLOAT_MAX_SPP = 256
+const MAX_BOUNCES = 8
+
+// Sobol' direction numbers for dimensions 1-3, verbatim from Burley 2020 ("Practical Hash-based Owen
+// Scrambling", JCGT 9(4)) supplemental sobol.cpp. Packed one bit per uvec4: (dim1, dim2, dim3, 0).
+const SOBOL_D1 = [
+  0x80000000, 0xc0000000, 0xa0000000, 0xf0000000, 0x88000000, 0xcc000000, 0xaa000000, 0xff000000,
+  0x80800000, 0xc0c00000, 0xa0a00000, 0xf0f00000, 0x88880000, 0xcccc0000, 0xaaaa0000, 0xffff0000,
+  0x80008000, 0xc000c000, 0xa000a000, 0xf000f000, 0x88008800, 0xcc00cc00, 0xaa00aa00, 0xff00ff00,
+  0x80808080, 0xc0c0c0c0, 0xa0a0a0a0, 0xf0f0f0f0, 0x88888888, 0xcccccccc, 0xaaaaaaaa, 0xffffffff,
+]
+const SOBOL_D2 = [
+  0x80000000, 0xc0000000, 0x60000000, 0x90000000, 0xe8000000, 0x5c000000, 0x8e000000, 0xc5000000,
+  0x68800000, 0x9cc00000, 0xee600000, 0x55900000, 0x80680000, 0xc09c0000, 0x60ee0000, 0x90550000,
+  0xe8808000, 0x5cc0c000, 0x8e606000, 0xc5909000, 0x6868e800, 0x9c9c5c00, 0xeeee8e00, 0x5555c500,
+  0x8000e880, 0xc0005cc0, 0x60008e60, 0x9000c590, 0xe8006868, 0x5c009c9c, 0x8e00eeee, 0xc5005555,
+]
+const SOBOL_D3 = [
+  0x80000000, 0xc0000000, 0x20000000, 0x50000000, 0xf8000000, 0x74000000, 0xa2000000, 0x93000000,
+  0xd8800000, 0x25400000, 0x59e00000, 0xe6d00000, 0x78080000, 0xb40c0000, 0x82020000, 0xc3050000,
+  0x208f8000, 0x51474000, 0xfbea2000, 0x75d93000, 0xa0858800, 0x914e5400, 0xdbe79e00, 0x25db6d00,
+  0x58800080, 0xe54000c0, 0x79e00020, 0xb6d00050, 0x800800f8, 0xc00c0074, 0x200200a2, 0x50050093,
+]
+const SOBOL_UNIFORM = new Uint32Array(SOBOL_D1.flatMap((d1, i) => [d1, SOBOL_D2[i], SOBOL_D3[i], 0]))
 const E_SIZE = 32 // mu and roughness resolution of the albedo tables
 const E_LAYERS = 16 // IOR resolution
 const LUT_SIZE = 65
@@ -96,28 +119,39 @@ function rectLight(az: number, el: number, dist: number, w: number, h: number) {
   return { corner, U, V }
 }
 
-function compile(gl: WebGL2RenderingContext, type: number, src: string) {
-  const sh = gl.createShader(type)!
-  gl.shaderSource(sh, src)
-  gl.compileShader(sh)
-  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(sh)
-    gl.deleteShader(sh)
-    throw new Error(`Shader compile failed: ${log}`)
-  }
-  return sh
-}
+// KHR_parallel_shader_compile. The path tracer takes seconds to compile on some drivers (Direct3D's compiler
+// inlines every function call), so compilation is started without asking for its status: any status query
+// blocks the page until the compiler finishes. With the extension, completion is polled instead.
+const COMPLETION_STATUS_KHR = 0x91b1
 
-function program(gl: WebGL2RenderingContext, fsSrc: string) {
+function startProgram(gl: WebGL2RenderingContext, fsSrc: string) {
   const p = gl.createProgram()!
-  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VERT))
-  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fsSrc))
-  gl.linkProgram(p)
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    throw new Error(`Program link failed: ${gl.getProgramInfoLog(p)}`)
+  for (const [type, src] of [
+    [gl.VERTEX_SHADER, VERT],
+    [gl.FRAGMENT_SHADER, fsSrc],
+  ] as const) {
+    const sh = gl.createShader(type)!
+    gl.shaderSource(sh, src)
+    gl.compileShader(sh)
+    gl.attachShader(p, sh)
   }
+  gl.linkProgram(p)
   return p
 }
+
+function finishProgram(gl: WebGL2RenderingContext, p: WebGLProgram) {
+  const shaders = gl.getAttachedShaders(p) ?? []
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    const logs = shaders.map(s => gl.getShaderInfoLog(s)).filter(Boolean)
+    throw new Error(`Shader program failed: ${[gl.getProgramInfoLog(p), ...logs].join('\n')}`)
+  }
+  shaders.forEach(s => {
+    gl.detachShader(p, s)
+    gl.deleteShader(s)
+  })
+}
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 export class LookdevEngine {
   static detect(): boolean {
@@ -133,10 +167,15 @@ export class LookdevEngine {
     }
   }
 
+  // Resolves true once the shaders are compiled and the albedo tables built (false if disposed first);
+  // rejects if a shader fails to compile.
+  readonly whenReady: Promise<boolean>
   private gl: WebGL2RenderingContext
   private vao: WebGLVertexArrayObject
   private progTrace: WebGLProgram
   private progDisplay: WebGLProgram
+  private progTable: WebGLProgram
+  private live = false
   private uniformCache = new Map<WebGLProgram, Map<string, WebGLUniformLocation | null>>()
   private accumTex: WebGLTexture[] = []
   private accumFbo: WebGLFramebuffer[] = []
@@ -188,17 +227,38 @@ export class LookdevEngine {
     }
 
     this.vao = gl.createVertexArray()!
-    this.progTrace = program(gl, TRACE_FRAG)
-    this.progDisplay = program(gl, DISPLAY_FRAG)
-    this.eTable = this.buildAlbedoTables()
+    const parallel = !!gl.getExtension('KHR_parallel_shader_compile')
+    this.progTrace = startProgram(gl, TRACE_FRAG)
+    this.progDisplay = startProgram(gl, DISPLAY_FRAG)
+    this.progTable = startProgram(gl, E_TABLE_FRAG)
 
     // Placeholder until the ACES 2.0 LUT arrives, so the sampler always has a complete texture.
     this.acesLut = gl.createTexture()!
     gl.bindTexture(gl.TEXTURE_3D, this.acesLut)
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]))
+    this.eTable = this.createAlbedoTexture()
     this.loadAcesLut()
 
     canvas.addEventListener('webglcontextlost', this.handleLost)
+    this.whenReady = this.warmUp(parallel)
+  }
+
+  private async warmUp(parallel: boolean) {
+    const gl = this.gl
+    const progs = [this.progTrace, this.progDisplay, this.progTable]
+    // Without the extension there is nothing to poll: yield once, then the status query below blocks.
+    for (;;) {
+      await sleep(parallel ? 50 : 0)
+      if (this.disposed || gl.isContextLost()) return false
+      if (!parallel || progs.every(p => gl.getProgramParameter(p, COMPLETION_STATUS_KHR))) break
+    }
+    progs.forEach(p => finishProgram(gl, p))
+    this.buildAlbedoTables()
+    gl.deleteProgram(this.progTable)
+    this.live = true
+    this.sceneDirty = true
+    this.kick()
+    return true
   }
 
   private handleLost = (e: Event) => {
@@ -209,7 +269,7 @@ export class LookdevEngine {
 
   // Directional albedo tables for multiple-scattering compensation and layering (Kulla and Conty 2017,
   // Turquin 2019), integrated on the GPU once at startup: one draw per IOR slice of a 3D texture.
-  private buildAlbedoTables() {
+  private createAlbedoTexture() {
     const gl = this.gl
     const tex = gl.createTexture()!
     gl.bindTexture(gl.TEXTURE_3D, tex)
@@ -219,14 +279,21 @@ export class LookdevEngine {
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE)
+    return tex
+  }
 
-    const prog = program(gl, E_TABLE_FRAG)
+  private buildAlbedoTables() {
+    const gl = this.gl
+    const tex = this.eTable
+    const prog = this.progTable
     const fbo = gl.createFramebuffer()!
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     gl.viewport(0, 0, E_SIZE, E_SIZE)
     gl.useProgram(prog)
     gl.bindVertexArray(this.vao)
     gl.uniform2f(gl.getUniformLocation(prog, 'uSize'), E_SIZE, E_SIZE)
+    gl.uniform1i(gl.getUniformLocation(prog, 'uSamples'), 2048)
+    gl.uniform1i(gl.getUniformLocation(prog, 'uFresnelSamples'), 256)
     const uLayer = gl.getUniformLocation(prog, 'uLayer')
     for (let layer = 0; layer < E_LAYERS; layer++) {
       gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, layer)
@@ -235,8 +302,6 @@ export class LookdevEngine {
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.deleteFramebuffer(fbo)
-    gl.deleteProgram(prog)
-    return tex
   }
 
   // ACES 2.0 SDR Output Transform, baked from OpenColorIO 2.5 into a 65^3 LUT stored as a PNG strip.
@@ -263,7 +328,7 @@ export class LookdevEngine {
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
       gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE)
       this.acesReady = true
-      if (this.width && this.spp > 0) this.display()
+      if (this.live && this.width && this.spp > 0) this.display()
     } catch (err) {
       console.warn('ACES 2.0 LUT unavailable; using AgX', err)
     }
@@ -378,7 +443,7 @@ export class LookdevEngine {
   }
 
   private kick() {
-    if (this.disposed || !this.visible || this.rafId || !this.width) return
+    if (this.disposed || !this.live || !this.visible || this.rafId || !this.width) return
     this.lastT = 0
     this.rafId = requestAnimationFrame(this.step)
   }
@@ -419,6 +484,9 @@ export class LookdevEngine {
       gl.uniform3fv(L(`uLightRadiance[${i}]`), on ? scale(r.rgb, r.power) : [0, 0, 0])
     })
 
+    gl.uniform4uiv(L('uSobol'), SOBOL_UNIFORM)
+    gl.uniform1i(L('uMaxBounces'), MAX_BOUNCES)
+    gl.uniform1i(L('uNumLights'), rigs.length)
     gl.uniform3fv(L('uEnv'), s.furnace ? [1, 1, 1] : [0.0012, 0.0013, 0.0016])
     gl.uniform1i(L('uFurnace'), s.furnace ? 1 : 0)
     gl.uniform1f(L('uIndirectClamp'), s.furnace ? 0 : INDIRECT_CLAMP)
@@ -466,6 +534,7 @@ export class LookdevEngine {
   // Each batch is flushed as its own submission and the queue is drained periodically, so no single GPU
   // submission runs long enough to trip the OS watchdog (TDR) and lose the context.
   renderNow(total: number) {
+    if (!this.live) return
     let batches = 0
     while (this.spp < total) {
       this.traceBatch(Math.min(8, total - this.spp))
@@ -502,6 +571,7 @@ export class LookdevEngine {
   }
 
   private display() {
+    if (!this.live) return
     const gl = this.gl
     const s = this.state
     const p = this.progDisplay
@@ -566,6 +636,7 @@ export class LookdevEngine {
     gl.deleteTexture(this.acesLut)
     gl.deleteProgram(this.progTrace)
     gl.deleteProgram(this.progDisplay)
+    gl.deleteProgram(this.progTable)
     gl.deleteVertexArray(this.vao)
   }
 }

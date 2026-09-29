@@ -79,27 +79,20 @@ uint laineKarrasPermutation(uint x, uint seed) {
 }
 uint nestedUniformScramble(uint x, uint seed) { return reverseBits32(laineKarrasPermutation(reverseBits32(x), seed)); }
 uint hashCombine(uint seed, uint v) { return seed ^ (v + (seed << 6) + (seed >> 2)); }
-const uint SOBOL_D1[32] = uint[32](
-  0x80000000u, 0xc0000000u, 0xa0000000u, 0xf0000000u, 0x88000000u, 0xcc000000u, 0xaa000000u, 0xff000000u,
-  0x80800000u, 0xc0c00000u, 0xa0a00000u, 0xf0f00000u, 0x88880000u, 0xcccc0000u, 0xaaaa0000u, 0xffff0000u,
-  0x80008000u, 0xc000c000u, 0xa000a000u, 0xf000f000u, 0x88008800u, 0xcc00cc00u, 0xaa00aa00u, 0xff00ff00u,
-  0x80808080u, 0xc0c0c0c0u, 0xa0a0a0a0u, 0xf0f0f0f0u, 0x88888888u, 0xccccccccu, 0xaaaaaaaau, 0xffffffffu);
-const uint SOBOL_D2[32] = uint[32](
-  0x80000000u, 0xc0000000u, 0x60000000u, 0x90000000u, 0xe8000000u, 0x5c000000u, 0x8e000000u, 0xc5000000u,
-  0x68800000u, 0x9cc00000u, 0xee600000u, 0x55900000u, 0x80680000u, 0xc09c0000u, 0x60ee0000u, 0x90550000u,
-  0xe8808000u, 0x5cc0c000u, 0x8e606000u, 0xc5909000u, 0x6868e800u, 0x9c9c5c00u, 0xeeee8e00u, 0x5555c500u,
-  0x8000e880u, 0xc0005cc0u, 0x60008e60u, 0x9000c590u, 0xe8006868u, 0x5c009c9cu, 0x8e00eeeeu, 0xc5005555u);
-const uint SOBOL_D3[32] = uint[32](
-  0x80000000u, 0xc0000000u, 0x20000000u, 0x50000000u, 0xf8000000u, 0x74000000u, 0xa2000000u, 0x93000000u,
-  0xd8800000u, 0x25400000u, 0x59e00000u, 0xe6d00000u, 0x78080000u, 0xb40c0000u, 0x82020000u, 0xc3050000u,
-  0x208f8000u, 0x51474000u, 0xfbea2000u, 0x75d93000u, 0xa0858800u, 0x914e5400u, 0xdbe79e00u, 0x25db6d00u,
-  0x58800080u, 0xe54000c0u, 0x79e00020u, 0xb6d00050u, 0x800800f8u, 0xc00c0074u, 0x200200a2u, 0x50050093u);
+// Sobol' direction numbers for dimensions 1-3 (Burley 2020 supplement, sobol.cpp), one uvec4 per bit
+// (x, y, z = dims 1, 2, 3), uploaded by the host as a uniform array. Dynamic indexing into a uniform buffer is
+// cheap; the same table as a const array is copied into scratch registers at every inlined call site by
+// Direct3D's shader compiler, which was a large share of the compile time.
+uniform uvec4 uSobol[32];
+// Walks only the set bits of the index; a data-dependent loop is never unrolled at compile time.
 uvec4 sobol4d(uint index) {
   uvec4 X = uvec4(reverseBits32(index), 0u, 0u, 0u);
-  for (int bit = 0; bit < 32; ++bit) {
-    if (((index >> uint(bit)) & 1u) != 0u) {
-      X.y ^= SOBOL_D1[bit]; X.z ^= SOBOL_D2[bit]; X.w ^= SOBOL_D3[bit];
-    }
+  uint bits = index;
+  int bit = 0;
+  while (bits != 0u) {
+    if ((bits & 1u) != 0u) X.yzw ^= uSobol[bit].xyz;
+    bits >>= 1u;
+    bit++;
   }
   return X;
 }
@@ -245,6 +238,8 @@ ${MICROFACET}
 ${TABLE_CONSTS}
 uniform vec2 uSize;
 uniform float uLayer;   // normalized x coordinate of this slice, k / (layers - 1)
+uniform int uSamples;   // 2048 VNDF samples; from a uniform so the loop is not unrolled at compile time
+uniform int uFresnelSamples; // 256
 out vec4 outColor;
 void main() {
   vec2 uv = (gl_FragCoord.xy - 0.5) / (uSize - 1.0); // texel i holds mu = i / (N - 1)
@@ -254,7 +249,7 @@ void main() {
   float x = uLayer * E_X_MAX;
   float eta = (1.0 + x) / (1.0 - x);
   vec3 wo = vec3(sqrt(max(0.0, 1.0 - mu * mu)), 0.0, mu);
-  const int N = 2048;
+  int N = uSamples;
   float e1 = 0.0, ed = 0.0;
   for (int i = 0; i < N; i++) {
     vec2 u = vec2((float(i) + 0.5) / float(N), u01(reverseBits32(uint(i))));
@@ -266,7 +261,7 @@ void main() {
     ed += w * fresnelDielectric(dot(wo, m), eta);
   }
   float favg = 0.0;
-  const int M = 256;
+  int M = uFresnelSamples;
   for (int j = 0; j < M; j++) {
     float c = (float(j) + 0.5) / float(M);
     favg += fresnelDielectric(c, eta) * c;
@@ -582,7 +577,8 @@ Surf setupSurf(Mat m, vec3 wo) {
   bool ms = uMultiScatter == 1;
   vec3 F0m = s.baseWeight * s.baseColor;
 
-  vec3 tS = texture(uETable, eTableCoord(mu, s.specRough, s.eta)).rgb;
+  // textureLod: implicit-derivative fetches inside loops force Direct3D to unroll them.
+  vec3 tS = textureLod(uETable, eTableCoord(mu, s.specRough, s.eta), 0.0).rgb;
   float Ess = max(tS.r, 1e-4);
   s.compD = ms ? 1.0 + tS.b * (1.0 - Ess) / Ess : 1.0;
   s.compM = ms ? 1.0 + favgF82Tint(F0m, s.specColor) * (1.0 - Ess) / Ess : vec3(1.0);
@@ -595,7 +591,7 @@ Surf setupSurf(Mat m, vec3 wo) {
     s.EspecR3 = sat3(s.EspecR * mix(vec3(1.0), ratio, s.tfW));
   }
 
-  vec3 tC = texture(uETable, eTableCoord(mu, s.coatRough, s.coatIor)).rgb;
+  vec3 tC = textureLod(uETable, eTableCoord(mu, s.coatRough, s.coatIor), 0.0).rgb;
   float EssC = max(tC.r, 1e-4);
   s.compC = ms ? 1.0 + tC.b * (1.0 - EssC) / EssC : 1.0;
   s.Ecoat = sat(tC.g * s.compC);
@@ -644,10 +640,11 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
     vec3 Fd = s.specColor * fresnelDielectric(voh, s.eta) * s.compD;
     vec3 Fm = s.specW * fresnelF82Tint(voh, s.baseWeight * s.baseColor, s.specColor) * s.compM;
     if (s.tfW > 0.0) {
-      vec3 FtfD = s.specColor * thinFilmF(voh, s.tfIor, s.tfThick, vec3(f0FromEta(s.eta))) * s.compD;
-      vec3 FtfM = s.specW * thinFilmF(voh, s.tfIor, s.tfThick, s.baseWeight * s.baseColor) * s.compM;
-      Fd = mix(Fd, FtfD, s.tfW);
-      Fm = mix(Fm, FtfM, s.tfW);
+      // One interference evaluation, with the base reflectance blended by metalness (exact for the pure
+      // dielectric and pure metal cases, and it keeps a single inlined copy of the film code).
+      vec3 Ftf = thinFilmF(voh, s.tfIor, s.tfThick, mix(vec3(f0FromEta(s.eta)), s.baseWeight * s.baseColor, s.metal));
+      Fd = mix(Fd, s.specColor * Ftf * s.compD, s.tfW);
+      Fm = mix(Fm, s.specW * Ftf * s.compM, s.tfW);
     }
     fS += s.tBase * mix(Fd, Fm, s.metal) * g;
     pdf += p.y * pdfGGXReflection_Bounded(wo, wi, s.aS);
@@ -790,11 +787,21 @@ bool sampleLight(int k, vec3 o, vec2 u, out vec3 wi, out float dist, out float p
   wi = w / dist;
   return true;
 }
+// Solid angle of light k seen from o: the same van Oosterom-Strackee two-triangle sum as SphQuad.Spdf, computed
+// directly from the corners (rotation invariant, so it equals the local-frame value), without the sampler setup.
+float rectSolidAngle(int k, vec3 o) {
+  vec3 ex = uLightU[k], ey = uLightV[k];
+  vec3 a = uLightCorner[k] - o, b = a + ex, c = b + ey, d = a + ey;
+  float N = abs(dot(a, cross(ex, ey)));
+  float la = length(a), lb = length(b), lc = length(c), ld = length(d);
+  float D1 = la * lb * lc + dot(a, b) * lc + dot(a, c) * lb + dot(b, c) * la;
+  float D2 = la * lc * ld + dot(a, c) * ld + dot(a, d) * lc + dot(c, d) * la;
+  return 2.0 * atan(N, D1) + 2.0 * atan(N, D2);
+}
 float lightPdf(int k, vec3 o, vec3 wi, float dist) {
   if (!facesLight(k, o)) return 0.0;
-  SphQuad q;
-  bool ok = sphQuadInit(q, uLightCorner[k], uLightU[k], uLightV[k], o);
-  if (ok && q.Spdf > MIN_SPHERICAL_SAMPLE_AREA) return 1.0 / q.Spdf;
+  float S = rectSolidAngle(k, o);
+  if (S > MIN_SPHERICAL_SAMPLE_AREA) return 1.0 / S;
   vec3 nL = cross(uLightU[k], uLightV[k]);
   float area = length(nL);
   float cosL = abs(dot(nL / area, wi));
@@ -847,7 +854,9 @@ uniform Mat uMat[4];
 
 out vec4 outColor;
 
-const int MAX_BOUNCES = 8;
+// Loop bounds come from uniforms so the Direct3D compiler cannot unroll the path loop (compile time).
+uniform int uMaxBounces;
+uniform int uNumLights;
 
 float ballX(int i) { return i == 0 ? uBallX.x : (i == 1 ? uBallX.y : uBallX.z); }
 
@@ -899,7 +908,7 @@ Hit intersect(vec3 ro, vec3 rd, bool withLights) {
     if (t > 0.0 && t < h.t) { h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.mat = 3; }
   }
   if (withLights) {
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < uNumLights; k++) {
       if (!lightOn(k)) continue;
       float t = intersectRect(ro, rd, k, h.t);
       if (t > 0.0) { h.t = t; h.light = k; h.mat = -1; }
@@ -963,7 +972,7 @@ void main() {
     float prevPdf = 0.0;
     vec3 prevP = ro;
 
-    for (int depth = 0; depth < MAX_BOUNCES; depth++) {
+    for (int depth = 0; depth < uMaxBounces; depth++) {
       Hit h = intersect(ro, rd, depth > 0);
 
       if (h.light >= 0) {
@@ -999,45 +1008,53 @@ void main() {
       Surf s = setupSurf(m, wo);
       vec3 po = offsetRay(p, n);
 
-      // Next-event estimation: every softbox, sampled by solid angle.
-      for (int k = 0; k < 3; k++) {
-        if (!lightOn(k)) continue;
-        vec2 ul = sample4(sampleIndex, pixSeed, depth, k).xy;
-        vec3 ld; float ldist; float lpdf;
-        if (!sampleLight(k, po, ul, ld, ldist, lpdf)) continue;
-        vec3 wi = vec3(dot(ld, t1), dot(ld, t2), dot(ld, n));
-        if (wi.z <= 0.0) continue;
+      // One pass over the vertex's sampled directions: k < uNumLights is next-event estimation toward softbox k
+      // (solid-angle sampling); k == uNumLights is the BSDF sample that continues the path. Sharing the loop
+      // keeps a single inlined copy of evalSurf, which is most of the shader's compile cost on Direct3D.
+      bool last = depth == uMaxBounces - 1;
+      bool continued = false;
+      for (int k = 0; k <= uNumLights; k++) {
+        bool isLight = k < uNumLights;
+        if (!isLight && last) break; // the continuation ray from the last vertex is never traced
+        if (isLight && !lightOn(k)) continue;
+        vec4 u = sample4(sampleIndex, pixSeed, depth, k);
+        vec3 dirW, wi;
+        float ldist = 0.0, lpdf = 0.0;
+        if (isLight) {
+          if (!sampleLight(k, po, u.xy, dirW, ldist, lpdf)) continue;
+          wi = vec3(dot(dirW, t1), dot(dirW, t2), dot(dirW, n));
+          if (wi.z <= 0.0) continue;
+        } else {
+          if (!sampleSurf(s, wo, filt, u.xyz, wi)) break;
+          dirW = normalize(t1 * wi.x + t2 * wi.y + n * wi.z);
+        }
         vec3 fD, fS;
         float bpdf = evalSurf(s, wo, wi, filt, fD, fS);
         vec3 f = fD + fS;
-        if (maxc(f) <= 0.0) continue;
-        if (occluded(po, ld, ldist * (1.0 - 1e-4))) continue;
-        // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
-        float wl = depth == MAX_BOUNCES - 1 ? 1.0 : powerHeuristic(lpdf, bpdf);
-        vec3 c = beta * f * uLightRadiance[k] * (wl / lpdf);
-        L += depth >= 1 ? clampIndirect(c) : c;
+        if (isLight) {
+          if (maxc(f) <= 0.0) continue;
+          if (occluded(po, dirW, ldist * (1.0 - 1e-4))) continue;
+          // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
+          float wl = last ? 1.0 : powerHeuristic(lpdf, bpdf);
+          vec3 c = beta * f * uLightRadiance[k] * (wl / lpdf);
+          L += depth >= 1 ? clampIndirect(c) : c;
+        } else {
+          if (bpdf <= 0.0) break;
+          beta *= f / bpdf;
+          if (maxc(beta) <= 0.0) break;
+          if (depth >= 3) {
+            float q = min(maxc(beta), 0.95);
+            if (u.w >= q) break;
+            beta /= q;
+          }
+          prevPdf = bpdf;
+          prevP = po;
+          rd = dirW;
+          ro = po;
+          continued = true;
+        }
       }
-      if (depth == MAX_BOUNCES - 1) break;
-
-      // Continue the path by sampling the lobe mixture.
-      vec4 ub = sample4(sampleIndex, pixSeed, depth, 3);
-      vec3 wi;
-      if (!sampleSurf(s, wo, filt, ub.xyz, wi)) break;
-      vec3 fD, fS;
-      float pdf = evalSurf(s, wo, wi, filt, fD, fS);
-      if (pdf <= 0.0) break;
-      beta *= (fD + fS) / pdf;
-      if (maxc(beta) <= 0.0) break;
-      prevPdf = pdf;
-      prevP = po;
-      rd = normalize(t1 * wi.x + t2 * wi.y + n * wi.z);
-      ro = po;
-
-      if (depth >= 3) {
-        float q = min(maxc(beta), 0.95);
-        if (ub.w >= q) break;
-        beta /= q;
-      }
+      if (!continued) break;
     }
     if (nonFinite(L.r) || nonFinite(L.g) || nonFinite(L.b)) L = vec3(0.0);
     acc += L;

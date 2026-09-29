@@ -1,0 +1,150 @@
+// Methods shown under the lab. Every entry was checked against its primary source (paper, journal page,
+// official spec or repository) by an independent verification pass before it went on the page.
+export interface Citation {
+  id: string
+  short: string
+  authors: string
+  title: string
+  venue: string
+  year: string
+  url: string
+}
+
+export const CITATIONS: Citation[] = [
+  {
+    id: 'openpbr',
+    short: 'OpenPBR Surface 1.1.1',
+    authors: 'Academy Software Foundation',
+    title: 'OpenPBR Surface Specification v1.1.1',
+    venue: 'ASWF',
+    year: '2026',
+    url: 'https://academysoftwarefoundation.github.io/OpenPBR/',
+  },
+  {
+    id: 'eon',
+    short: 'EON diffuse',
+    authors: 'Jamie Portsmouth, Peter Kutz, Stephen Hill',
+    title: 'EON: A Practical Energy-Preserving Rough Diffuse BRDF',
+    venue: 'Journal of Computer Graphics Techniques 14(1)',
+    year: '2025',
+    url: 'https://jcgt.org/published/0014/01/06/',
+  },
+  {
+    id: 'bvndf',
+    short: 'Bounded VNDF sampling',
+    authors: 'Yusuke Tokuyoshi, Kenta Eto',
+    title: 'Bounded VNDF Sampling for the Smith-GGX BRDF',
+    venue: 'Proc. ACM Comput. Graph. Interact. Tech. 7(1) (I3D)',
+    year: '2024',
+    url: 'https://doi.org/10.1145/3651291',
+  },
+  {
+    id: 'caps',
+    short: 'Spherical-cap VNDF',
+    authors: 'Jonathan Dupuy, Anis Benyoub',
+    title: 'Sampling Visible GGX Normals with Spherical Caps',
+    venue: 'Computer Graphics Forum 42(8) (HPG)',
+    year: '2023',
+    url: 'https://doi.org/10.1111/cgf.14867',
+  },
+  {
+    id: 'turquin',
+    short: 'Multiple-scattering compensation',
+    authors: 'Emmanuel Turquin',
+    title: 'Practical Multiple Scattering Compensation for Microfacet Models',
+    venue: 'Industrial Light & Magic technical report',
+    year: '2019',
+    url: 'https://blog.selfshadow.com/publications/turquin/ms_comp_final.pdf',
+  },
+  {
+    id: 'kulla',
+    short: 'Albedo tables',
+    authors: 'Christopher Kulla, Alejandro Conty',
+    title: 'Revisiting Physically Based Shading at Imageworks',
+    venue: 'SIGGRAPH Course: Physically Based Shading in Theory and Practice (slides v2)',
+    year: '2017',
+    url: 'https://blog.selfshadow.com/publications/s2017-shading-course/imageworks/s2017_pbs_imageworks_slides_v2.pdf',
+  },
+  {
+    id: 'f82',
+    short: 'F82-tint Fresnel',
+    authors: 'Naty Hoffman',
+    title: 'Fresnel Equations Considered Harmful',
+    venue: 'Eurographics Workshop on Material Appearance Modeling',
+    year: '2019',
+    url: 'https://renderwonk.com/publications/mam2019/',
+  },
+  {
+    id: 'sheen',
+    short: 'LTC fuzz',
+    authors: 'Tizian Zeltner, Brent Burley, Matt Jen-Yuan Chiang',
+    title: 'Practical Multiple-Scattering Sheen Using Linearly Transformed Cosines',
+    venue: 'ACM SIGGRAPH Talks',
+    year: '2022',
+    url: 'https://doi.org/10.1145/3532836.3536240',
+  },
+  {
+    id: 'thinfilm',
+    short: 'Thin-film iridescence (KHR approx.)',
+    authors: 'Laurent Belcour, Pascal Barla',
+    title: 'A Practical Extension to Microfacet Theory for the Modeling of Varying Iridescence',
+    venue:
+      'ACM Transactions on Graphics 36(4), Article 65, as approximated by KHR_materials_iridescence (Khronos glTF Sample Renderer)',
+    year: '2017',
+    url: 'https://doi.org/10.1145/3072959.3073620',
+  },
+  {
+    id: 'sphrect',
+    short: 'Spherical-rectangle lights',
+    authors: 'Carlos Ureña, Marcos Fajardo, Alan King',
+    title: 'An Area-Preserving Parametrization for Spherical Rectangles',
+    venue: 'Computer Graphics Forum 32(4) (EGSR)',
+    year: '2013',
+    url: 'https://doi.org/10.1111/cgf.12151',
+  },
+  {
+    id: 'owen',
+    short: "Owen-scrambled Sobol'",
+    authors: 'Brent Burley',
+    title: 'Practical Hash-based Owen Scrambling',
+    venue: 'Journal of Computer Graphics Techniques 9(4)',
+    year: '2020',
+    url: 'https://jcgt.org/published/0009/04/01/',
+  },
+  {
+    id: 'aces2',
+    short: 'ACES 2.0 via OpenColorIO 2.5',
+    authors: 'Academy of Motion Picture Arts and Sciences; Academy Software Foundation',
+    title: 'ACES 2.0 Output Transform (cg-config v4.0.0, OpenColorIO 2.5)',
+    venue: 'ACES',
+    year: '2025',
+    url: 'https://docs.acescentral.com/background/about-aces-2/',
+  },
+  {
+    id: 'neutral',
+    short: 'Khronos PBR Neutral',
+    authors: 'Emmett Lalish',
+    title: 'Neutral Tone Mapping for PBR Color Accuracy',
+    venue: 'ACM SIGGRAPH Talks',
+    year: '2024',
+    url: 'https://doi.org/10.1145/3641233.3664313',
+  },
+  {
+    id: 'agx',
+    short: 'AgX (three.js/Filament approx.)',
+    authors: 'Troy Sobotka (AgX); Eary Chow (Blender Rec.2020 variant); Benjamin Wrensch (sigmoid fit)',
+    title: 'AgX',
+    venue: 'Blender 4.x-style approximation via three.js and Filament',
+    year: '2022',
+    url: 'https://github.com/sobotka/AgX',
+  },
+  {
+    id: 'blackbody',
+    short: 'Blackbody locus',
+    authors: 'Bongsoon Kang, Ohak Moon, Changhee Hong, Honam Lee, Bonghwan Cho, Youngsun Kim',
+    title: 'Design of Advanced Color-Temperature Control System for HDTV Applications',
+    venue: 'Journal of the Korean Physical Society 41(6)',
+    year: '2002',
+    url: 'https://web.archive.org/web/20190303161843/http://pdfs.semanticscholar.org/cc7f/c2e67601ccb1a8fec048c9b78a4224c34d26.pdf',
+  },
+]

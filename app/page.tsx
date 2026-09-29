@@ -3,6 +3,7 @@ import Hero from '@/components/Hero'
 import Reel from '@/components/Reel'
 import Work from '@/components/Work'
 import Skills from '@/components/Skills'
+import LookdevLab from '@/components/LookdevLab'
 import About from '@/components/About'
 import Testimonials from '@/components/Testimonials'
 import Contact from '@/components/Contact'
@@ -28,6 +29,7 @@ export default async function Home() {
       <Reel reelUrl={settings?.reelUrl} />
       <Work cards={workCards} />
       <Skills />
+      <LookdevLab />
       <About settings={settings} years={years} />
       <Testimonials items={testimonials} />
       <Contact />

@@ -33,6 +33,34 @@ body {
 ::selection { background: var(--accent); color: var(--bg); }
 .work-card:hover { background: var(--bg-card) !important; }
 
+/* ─── Lookdev lab ────────────────────────────────────────── */
+.lab-frame { position: relative; width: 100%; aspect-ratio: 2.39 / 1; background: #060607; border: 0.5px solid var(--border); overflow: hidden; }
+.lab-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: pan-y; outline: none; }
+.lab-canvas:active { cursor: grabbing; }
+.lab-canvas:focus-visible { outline: 1px solid var(--border-teal); outline-offset: -1px; }
+.lab-hud { position: absolute; top: 12px; max-width: calc(100% - 28px); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-muted); pointer-events: none; white-space: pre-wrap; font-variant-numeric: tabular-nums; }
+.lab-hud-left { left: 14px; }
+.lab-hud-right { right: 14px; text-align: right; }
+.lab-progress { position: absolute; left: 0; bottom: 0; width: 100%; height: 1px; background: var(--accent); transform-origin: left; opacity: 0.6; pointer-events: none; }
+.lab-marker { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border: 1px solid var(--accent); border-radius: 50%; opacity: 0.8; pointer-events: none; }
+.lab-marker::after { content: ''; position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px; border-radius: 50%; background: var(--accent); }
+.lab-ball-label { position: absolute; transform: translateX(-50%); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); pointer-events: none; white-space: nowrap; }
+.lab-controls { display: flex; flex-direction: column; gap: 14px; margin-top: 20px; }
+.lab-row { display: flex; flex-wrap: wrap; gap: 14px 32px; align-items: center; }
+.lab-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.lab-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); margin-right: 6px; }
+.lab-pill { font-family: inherit; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; padding: 6px 10px; background: transparent; color: var(--text-muted); border: 0.5px solid var(--border); cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s; }
+.lab-pill:hover { color: var(--text-soft); }
+.lab-pill:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+.lab-pill.on { color: var(--accent); border-color: var(--border-teal); background: var(--bg-teal); }
+.lab-range { width: 120px; accent-color: var(--accent); }
+.lab-readout { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; min-width: 44px; }
+.lab-note { font-size: 12px; color: var(--text-muted); line-height: 1.6; max-width: 560px; }
+.lab-methods { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; margin-top: 24px; padding-top: 16px; border-top: 0.5px solid var(--border-subtle); }
+.lab-methods ul { display: flex; flex-wrap: wrap; gap: 6px 16px; list-style: none; margin: 0; padding: 0; }
+.lab-methods a { font-size: 11px; color: var(--text-muted); text-decoration: none; }
+.lab-methods a:hover { color: var(--accent); }
+
 /* ─── Responsive ─────────────────────────────────────────── */
 
 /* Nav */
@@ -76,6 +104,11 @@ body {
 .footer-pad { padding: 24px 48px; display: flex; justify-content: space-between; align-items: center; }
 
 @media (max-width: 768px) {
+  /* Lookdev lab */
+  .lab-frame { aspect-ratio: 4 / 3; }
+  .lab-hud-left, .lab-hud-right { max-width: calc(50% - 20px); }
+  .lab-row { gap: 12px 20px; }
+
   /* Nav */
   .nav-pad { padding: 16px 20px; position: relative; flex-wrap: wrap; }
   .nav-links { display: none; }

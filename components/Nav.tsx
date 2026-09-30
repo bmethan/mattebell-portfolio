@@ -12,8 +12,8 @@ export default function Nav({ available }: { available: boolean }) {
       borderBottom: '0.5px solid var(--border)',
       position: 'sticky', top: 0, background: 'var(--bg)', zIndex: 50,
     }}>
-      <div style={{ fontSize: 13, fontWeight: 500, letterSpacing: '0.12em', textTransform: 'uppercase' }}>
-        Matthew Bell
+      <div className="nav-brand" style={{ fontSize: 13, fontWeight: 500, letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+        Matthew Bell<span className="nav-brand-sep">&nbsp;/&nbsp;</span><span className="nav-brand-tag">VFX &amp; Creative Tech</span>
       </div>
 
       {/* Desktop links */}

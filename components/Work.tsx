@@ -21,14 +21,15 @@ const VIMEO = (id: string) =>
   `https://player.vimeo.com/video/${id}?title=0&byline=0&portrait=0&like=0&watchlater=0&share=0`
 
 const DEFAULT_CARDS: Card[] = [
-  { title: 'Ready Player One', year: '2018', type: 'Feature film', badge: 'Spielberg', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/rpocard.jpg' },
-  { title: 'Iron Man 3', year: '2013', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/im3card.jpg' },
-  { title: 'Real Steel', year: '2011', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/realsteelcard.jpg' },
-  { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/startrekcard.jpg' },
-  { title: 'Legends of Tomorrow', year: '2021–23', type: 'Television series', badge: '', role: 'Sequence Lighting', studio: 'Zoic Studios', icon: '📺', image: '/images/lotcard.jpg' },
+  // Card years are release or air years. Badges describe the production, not a personal award.
+  { title: 'Ready Player One', year: '2018', type: 'Feature film · Steven Spielberg', badge: 'Oscar-nominated: Best Visual Effects', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/rpocard.jpg' },
+  { title: 'Iron Man 3', year: '2013', type: 'Feature film', badge: 'Oscar-nominated: Best Visual Effects', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/im3card.jpg' },
+  { title: 'Real Steel', year: '2011', type: 'Feature film', badge: 'Oscar-nominated: Best Visual Effects', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/realsteelcard.jpg' },
+  { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated: Best Visual Effects', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/startrekcard.jpg' },
+  { title: "DC's Legends of Tomorrow", year: '2021–22', type: 'Television series', badge: '', role: 'Sequence Lighting', studio: 'Zoic Studios', icon: '📺', image: '/images/lotcard.jpg' },
   {
-    title: 'Walmart: Famous Visitors', year: '2021', type: 'Commercial',
-    badge: 'VES Award: Outstanding VFX in a Commercial',
+    title: 'Walmart: Famous Visitors', year: '2020', type: 'Super Bowl commercial',
+    badge: 'VES Award-winning production',
     role: 'Senior VFX Artist', studio: 'The Mill LA', icon: '📢',
     summary: 'Look development of the LEGO assets and the Blade Runner Spinner; shot lighting for the Spinner and all volumetrics.',
     image: '/images/walmart-famous-visitors.jpg',

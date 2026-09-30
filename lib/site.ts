@@ -4,8 +4,9 @@ export const SITE = 'https://mattebell.xyz'
 export const NAME = 'Matthew Bell'
 export const TITLE = 'Matthew Bell | VFX Artist & Creative Technologist'
 
+// His strongest fact leads (it is what VFX producers search), and both practices stay in the first sentence.
 export const description = (years: number) =>
-  `VFX artist and creative technologist: lighting and look development for film, TV and real-time production, and generative AI and real-time R&D. ${years} years in 3D and VFX, based in San Antonio.`
+  `VFX artist and creative technologist: lighting and lookdev lead on Ready Player One, Iron Man 3, Real Steel and Star Trek, and generative AI and real-time R&D. ${years} years in 3D, based in San Antonio.`
 
 export const SAME_AS = [
   'https://www.imdb.com/name/nm2998873/',

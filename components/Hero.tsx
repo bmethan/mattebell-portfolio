@@ -1,11 +1,13 @@
-// The award stats follow the Oscar stat's pattern: the VES and the Emmy went to productions he worked on
+// The award stats follow the Oscar stat's pattern: the VES and the Sports Emmy went to productions he worked on
 // (Walmart "Famous Visitors", The Mill; NFL Network "Run", Motion Theory, as lighter), not to him personally.
+// The four Oscar productions are Best Visual Effects nominees he was lighting and lookdev lead on: Star Trek
+// (82nd), Real Steel (84th), Iron Man 3 (86th) and Ready Player One (91st).
 const stats = (years: number) => [
   { num: `${years}+`, label: 'Years experience' },
   { num: '20+', label: 'Feature film credits' },
-  { num: '3×', label: 'Oscar-nominated productions' },
+  { num: '4×', label: 'Oscar-nominated productions' },
   { num: '1×', label: 'VES Award-winning production' },
-  { num: '1×', label: 'Emmy-winning production' },
+  { num: '1×', label: 'Sports Emmy-winning production' },
 ]
 
 export default function Hero({ years }: { years: number }) {
@@ -36,9 +38,9 @@ export default function Hero({ years }: { years: number }) {
       </h1>
 
       <p style={{ fontSize: 15, color: 'var(--text-muted)', maxWidth: 580, lineHeight: 1.8, marginBottom: 40 }}>
-        {years} years in 3D and visual effects, with lead roles on three Oscar-nominated productions.{' '}
+        {years} years in 3D and visual effects, with lead roles on four films nominated for the Best Visual Effects Oscar.{' '}
         <strong style={{ color: 'var(--text-soft)', fontWeight: 500 }}>A specialist in lighting and look development</strong>
-        {' for film, episodic TV and real-time production, and a creative technologist building generative AI and real-time tools. Based in San Antonio, working remote or on-location.'}
+        {' for film, episodic TV, commercials and real-time production, and a creative technologist building generative AI and real-time tools. Based in San Antonio, working remote or on-location.'}
       </p>
 
       <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>

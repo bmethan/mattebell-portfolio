@@ -3,12 +3,14 @@ const SASTW_TALK = 'https://www.sasw.co/speakers/matthew-bell'
 
 const timeline: { year: string; role: string; studio: string; note: string; href?: string }[] = [
   { year: '2026', role: 'Speaker', studio: 'San Antonio Startup + Tech Week', note: "'Big Work, Small Teams: The Future of Entertainment, Film, and Interactive Experiences'", href: SASTW_TALK },
-  { year: '2020–', role: 'Freelance Senior LookDev & Lighting / Visualization Consultant', studio: 'Zero VFX · Zoic Studios · Reactor VFX · Artjail · and others', note: 'Challengers · The Instigators · Good Burger 2 · The Flash · Mrs. Davis · Hello Tomorrow!' },
-  { year: '2019–20', role: 'Senior VFX Artist', studio: 'The Mill LA', note: "Walmart 'Famous Visitors' (VES Award: Outstanding VFX in a Commercial)" },
-  { year: '2016–17', role: 'Lighting Lead', studio: 'Digital Domain', note: 'Ready Player One · X-Men: Apocalypse' },
-  { year: '2012–13', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', note: 'Iron Man 3 (Oscar-nominated production) · G.I. Joe: Retaliation' },
-  { year: '2007–12', role: 'LookDev & Lighting Lead · Senior Artist', studio: 'Digital Domain · Method Studios · Dr. D Studios · Motion Theory', note: "Star Trek · Real Steel (Oscar-nominated productions, as lead) · Wrath of the Titans · Happy Feet 2 · NFL Network 'Run' (Emmy-winning promo, as lighter)" },
-  { year: '1998–07', role: 'LightWave3D Expert / Demo Artist · Graphic Designer', studio: 'NewTek Inc. · NewTek Europe · News 9 San Antonio', note: '' },
+  { year: '2020–', role: 'Freelance Senior LookDev & Lighting / Visualization Consultant', studio: 'Zero VFX · Zoic Studios · Reactor VFX · Artjail · and others', note: "Challengers · The Instigators · Good Burger 2 · DC's Legends of Tomorrow · The Flash (TV series) · Mrs. Davis · Hello Tomorrow!" },
+  { year: '2019–20', role: 'Senior VFX Artist', studio: 'The Mill LA', note: "Walmart 'Famous Visitors', Super Bowl LIV (VES Award-winning production, Outstanding Visual Effects in a Commercial)" },
+  { year: '2017–19', role: 'Assets · LookDev & Lighting · Visualization', studio: 'Blur Studio · MPC · ETC', note: 'Love, Death + Robots · Honda campaign' },
+  { year: '2015–17', role: 'LookDev & Lighting Lead · Senior Artist', studio: 'Digital Domain · Iloura · ETC · MPC', note: 'Ready Player One (Oscar-nominated, Best Visual Effects, as lead) · X-Men: Apocalypse · Deadpool · Ted 2' },
+  { year: '2012–15', role: 'LookDev & Lighting Lead · Sequence Lighting', studio: 'Digital Domain · Method Studios · Blur Studio', note: 'Iron Man 3 (Oscar-nominated, Best Visual Effects, as lead) · G.I. Joe: Retaliation · Into the Storm · Furious 7 · Thor: The Dark World · Divergent · Halo 2: Anniversary' },
+  { year: '2007–12', role: 'LookDev & Lighting Lead · Senior Artist', studio: 'Digital Domain · Method Studios · Dr. D Studios · Motion Theory', note: "Star Trek and Real Steel (both Oscar-nominated, Best Visual Effects, as lead) · Wrath of the Titans · Happy Feet Two · NFL Network 'Run' (Sports Emmy-winning promo, as lighter)" },
+  { year: '2007', role: 'BFA in Visual Effects', studio: 'Savannah College of Art and Design', note: 'Minors: Technical Direction & Animation' },
+  { year: '1998–04', role: 'LightWave 3D Technical Support Expert · Demo Artist & Trainer · Broadcast Graphic Designer', studio: 'NewTek Inc. · NewTek Europe · News 9 San Antonio · KSAT12 News', note: '' },
 ]
 
 const pills = [
@@ -33,9 +35,9 @@ type Settings = {
 
 const DEFAULT_BIO = (years: number) => [
   `<strong>Matthew Bell.</strong> Senior VFX Artist and Creative Technologist with ${years} years in 3D and visual effects, across feature film, episodic television, commercials, and real-time production. Core specialist in lighting and look development, and a trusted generalist across the full pipeline.`,
-  "Lighting and look development lead on three Oscar-nominated productions (Iron Man 3, Real Steel, and Star Trek) and on Spielberg's Ready Player One, with credits spanning Digital Domain, MPC, The Mill, Method Studios, Zero VFX, Zoic Studios, and more.",
-  "Senior artist on the VES Award-winning Walmart 'Famous Visitors' (Outstanding Visual Effects in a Commercial, 2021). Also available for VFX consultation across visualization, real-time pipeline, and UI/UX strategy. Open to remote and on-location engagements worldwide.",
-  'Fluent in generative AI workflows, including ComfyUI and Flux pipelines, applied to pitch development and look exploration, with an eye toward production integration as the toolset matures.',
+  "Lighting and look development lead on four films nominated for the Best Visual Effects Oscar: Steven Spielberg's Ready Player One, Iron Man 3, Real Steel, and Star Trek. Credits span Digital Domain, MPC, The Mill, Method Studios, Blur Studio, Zero VFX, Zoic Studios, and more.",
+  "Senior artist on Walmart 'Famous Visitors', a Super Bowl LIV spot that won the 2021 VES Award for Outstanding Visual Effects in a Commercial, and lighter on Motion Theory's NFL Network 'Run', winner of a 2010 Sports Emmy. Also available for VFX consultation across visualization, real-time pipeline, and UI/UX strategy. Open to remote and on-location engagements worldwide.",
+  'Builds generative AI and agent-driven tools for VFX work: ComfyUI pipelines with FLUX.2, custom LoRAs and control adapters for look exploration and pitch development, and an MCP connector that lets AI agents work directly in Houdini, Blender and Unreal.',
 ]
 
 export default function About({ settings, years }: { settings: Settings; years: number }) {

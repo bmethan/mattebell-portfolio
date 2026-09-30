@@ -63,7 +63,7 @@ export default function Services() {
       </div>
 
       <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.7, margin: '24px 0 0', maxWidth: 720 }}>
-        Also available for talks and panels on AI in film, entertainment and interactive production. Most recently at{' '}
+        Also available for talks and panels on AI in film, entertainment and interactive production. Spoke at{' '}
         <a href="https://www.sasw.co/speakers/matthew-bell" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', textDecoration: 'none' }}>
           San Antonio Startup + Tech Week 2026
         </a>

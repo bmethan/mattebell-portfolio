@@ -51,6 +51,11 @@ body {
   z-index: 100;
 }
 .nav-mobile-menu.open { display: flex; }
+.nav-mobile-actions { display: none; }
+.nav-cta-mobile { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); text-decoration: none; }
+/* Anchors land below the sticky nav (about 76px tall on desktop, 60px on phones). */
+section[id], .anchor-target { scroll-margin-top: 80px; }
+.contact-field:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
 .nav-mobile-menu a {
   padding: 16px 24px;
   font-size: 13px;
@@ -75,11 +80,18 @@ body {
 .hero-pad { padding: 80px 48px 64px; }
 .footer-pad { padding: 24px 48px; display: flex; justify-content: space-between; align-items: center; }
 
+/* The nav needs about 800px for its five links and the hire button, so it switches to the menu a little
+   earlier than the rest of the layout. */
+@media (max-width: 900px) {
+  .nav-links { display: none; }
+  .nav-hamburger { display: flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; padding: 4px; color: var(--text-muted); }
+  .nav-mobile-actions { display: flex; align-items: center; gap: 18px; }
+}
+
 @media (max-width: 768px) {
   /* Nav */
   .nav-pad { padding: 16px 20px; position: relative; flex-wrap: wrap; }
-  .nav-links { display: none; }
-  .nav-hamburger { display: flex; align-items: center; justify-content: center; background: none; border: none; cursor: pointer; padding: 4px; color: var(--text-muted); }
+  section[id], .anchor-target { scroll-margin-top: 64px; }
 
   /* Sections */
   .section-pad { padding: 48px 20px; }

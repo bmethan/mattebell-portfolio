@@ -1,20 +1,13 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { SITE, TITLE, OG_SHARED } from "@/lib/site";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
+// The page sets its own description and canonical (app/page.tsx), so a future route never inherits them.
 export const metadata: Metadata = {
-  title: "Matthew Bell | VFX Artist & Creative Technologist",
-  description: "Senior VFX Artist specializing in lighting and look development. 27+ years across feature film, episodic television, and real-time production.",
+  metadataBase: new URL(SITE),
+  title: TITLE,
+  openGraph: OG_SHARED,
+  twitter: { card: "summary_large_image" },
 };
 
 export default function RootLayout({
@@ -23,10 +16,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
+    <html lang="en" className="h-full antialiased">
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );

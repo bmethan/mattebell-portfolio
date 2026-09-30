@@ -11,6 +11,7 @@ type Card = {
   badge?: string
   role: string
   studio: string
+  summary?: string // one line of what he did, as text search engines can read
   icon?: string
   image?: string
   modal?: Modal
@@ -29,6 +30,7 @@ const DEFAULT_CARDS: Card[] = [
     title: 'Walmart: Famous Visitors', year: '2021', type: 'Commercial',
     badge: 'VES Award: Outstanding VFX in a Commercial',
     role: 'Senior VFX Artist', studio: 'The Mill LA', icon: '📢',
+    summary: 'Look development of the LEGO assets and the Blade Runner Spinner; shot lighting for the Spinner and all volumetrics.',
     image: '/images/walmart-famous-visitors.jpg',
     modal: {
       blurb: 'This commercial was an absolute blast to work on. I was involved with the LEGO and Blade Runner portions of the spot, and as a lifelong LEGO fan, getting to work on the LEGO characters and spaceship really brought out my inner kid. I was responsible for the look development of the LEGO assets and the Spinner from Blade Runner, as well as the shot lighting for the Spinner and all volumetrics.',
@@ -97,6 +99,7 @@ function WorkModal({ card, onClose }: { card: Card; onClose: () => void }) {
           </div>
           <button
             onClick={onClose}
+            aria-label="Close"
             style={{
               background: 'none', border: '0.5px solid var(--border)', cursor: 'pointer',
               color: 'var(--text-muted)', fontSize: 18, lineHeight: 1,
@@ -117,6 +120,7 @@ function WorkModal({ card, onClose }: { card: Card; onClose: () => void }) {
               <div style={{ aspectRatio: '16/9', position: 'relative' }}>
                 <iframe
                   src={clip.url}
+                  title={`${card.title}: ${clip.label}`}
                   style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none' }}
                   allow="autoplay; fullscreen"
                   allowFullScreen
@@ -167,18 +171,20 @@ function WorkCard({ card, onClick }: { card: Card; onClick?: () => void }) {
         overflow: 'hidden', position: 'relative',
       }}>
         {card.image
-          ? <img src={card.image} alt={card.title} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+          ? <img src={card.image} alt={`Still from ${card.title}`} loading="lazy" decoding="async" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
           : <span>◻</span>
         }
+        {/* The chip is the keyboard and screen reader way in (its click bubbles to the card); the card's text
+            stays plain content, so the badge and summary are still read out. */}
         {clickable && (
-          <div style={{
-            position: 'absolute', bottom: 10, right: 10,
+          <button type="button" aria-label={`Learn more about ${card.title}`} style={{
+            position: 'absolute', bottom: 10, right: 10, font: 'inherit', cursor: 'pointer',
             fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase',
             background: 'var(--overlay-panel)', color: 'var(--accent)',
             border: '0.5px solid var(--border-teal)', padding: '4px 8px',
           }}>
             Learn more
-          </div>
+          </button>
         )}
       </div>
       <div style={{ position: 'absolute', top: 28, right: 28, fontSize: 11, color: 'var(--text-ghost)', letterSpacing: '0.06em' }}>
@@ -198,6 +204,7 @@ function WorkCard({ card, onClick }: { card: Card; onClick?: () => void }) {
       )}
       <div style={{ fontSize: 16, fontWeight: 500, color: 'var(--text)', marginBottom: 4 }}>{card.title}</div>
       <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{card.role}&nbsp;·&nbsp;{card.studio}</div>
+      {card.summary && <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6, margin: '10px 0 0' }}>{card.summary}</p>}
     </div>
   )
 }

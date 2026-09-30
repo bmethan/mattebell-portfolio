@@ -13,6 +13,8 @@ export default function Reel({ reelUrl }: { reelUrl?: string }) {
         {reelUrl ? (
           <iframe
             src={reelUrl}
+            title="Matthew Bell, look development and lighting reel"
+            loading="lazy"
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none' }}
             allow="autoplay; fullscreen"
             allowFullScreen
@@ -27,9 +29,9 @@ export default function Reel({ reelUrl }: { reelUrl?: string }) {
         )}
       </div>
       <div className="reel-bar" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 48px' }}>
-        <span style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>2024 Showreel</span>
+        <span style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Look development &amp; lighting reel</span>
         <a href="https://vimeo.com/user6348780" target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-dim)', textDecoration: 'none' }}>
-          ↓ Download reel
+          Watch on Vimeo →
         </a>
       </div>
     </section>

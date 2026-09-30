@@ -7,7 +7,7 @@ const LANES = [
     title: 'Lighting and look development',
     items: [
       'Asset lookdev, sequence and shot lighting, and lighting TD work for feature film, episodic and commercials',
-      'Unreal Engine lighting and lookdev for real-time and virtual production',
+      'Unreal Engine environments, lighting and lookdev for episodic, real-time and virtual production, including environment work on the final season of The Flash',
       'Senior generalist across the pipeline, from environments and FX to final comp',
       'VFX consultation',
       'Texas-based, for productions hiring Texas crew under the state incentive',

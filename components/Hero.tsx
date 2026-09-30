@@ -37,7 +37,7 @@ export default function Hero({ years }: { years: number }) {
       </h1>
 
       <p style={{ fontSize: 15, color: 'var(--text-muted)', maxWidth: 580, lineHeight: 1.8, marginBottom: 40 }}>
-        {years} years in 3D and visual effects, with credits on three Oscar-nominated productions.{' '}
+        {years} years in 3D and visual effects, with lead roles on three Oscar-nominated productions.{' '}
         <strong style={{ color: 'var(--text-soft)', fontWeight: 500 }}>A specialist in lighting and look development</strong>
         {' for film, episodic TV and real-time production, and a creative technologist building generative AI and real-time tools. Based in San Antonio, working remote or on-location.'}
       </p>

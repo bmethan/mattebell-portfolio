@@ -23,8 +23,8 @@ const VIMEO = (id: string) =>
 const DEFAULT_CARDS: Card[] = [
   { title: 'Ready Player One', year: '2018', type: 'Feature film', badge: 'Spielberg', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/rpocard.jpg' },
   { title: 'Iron Man 3', year: '2013', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/im3card.jpg' },
-  { title: 'Real Steel', year: '2011', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬', image: '/images/realsteelcard.jpg' },
-  { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated production', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain', icon: '🎬', image: '/images/startrekcard.jpg' },
+  { title: 'Real Steel', year: '2011', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/realsteelcard.jpg' },
+  { title: 'Star Trek', year: '2009', type: 'Feature film', badge: 'Oscar-nominated production', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', icon: '🎬', image: '/images/startrekcard.jpg' },
   { title: 'Legends of Tomorrow', year: '2021–23', type: 'Television series', badge: '', role: 'Sequence Lighting', studio: 'Zoic Studios', icon: '📺', image: '/images/lotcard.jpg' },
   {
     title: 'Walmart: Famous Visitors', year: '2021', type: 'Commercial',

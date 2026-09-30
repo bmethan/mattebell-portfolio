@@ -7,7 +7,7 @@ const timeline: { year: string; role: string; studio: string; note: string; href
   { year: '2019–20', role: 'Senior VFX Artist', studio: 'The Mill LA', note: "Walmart 'Famous Visitors' (VES Award: Outstanding VFX in a Commercial)" },
   { year: '2016–17', role: 'Lighting Lead', studio: 'Digital Domain', note: 'Ready Player One · X-Men: Apocalypse' },
   { year: '2012–13', role: 'LookDev & Lighting Lead', studio: 'Digital Domain', note: 'Iron Man 3 (Oscar-nominated production) · G.I. Joe: Retaliation' },
-  { year: '2007–12', role: 'Senior LookDev & Lighting Artist', studio: 'Digital Domain · Method Studios · Dr. D Studios · Motion Theory', note: "Star Trek · Real Steel (Oscar-nominated productions) · Wrath of the Titans · Happy Feet 2 · NFL Network 'Run' (Emmy-winning promo; lighter)" },
+  { year: '2007–12', role: 'LookDev & Lighting Lead · Senior Artist', studio: 'Digital Domain · Method Studios · Dr. D Studios · Motion Theory', note: "Star Trek · Real Steel (Oscar-nominated productions, as lead) · Wrath of the Titans · Happy Feet 2 · NFL Network 'Run' (Emmy-winning promo, as lighter)" },
   { year: '1998–07', role: 'LightWave3D Expert / Demo Artist · Graphic Designer', studio: 'NewTek Inc. · NewTek Europe · News 9 San Antonio', note: '' },
 ]
 
@@ -33,7 +33,7 @@ type Settings = {
 
 const DEFAULT_BIO = (years: number) => [
   `<strong>Matthew Bell.</strong> Senior VFX Artist and Creative Technologist with ${years} years in 3D and visual effects, across feature film, episodic television, commercials, and real-time production. Core specialist in lighting and look development, and a trusted generalist across the full pipeline.`,
-  'Lighting and look development on three Oscar-nominated productions (Iron Man 3, Real Steel, and Star Trek) with credits spanning Digital Domain, MPC, The Mill, Method Studios, Zero VFX, Zoic Studios, and more.',
+  "Lighting and look development lead on three Oscar-nominated productions (Iron Man 3, Real Steel, and Star Trek) and on Spielberg's Ready Player One, with credits spanning Digital Domain, MPC, The Mill, Method Studios, Zero VFX, Zoic Studios, and more.",
   "Senior artist on the VES Award-winning Walmart 'Famous Visitors' (Outstanding Visual Effects in a Commercial, 2021). Also available for VFX consultation across visualization, real-time pipeline, and UI/UX strategy. Open to remote and on-location engagements worldwide.",
   'Fluent in generative AI workflows, including ComfyUI and Flux pipelines, applied to pitch development and look exploration, with an eye toward production integration as the toolset matures.',
 ]

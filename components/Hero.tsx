@@ -1,12 +1,11 @@
-// Award stats name the award and his part in it, the way producers will check them: the VES and the Emmy went
-// to the productions (Walmart "Famous Visitors", The Mill; NFL Network "Run", Motion Theory), and he was on the
-// crew, as lighter on "Run".
+// The award stats follow the Oscar stat's pattern: the VES and the Emmy went to productions he worked on
+// (Walmart "Famous Visitors", The Mill; NFL Network "Run", Motion Theory, as lighter), not to him personally.
 const stats = (years: number) => [
   { num: `${years}+`, label: 'Years experience' },
   { num: '20+', label: 'Feature film credits' },
   { num: '3×', label: 'Oscar-nominated productions' },
-  { num: 'VES', label: 'Award-winning spot (crew)' },
-  { num: 'Emmy', label: 'Award-winning spot (lighter)' },
+  { num: '1×', label: 'VES Award-winning production' },
+  { num: '1×', label: 'Emmy-winning production' },
 ]
 
 export default function Hero({ years }: { years: number }) {

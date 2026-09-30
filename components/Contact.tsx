@@ -14,6 +14,7 @@ const TOPICS = [
   'Generative AI R&D and pipelines',
   'Real-time prototypes and custom tools',
   'Consultation',
+  'A talk or panel',
   'Something else',
 ]
 

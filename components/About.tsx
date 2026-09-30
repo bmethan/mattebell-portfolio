@@ -1,4 +1,8 @@
-const timeline = [
+// A row may link to a public source for its claim (the event's own speaker page, for talks).
+const SASTW_TALK = 'https://www.sasw.co/speakers/matthew-bell'
+
+const timeline: { year: string; role: string; studio: string; note: string; href?: string }[] = [
+  { year: '2026', role: 'Speaker', studio: 'San Antonio Startup + Tech Week', note: "'Big Work, Small Teams: The Future of Entertainment, Film, and Interactive Experiences'", href: SASTW_TALK },
   { year: '2020–', role: 'Freelance Senior LookDev & Lighting / Visualization Consultant', studio: 'Zero VFX · Zoic Studios · Reactor VFX · Artjail · and others', note: 'Challengers · The Instigators · Good Burger 2 · The Flash · Mrs. Davis · Hello Tomorrow!' },
   { year: '2019–20', role: 'Senior VFX Artist', studio: 'The Mill LA', note: "Walmart 'Famous Visitors' (VES Award: Outstanding VFX in a Commercial)" },
   { year: '2016–17', role: 'Lighting Lead', studio: 'Digital Domain', note: 'Ready Player One · X-Men: Apocalypse' },
@@ -16,6 +20,7 @@ const pills = [
   { label: 'Virtual production', accent: false },
   { label: 'Fur & hair groom', accent: false },
   { label: 'Generative AI / R&D', accent: false },
+  { label: 'Public speaker', accent: false },
 ]
 
 type Settings = {
@@ -81,7 +86,17 @@ export default function About({ settings, years }: { settings: Settings; years: 
               <div>
                 <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)', marginBottom: 2 }}>{t.role}</div>
                 <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{t.studio}</div>
-                {t.note && <div style={{ fontSize: 11, color: 'var(--text-ghost)', marginTop: 3, fontStyle: 'italic' }}>{t.note}</div>}
+                {t.note && (
+                  <div style={{ fontSize: 11, color: 'var(--text-ghost)', marginTop: 3, fontStyle: 'italic' }}>
+                    {t.href ? (
+                      <a href={t.href} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-dim)', textDecoration: 'none' }}>
+                        {t.note} →
+                      </a>
+                    ) : (
+                      t.note
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           ))}

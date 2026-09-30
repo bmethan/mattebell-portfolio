@@ -38,6 +38,14 @@ body {
 .lab-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: pan-y; outline: none; }
 .lab-canvas:active { cursor: grabbing; }
 .lab-canvas:focus-visible { outline: 1px solid var(--border-teal); outline-offset: -1px; }
+/* Where :has() works, the ring is drawn above everything in the frame, since the still can cover the canvas. */
+@supports selector(:has(*)) {
+  .lab-canvas:focus-visible { outline: none; }
+  .lab-frame:has(.lab-canvas:focus-visible)::after { content: ''; position: absolute; inset: 0; z-index: 1; border: 1px solid var(--border-teal); pointer-events: none; }
+}
+.lab-still { position: absolute; inset: 0; pointer-events: none; transition: opacity 0.35s ease; }
+.lab-still.gone { opacity: 0; }
+.lab-still-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .lab-hud { position: absolute; top: 12px; max-width: calc(100% - 28px); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-muted); pointer-events: none; white-space: pre-wrap; font-variant-numeric: tabular-nums; }
 .lab-hud-left { left: 14px; }
 .lab-hud-right { right: 14px; text-align: right; }
@@ -107,7 +115,7 @@ body {
 
 @media (max-width: 768px) {
   /* Lookdev lab */
-  .lab-frame { aspect-ratio: 4 / 3; }
+  .lab-frame { aspect-ratio: 4 / 3; } /* keep in step with the <source> media query in LookdevLab's Still */
   .lab-hud-left, .lab-hud-right { max-width: calc(50% - 20px); }
   .lab-row { gap: 12px 20px; }
 

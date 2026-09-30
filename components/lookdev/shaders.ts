@@ -1080,6 +1080,7 @@ void main() {
 export const DISPLAY_FRAG = /* glsl */ `${HEADER}
 ${COMMON}
 uniform sampler2D uAccum;
+uniform int uAccumDiv;  // 1 for the accumulation; k for a 1/k-resolution preview (nearest, like an IPR proxy)
 uniform sampler3D uAcesLut;
 uniform int uAcesReady;
 uniform float uExposure;
@@ -1158,7 +1159,7 @@ vec3 aces2(vec3 ap1) {
 }
 
 void main() {
-  vec3 c = texelFetch(uAccum, ivec2(gl_FragCoord.xy), 0).rgb;
+  vec3 c = texelFetch(uAccum, ivec2(gl_FragCoord.xy) / uAccumDiv, 0).rgb;
   if (uPass == 4) { outColor = vec4(c, 1.0); return; }                                   // normals: raw data
   if (uPass == 3) { outColor = vec4(srgbOETF(max(AP1_TO_REC709 * c, 0.0)), 1.0); return; } // albedo
   c = max(c, 0.0) * exp2(uExposure);

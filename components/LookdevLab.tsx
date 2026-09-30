@@ -1,9 +1,9 @@
 'use client'
 import { useEffect, useId, useRef, useState } from 'react'
-import Image from 'next/image'
 import {
   LookdevEngine,
   DEFAULT_STATE,
+  isPosterState,
   BALL_X,
   TARGET_SPP,
   type LabState,
@@ -29,6 +29,9 @@ const VIEWS: { id: View; label: string }[] = [
   { id: 'standard', label: 'Standard' },
 ]
 
+const TOUCH_SLOP = 8 // px a finger must travel sideways before it drags the light
+const POSTER_SPP = 2048 // samples per pixel of poster.jpg, the converged render of the default settings
+
 const AZ_RANGE = 5.2
 const EL_MIN = 0.05
 const EL_MAX = 1.35
@@ -40,6 +43,18 @@ function Pill({ on, onClick, children }: { on: boolean; onClick: () => void; chi
     <button type="button" className={`lab-pill${on ? ' on' : ''}`} aria-pressed={on} onClick={onClick}>
       {children}
     </button>
+  )
+}
+
+// The renderer's own 2048 spp image of the default settings, one per frame shape (the frame is 4:3 on narrow
+// screens). A <picture> downloads only the one that is shown; the files are served exactly as rendered.
+// object-fit contain: the camera keeps a fixed horizontal extent, so a still lines up with the live frame.
+function Still({ alt }: { alt: string }) {
+  return (
+    <picture>
+      <source media="(max-width: 768px)" srcSet="/lookdev/poster-4x3.jpg" />
+      <img className="lab-still-img" src="/lookdev/poster.jpg" alt={alt} decoding="async" />
+    </picture>
   )
 }
 
@@ -61,25 +76,37 @@ export default function LookdevLab() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<LookdevEngine | null>(null)
   const labRef = useRef<LabState>(DEFAULT_STATE)
-  const dragging = useRef(false)
+  const dragging = useRef<number | null>(null) // pointerId of the drag moving the light
+  const touchStart = useRef<{ id: number; x: number; y: number } | null>(null)
 
   const [lab, setLab] = useState<LabState>(DEFAULT_STATE)
-  const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false })
+  const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false, preview: false })
   const [mode, setMode] = useState<'idle' | 'live' | 'fallback'>('idle')
   const [labels, setLabels] = useState<{ x: number; y: number }[]>([])
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
   const [paused, setPaused] = useState(false)
   const [ready, setReady] = useState(false)
-
-  useEffect(() => {
-    labRef.current = lab
-  }, [lab])
+  // The still is the renderer's own converged image of the default settings, so the live render (IPR) only
+  // runs once something differs: the first edit (a click or drag on the frame, an arrow key, any control)
+  // starts it, and putting every setting back shows the still again with the GPU idle. Hover and scrolling
+  // past never cost anything.
+  const pristine = isPosterState(lab)
+  const [liveShown, setLiveShown] = useState(false) // the live render has drawn a frame since it (re)started
 
   const update = (patch: Partial<LabState>) => {
-    setLab(prev => ({ ...prev, ...patch }))
-    // Anything beyond exposure or view transform re-renders, so a previous furnace reading no longer applies.
-    if (Object.keys(patch).some(k => k !== 'exposure' && k !== 'view')) setFurnaceMean(null)
+    const next = { ...labRef.current, ...patch }
+    labRef.current = next
+    setLab(next)
+    // Anything beyond exposure or view transform re-renders from zero samples, so the previous count and
+    // furnace reading no longer apply.
+    if (Object.keys(patch).some(k => k !== 'exposure' && k !== 'view')) {
+      setFurnaceMean(null)
+      setStatus(s => ({ ...s, spp: 0, converged: false, preview: false }))
+    }
+    const toStill = isPosterState(next)
+    if (toStill) setLiveShown(false)
     engineRef.current?.setState(patch)
+    engineRef.current?.setActive(!toStill)
   }
 
   // Create the renderer once the page is idle (or earlier, if the section comes into view first), so its
@@ -102,6 +129,7 @@ export default function LookdevLab() {
     // When the white furnace test converges, measure the mean radiance over the spheres.
     const handleStatus = (s: LabStatus) => {
       setStatus(s)
+      if (s.spp > 0 || s.preview) setLiveShown(true)
       if (s.converged && labRef.current.furnace && engineRef.current) {
         const m = engineRef.current.readSphereMean()
         setFurnaceMean(m ? (m[0] + m[1] + m[2]) / 3 : null)
@@ -131,6 +159,7 @@ export default function LookdevLab() {
         setMode('live')
         layout()
         e.setVisible(visible)
+        e.setActive(!isPosterState(labRef.current))
         e.whenReady.then(
           ok => {
             if (ok && engine === e) setReady(true)
@@ -160,6 +189,7 @@ export default function LookdevLab() {
       engine = null
       engineRef.current = null
       setReady(false)
+      setLiveShown(false)
       setPaused(true)
     }
     const onContextRestored = () => {
@@ -177,24 +207,30 @@ export default function LookdevLab() {
       cancelIdle = () => clearTimeout(id)
     }
 
-    io = new IntersectionObserver(
-      entries => {
-        visible = entries.some(en => en.isIntersecting)
-        if (visible) start()
-        engine?.setVisible(visible)
-      },
-      { rootMargin: '200px 0px' },
-    )
+    // Approaching the section starts the renderer early if the idle callback has not yet; only a frame that is
+    // actually on screen renders.
+    io = new IntersectionObserver(entries => entries.some(en => en.isIntersecting) && start(), {
+      rootMargin: '200px 0px',
+    })
     io.observe(section)
+    const onScreen = new IntersectionObserver(entries => {
+      visible = entries.some(en => en.isIntersecting)
+      engine?.setVisible(visible)
+    })
+    onScreen.observe(frame)
     const ro = new ResizeObserver(layout)
     ro.observe(frame)
     return () => {
       cancelIdle()
       io?.disconnect()
+      onScreen.disconnect()
       ro.disconnect()
       canvas.removeEventListener('webglcontextrestored', onContextRestored)
       engine?.dispose()
       engineRef.current = null
+      // Fast Refresh keeps state across a remount, but the next engine starts cold.
+      setReady(false)
+      setLiveShown(false)
     }
   }, [])
 
@@ -205,25 +241,47 @@ export default function LookdevLab() {
     update({ keyAz: (u - 0.5) * AZ_RANGE, keyEl: clamp(EL_MAX - v * (EL_MAX - EL_MIN) * 1.1, EL_MIN, EL_MAX) })
   }
 
-  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (lab.furnace || !ready) return
-    dragging.current = true
+  const beginDrag = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    dragging.current = e.pointerId
     e.currentTarget.setPointerCapture(e.pointerId)
     engineRef.current?.setInteracting(true)
     setFromPointer(e)
   }
-  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (dragging.current) setFromPointer(e)
+  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (lab.furnace || !ready || dragging.current !== null) return
+    if (e.pointerType !== 'touch') {
+      if (e.button === 0) beginDrag(e) // mouse or pen: press places the light, a drag moves it
+      return
+    }
+    // Touch: only a sideways drag moves the light. A vertical move is a page scroll (touch-action: pan-y hands
+    // it to the browser, which cancels the pointer), and a tap is often just stopping a scroll fling, so
+    // neither changes anything.
+    touchStart.current = { id: e.pointerId, x: e.clientX, y: e.clientY }
   }
-  const endDrag = () => {
-    if (!dragging.current) return
-    dragging.current = false
+  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (dragging.current !== null) {
+      if (e.pointerId === dragging.current) setFromPointer(e) // one pointer drives the light
+      return
+    }
+    const s = touchStart.current
+    if (!s || s.id !== e.pointerId) return
+    const dx = e.clientX - s.x
+    const dy = e.clientY - s.y
+    if (Math.abs(dx) >= TOUCH_SLOP && Math.abs(dx) > Math.abs(dy)) {
+      touchStart.current = null
+      beginDrag(e)
+    }
+  }
+  const endDrag = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (touchStart.current?.id === e.pointerId) touchStart.current = null
+    if (dragging.current !== e.pointerId) return
+    dragging.current = null
     engineRef.current?.setInteracting(false)
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
     if (lab.furnace || !ready) return
     const s = 0.08
-    let { keyAz, keyEl } = lab
+    let { keyAz, keyEl } = labRef.current // held keys repeat faster than React re-renders
     if (e.key === 'ArrowLeft') keyAz -= s
     else if (e.key === 'ArrowRight') keyAz += s
     else if (e.key === 'ArrowUp') keyEl += s
@@ -258,13 +316,7 @@ export default function LookdevLab() {
 
       <div ref={frameRef} className="lab-frame">
         {mode === 'fallback' ? (
-          <Image
-            src="/lookdev/poster.jpg"
-            alt="Path traced lookdev reference balls: an 18% gray card ball, a chromium ball and a clear coated car paint ball under a three point softbox rig"
-            fill
-            sizes="(max-width: 768px) 100vw, 1200px"
-            style={{ objectFit: 'contain' }}
-          />
+          <Still alt="Path traced lookdev reference balls: an 18% gray card ball, a chromium ball and a clear coated car paint ball under a three point softbox rig" />
         ) : (
           <canvas
             ref={canvasRef}
@@ -281,17 +333,26 @@ export default function LookdevLab() {
           />
         )}
 
-        {mode !== 'fallback' && !ready && (
-          <>
-            {/* contain: the camera keeps a fixed horizontal extent, so the still lines up with the live frame */}
-            <Image src="/lookdev/poster.jpg" alt="" fill sizes="(max-width: 768px) 100vw, 1200px" style={{ objectFit: 'contain' }} />
-            <div className="lab-hud lab-hud-left">
-              {paused
-                ? 'Renderer paused. It resumes when the browser restores graphics.'
-                : 'Still frame. The live renderer is compiling its shaders.'}
-            </div>
-          </>
+        {mode !== 'fallback' && (
+          // The still covers the canvas for the default settings, and after an edit until the live render has
+          // drawn its first frame.
+          <div className={`lab-still${ready && !pristine && liveShown ? ' gone' : ''}`}>
+            <Still alt="" />
+          </div>
         )}
+        {mode !== 'fallback' && !ready && (
+          <div className="lab-hud lab-hud-left">
+            {paused
+              ? 'Renderer paused. It resumes when the browser restores graphics.'
+              : 'Still frame. The live renderer is compiling its shaders.'}
+          </div>
+        )}
+        {mode === 'live' &&
+          labels.map((p, i) => (
+            <div key={i} className="lab-ball-label" style={{ left: `${p.x * 100}%`, top: `calc(${p.y * 100}% + 12px)` }}>
+              {ballNames[i]}
+            </div>
+          ))}
         {mode === 'live' && ready && (
           <>
             <div className="sr-only" aria-live="polite">
@@ -303,17 +364,21 @@ export default function LookdevLab() {
             <div className="lab-hud lab-hud-right">
               {PASSES.find(p => p.id === lab.pass)?.label}
               {'  '}
-              {status.converged ? `${status.spp} spp` : `${status.spp} / ${status.target} spp`}
+              {pristine
+                ? `${POSTER_SPP} spp`
+                : status.preview
+                  ? 'Preview'
+                  : status.converged
+                    ? `${status.spp} spp`
+                    : `${status.spp} / ${status.target} spp`}
             </div>
-            <div className="lab-progress" style={{ transform: `scaleX(${status.spp / status.target})` }} />
+            <div
+              className="lab-progress"
+              style={{ transform: `scaleX(${pristine ? 1 : status.spp / status.target})` }}
+            />
             {lab.key && !lab.furnace && (
               <div className="lab-marker" style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }} />
             )}
-            {labels.map((p, i) => (
-              <div key={i} className="lab-ball-label" style={{ left: `${p.x * 100}%`, top: `calc(${p.y * 100}% + 12px)` }}>
-                {ballNames[i]}
-              </div>
-            ))}
           </>
         )}
         {mode === 'fallback' && (

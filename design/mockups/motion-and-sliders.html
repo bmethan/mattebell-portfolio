@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sliders and working indicators</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0b; --bg-alt: #0d0d10; --bg-card: #111114; --bg-teal: #0d1a16;
+    --border: #2a2a2e; --border-subtle: #1e1e22; --border-teal: #0F6E56;
+    --accent: #5DCAA5; --on-accent: #04342C;
+    --text: #e8e6e0; --text-bright: #f0ede8; --text-soft: #b4b2a9; --text-muted: #888780; --text-dim: #5F5E5A;
+    --danger: #e05c5c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: Geist, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  main { max-width: 1120px; margin: 0 auto; padding: 56px 24px 96px; }
+  .eyebrow { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+  .eyebrow span { display: inline-block; width: 16px; height: 1px; background: var(--accent); }
+  h2 { font-size: 26px; font-weight: 500; color: var(--text-bright); letter-spacing: -0.01em; margin: 0 0 10px; }
+  p.lede { font-size: 14px; color: var(--text-muted); line-height: 1.8; max-width: 680px; margin: 0 0 32px; }
+  section { padding: 40px 0 56px; border-bottom: 0.5px solid var(--border); }
+  .label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1px; background: var(--border-subtle); border: 0.5px solid var(--border-subtle); }
+  .card { background: var(--bg); padding: 22px 24px 26px; }
+  .card h3 { font-size: 12px; font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-soft); margin: 0 0 6px; }
+  .card .note { font-size: 12px; color: var(--text-dim); line-height: 1.6; margin: 0 0 18px; min-height: 38px; }
+  .row { display: flex; align-items: center; gap: 12px; margin: 12px 0; }
+  .readout { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; min-width: 44px; }
+  .pill { font: inherit; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; padding: 5px 9px; background: transparent; color: var(--text-muted); border: 0.5px solid var(--border); cursor: pointer; }
+  .pill.on { color: var(--accent); border-color: var(--border-teal); background: var(--bg-teal); }
+  .pill:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* ── Slider A: today's native range ─────────────────────── */
+  .range-native { width: 140px; accent-color: var(--accent); }
+
+  /* ── Sliders B and C: the skill-bar track with a vertical bar handle ── */
+  .range { --pct: 50%; -webkit-appearance: none; appearance: none; width: 140px; height: 20px; margin: 0; background: transparent; cursor: pointer; }
+  .range:focus { outline: none; }
+  .range::-webkit-slider-runnable-track {
+    height: 20px;
+    background:
+      linear-gradient(var(--accent), var(--accent)) 0 50% / var(--pct) 2px no-repeat,
+      linear-gradient(var(--border), var(--border)) 0 50% / 100% 2px no-repeat;
+  }
+  .range::-moz-range-track { height: 2px; background: var(--border); }
+  .range::-moz-range-progress { height: 2px; background: var(--accent); }
+  /* The visible handle is a 2px bar; the 12px thumb around it is the hit area. */
+  .range::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 12px; height: 16px; margin-top: 2px; border: 0;
+    background: linear-gradient(90deg, transparent 5px, var(--text-bright) 5px, var(--text-bright) 7px, transparent 7px);
+    transition: height 0.12s, margin-top 0.12s;
+  }
+  .range::-moz-range-thumb { width: 12px; height: 16px; border: 0; border-radius: 0; background: linear-gradient(90deg, transparent 5px, var(--text-bright) 5px, var(--text-bright) 7px, transparent 7px); }
+  .range:hover::-webkit-slider-thumb, .range:active::-webkit-slider-thumb { height: 20px; margin-top: 0; }
+  .range:focus-visible::-webkit-slider-thumb { background: linear-gradient(90deg, transparent 3px, var(--accent) 3px, var(--accent) 9px, transparent 9px); }
+  .range:focus-visible::-moz-range-thumb { background: linear-gradient(90deg, transparent 3px, var(--accent) 3px, var(--accent) 9px, transparent 9px); }
+  /* C adds instrument ticks every 10% under the track. */
+  .range.ticks::-webkit-slider-runnable-track {
+    background:
+      linear-gradient(var(--accent), var(--accent)) 0 50% / var(--pct) 2px no-repeat,
+      linear-gradient(var(--border), var(--border)) 0 50% / 100% 2px no-repeat,
+      repeating-linear-gradient(90deg, var(--text-dim) 0 1px, transparent 1px calc(10% - 0.1px)) 0 calc(50% + 6px) / 100% 3px no-repeat;
+  }
+  .range.teal-handle::-webkit-slider-thumb { background: linear-gradient(90deg, transparent 5px, var(--accent) 5px, var(--accent) 7px, transparent 7px); }
+  .range.teal-handle::-moz-range-thumb { background: linear-gradient(90deg, transparent 5px, var(--accent) 5px, var(--accent) 7px, transparent 7px); }
+
+  /* ── Indicators ─────────────────────────────────────────── */
+  .stage { display: flex; align-items: center; justify-content: center; height: 150px; background: #060607; border: 0.5px solid var(--border); margin-bottom: 16px; position: relative; }
+  .stage .axis-tag { position: absolute; right: 10px; bottom: 8px; font-size: 10px; letter-spacing: 0.14em; color: var(--text-dim); }
+  .context { display: flex; flex-direction: column; gap: 10px; }
+  .hud { display: flex; align-items: center; gap: 8px; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; background: var(--accent); color: var(--on-accent); font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; padding: 11px 18px; font-weight: 500; border: 0; width: 200px; }
+  canvas.ind { display: block; }
+  .where { font-size: 13px; color: var(--text-muted); line-height: 1.8; max-width: 760px; }
+  .where b { color: var(--text-soft); font-weight: 500; }
+  @media (prefers-reduced-motion: reduce) { .rm-note { display: block !important; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow"><span></span>Mockup<span></span></div>
+  <h2>Sliders and working indicators</h2>
+  <p class="lede">Two small pieces for the design system. Drag the sliders, and watch the indicators both at the size they would really appear on the site and enlarged. Everything here uses the site's own colors and type.</p>
+  <p class="lede" style="margin-top:-16px"><span style="color:var(--accent)">Chosen, 29 September 2026:</span> slider B (skill-bar track, bar handle) and indicator 2, the XYZ cube, drawn as edges. Built into the site as <code>.lab-range</code> in app/globals.css and <code>components/WorkIndicator.tsx</code>. This page is a standalone reference: open it directly in a browser.</p>
+
+  <section>
+    <div class="eyebrow"><span></span>01 Sliders<span></span></div>
+    <div class="grid">
+      <div class="card">
+        <h3>A. Today</h3>
+        <p class="note">The browser's own slider tinted teal. The round thumb is the only circle in the interface.</p>
+        <div class="row"><span class="label" style="width:78px">Key temp</span><input class="range-native" type="range" min="2500" max="9000" step="100" value="4300" data-unit="K"><span class="readout">4300K</span></div>
+        <div class="row"><span class="label" style="width:78px">Exposure</span><input class="range-native" type="range" min="-3" max="3" step="0.1" value="0.5" data-signed><span class="readout">+0.5</span></div>
+        <div class="row"><span class="label" style="width:78px">Roughness</span><input class="range-native" type="range" min="0" max="1" step="0.01" value="0.3" data-fixed="2"><span class="readout">0.30</span></div>
+      </div>
+      <div class="card">
+        <h3>B. Skill-bar track, bar handle</h3>
+        <p class="note">The same 2px track and teal fill as the skill meters, with a thin vertical handle like a fader or a timeline playhead. It grows on hover and turns teal on keyboard focus.</p>
+        <div class="row"><span class="label" style="width:78px">Key temp</span><input class="range" type="range" min="2500" max="9000" step="100" value="4300" data-unit="K"><span class="readout">4300K</span></div>
+        <div class="row"><span class="label" style="width:78px">Exposure</span><input class="range" type="range" min="-3" max="3" step="0.1" value="0.5" data-signed><span class="readout">+0.5</span></div>
+        <div class="row"><span class="label" style="width:78px">Roughness</span><input class="range" type="range" min="0" max="1" step="0.01" value="0.3" data-fixed="2"><span class="readout">0.30</span></div>
+      </div>
+      <div class="card">
+        <h3>C. B with ticks, teal handle</h3>
+        <p class="note">Adds faint ticks every 10% for an instrument feel, and colors the handle teal. More detail, slightly busier.</p>
+        <div class="row"><span class="label" style="width:78px">Key temp</span><input class="range ticks teal-handle" type="range" min="2500" max="9000" step="100" value="4300" data-unit="K"><span class="readout">4300K</span></div>
+        <div class="row"><span class="label" style="width:78px">Exposure</span><input class="range ticks teal-handle" type="range" min="-3" max="3" step="0.1" value="0.5" data-signed><span class="readout">+0.5</span></div>
+        <div class="row"><span class="label" style="width:78px">Roughness</span><input class="range ticks teal-handle" type="range" min="0" max="1" step="0.01" value="0.3" data-fixed="2"><span class="readout">0.30</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow"><span></span>02 Working indicators<span></span></div>
+    <p class="lede" style="margin-bottom:24px">Your reference turns out to be 3D in disguise: when the square collapses to a diagonal line, that is a square turned edge-on. These are real 3D rotations, drawn with depth shading (nearer points brighter). Try the glyph and color options.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>1. Pivot</h3>
+        <p class="note">Closest to your reference. The square turns 180 degrees about one diagonal, then the other.</p>
+        <div class="stage"><canvas class="ind" data-kind="pivot" data-size="120"></canvas></div>
+        <div class="pills" data-for="pivot" data-opt="glyph"><button class="pill on" data-v="dot">Dots</button><button class="pill" data-v="bar">Bars</button><button class="pill" data-v="dash">Dashes</button><button class="pill" data-v="square">Squares</button></div>
+      </div>
+      <div class="card">
+        <h3>2. XYZ cube</h3>
+        <p class="note">At rest it is the same four dots. Mid-turn the hidden back corners appear: it is a cube, turning a quarter about X, then Y, then Z.</p>
+        <div class="stage"><canvas class="ind" data-kind="cube" data-size="120"></canvas><span class="axis-tag" data-axis-for="cube"></span></div>
+        <div class="pills" data-for="cube" data-opt="glyph"><button class="pill on" data-v="dot">Dots</button><button class="pill" data-v="bar">Bars</button><button class="pill" data-v="square">Squares</button><button class="pill" data-v="edges">Edges</button></div>
+      </div>
+      <div class="card">
+        <h3>3. Axis gizmo</h3>
+        <p class="note">The viewport gizmo from every DCC, stepping a quarter turn at a time like a turntable. Red, green, blue is the industry convention; teal keeps it on brand.</p>
+        <div class="stage"><canvas class="ind" data-kind="gizmo" data-size="120"></canvas></div>
+        <div class="pills" data-for="gizmo" data-opt="color"><button class="pill on" data-v="dcc">X Y Z colors</button><button class="pill" data-v="teal">Teal</button></div>
+      </div>
+    </div>
+
+    <div class="eyebrow" style="margin-top:36px"><span></span>At real size<span></span></div>
+    <div class="grid">
+      <div class="card context">
+        <h3>Lab: compiling</h3>
+        <div class="hud"><canvas class="ind" data-kind="pivot" data-size="12"></canvas>Compiling shaders</div>
+        <div class="hud"><canvas class="ind" data-kind="cube" data-size="12"></canvas>Compiling shaders</div>
+        <div class="hud"><canvas class="ind" data-kind="gizmo" data-size="12"></canvas>Compiling shaders</div>
+      </div>
+      <div class="card context">
+        <h3>Lab: rendering, with render time</h3>
+        <div class="hud"><canvas class="ind" data-kind="pivot" data-size="12"></canvas>Rendering <span data-clock></span>&nbsp;&nbsp;384 / 1024 spp</div>
+        <div class="hud"><canvas class="ind" data-kind="cube" data-size="12"></canvas>Rendering <span data-clock></span>&nbsp;&nbsp;384 / 1024 spp</div>
+        <div class="hud"><canvas class="ind" data-kind="gizmo" data-size="12"></canvas>Rendering <span data-clock></span>&nbsp;&nbsp;384 / 1024 spp</div>
+      </div>
+      <div class="card context">
+        <h3>Contact: sending</h3>
+        <div class="btn"><canvas class="ind" data-kind="pivot" data-size="12" data-ink="on-accent"></canvas>Sending</div>
+        <div class="btn"><canvas class="ind" data-kind="cube" data-size="12" data-ink="on-accent"></canvas>Sending</div>
+      </div>
+    </div>
+    <p class="where" style="margin-top:28px"><b>Where it would live:</b> only while something is actually working. The lab while shaders compile and while it renders (with an elapsed render time, like an IPR), and the contact button while a message sends. Nowhere decorative, so the page stays calm. Visitors who ask their system for reduced motion get a still version.</p>
+    <p class="where rm-note" style="display:none"><b>Reduced motion is on for this device,</b> so the indicators are shown still.</p>
+  </section>
+</main>
+
+<script>
+(() => {
+  // ── Sliders: readouts, plus the fill amount for the custom track ──
+  for (const input of document.querySelectorAll('input[type=range]')) {
+    const out = input.nextElementSibling
+    const sync = () => {
+      const v = +input.value, min = +input.min, max = +input.max
+      input.style.setProperty('--pct', ((v - min) / (max - min)) * 100 + '%')
+      let s = input.dataset.fixed ? v.toFixed(+input.dataset.fixed) : input.dataset.signed !== undefined ? (v >= 0 ? '+' : '') + v.toFixed(1) : String(v)
+      out.textContent = s + (input.dataset.unit || '')
+    }
+    input.addEventListener('input', sync)
+    sync()
+  }
+
+  // ── Indicators ──
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim()
+  const ACCENT = css('--accent'), ON_ACCENT = css('--on-accent'), RED = css('--danger')
+  const BLUE = '#6f93d6'
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches
+  const opts = { pivot: { glyph: 'dot' }, cube: { glyph: 'dot' }, gizmo: { color: 'dcc' } }
+  for (const group of document.querySelectorAll('.pills')) {
+    group.addEventListener('click', e => {
+      const b = e.target.closest('.pill'); if (!b) return
+      group.querySelectorAll('.pill').forEach(p => p.classList.toggle('on', p === b))
+      opts[group.dataset.for][group.dataset.opt] = b.dataset.v
+    })
+  }
+
+  const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2) // cubic in-out
+  // Rotate point p about unit axis k by angle a (Rodrigues).
+  const rot = (p, k, a) => {
+    const c = Math.cos(a), s = Math.sin(a), d = p[0] * k[0] + p[1] * k[1] + p[2] * k[2]
+    const x = [k[1] * p[2] - k[2] * p[1], k[2] * p[0] - k[0] * p[2], k[0] * p[1] - k[1] * p[0]]
+    return [0, 1, 2].map(i => p[i] * c + x[i] * s + k[i] * d * (1 - c))
+  }
+  const norm = v => { const l = Math.hypot(...v); return v.map(x => x / l) }
+  // A beat: turn for `turn` seconds, then hold. Returns the step index and eased progress.
+  const beat = (t, turn, hold) => { const T = turn + hold, i = Math.floor(t / T), f = Math.min(1, (t - i * T) / turn); return { i, f: ease(f) } }
+
+  const DIAG = [norm([1, -1, 0]), norm([1, 1, 0])]
+  const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  const SQUARE = [[-1, 1, 0], [1, 1, 0], [-1, -1, 0], [1, -1, 0]]
+  const CUBE = []; for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) CUBE.push([x, y, z])
+  const CUBE_EDGES = []; for (let a = 0; a < 8; a++) for (let b = a + 1; b < 8; b++) { const d = CUBE[a].reduce((n, v, i) => n + (v !== CUBE[b][i]), 0); if (d === 1) CUBE_EDGES.push([a, b]) }
+
+  // A half turn about a diagonal maps the square onto itself (and a quarter turn maps the cube onto itself), so
+  // every beat can start from the rest pose.
+  function pivotPoints(t) {
+    const { i, f } = beat(t, 0.42, 0.22)
+    return SQUARE.map(p => rot(p, DIAG[i % 2], Math.PI * f))
+  }
+  function cubePoints(t) {
+    const { i, f } = beat(t, 0.5, 0.26)
+    return { pts: CUBE.map(p => rot(p, AXES[i % 3], (Math.PI / 2) * f)), axis: 'XYZ'[i % 3] }
+  }
+  function gizmoFrame(t) {
+    const { i, f } = beat(t, 0.55, 0.35)
+    const yaw = (i + f) * (Math.PI / 2) + Math.PI / 4
+    const tilt = -0.52
+    return AXES.map(a => rot(rot(a.map(v => v * 1.15), [0, 1, 0], yaw), [1, 0, 0], tilt))
+  }
+
+  function drawGlyph(g, kind, x, y, r, a, ink) {
+    g.globalAlpha = a; g.fillStyle = ink
+    if (kind === 'dot') { g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill() }
+    else if (kind === 'bar') g.fillRect(x - r * 0.45, y - r * 1.6, r * 0.9, r * 3.2)
+    else if (kind === 'dash') g.fillRect(x - r * 1.6, y - r * 0.45, r * 3.2, r * 0.9)
+    else g.fillRect(x - r * 0.9, y - r * 0.9, r * 1.8, r * 1.8)
+  }
+
+  const canvases = [...document.querySelectorAll('canvas.ind')]
+  function setup(c) {
+    const css = +c.dataset.size, dpr = Math.max(1, Math.min(3, devicePixelRatio || 1))
+    c.style.width = c.style.height = css + 'px'
+    c.width = c.height = Math.round(css * dpr)
+    return { c, g: c.getContext('2d'), css, dpr }
+  }
+  const items = canvases.map(setup)
+  const clocks = [...document.querySelectorAll('[data-clock]')]
+  const start = performance.now()
+
+  function frame(now) {
+    const t = reduced ? 0 : Math.max(0, now - start) / 1000 // the first frame can be stamped before start
+    for (const { c, g, css, dpr } of items) {
+      const kind = c.dataset.kind, ink = c.dataset.ink === 'on-accent' ? ON_ACCENT : ACCENT
+      g.setTransform(dpr, 0, 0, dpr, 0, 0)
+      g.clearRect(0, 0, css, css)
+      const s = css * 0.28, cx = css / 2, cy = css / 2
+      const r = Math.max(0.9, css * 0.07)
+      const shade = z => 0.45 + 0.55 * (z + 1.5) / 3 // nearer (larger z) is brighter
+      if (kind === 'pivot') {
+        const pts = pivotPoints(t).sort((a, b) => a[2] - b[2])
+        for (const p of pts) drawGlyph(g, opts.pivot.glyph, cx + p[0] * s, cy - p[1] * s, r, Math.min(1, shade(p[2])), ink)
+      } else if (kind === 'cube') {
+        const { pts, axis } = cubePoints(t)
+        const tag = document.querySelector('[data-axis-for="cube"]'); if (tag && css > 40) tag.textContent = reduced ? '' : axis
+        const glyph = opts.cube.glyph
+        if (glyph === 'edges') {
+          g.lineWidth = Math.max(1, css / 90); g.strokeStyle = ink
+          for (const [a, b] of CUBE_EDGES) {
+            const pa = pts[a], pb = pts[b]
+            g.globalAlpha = Math.min(1, shade((pa[2] + pb[2]) / 2)) * 0.9
+            g.beginPath(); g.moveTo(cx + pa[0] * s, cy - pa[1] * s); g.lineTo(cx + pb[0] * s, cy - pb[1] * s); g.stroke()
+          }
+        } else {
+          for (const p of [...pts].sort((a, b) => a[2] - b[2])) drawGlyph(g, glyph, cx + p[0] * s, cy - p[1] * s, r * 0.9, Math.min(1, shade(p[2])), ink)
+        }
+      } else if (kind === 'gizmo') {
+        const tips = gizmoFrame(t)
+        const cols = opts.gizmo.color === 'dcc' ? [RED, ACCENT, BLUE] : [ACCENT, ACCENT, ACCENT]
+        const order = [0, 1, 2].sort((a, b) => tips[a][2] - tips[b][2])
+        const gs = css * 0.34
+        g.lineCap = 'round'
+        for (const k of order) {
+          const p = tips[k], a = Math.min(1, shade(p[2]))
+          g.globalAlpha = a; g.strokeStyle = cols[k]; g.lineWidth = Math.max(1, css / 70)
+          g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + p[0] * gs, cy - p[1] * gs); g.stroke()
+          drawGlyph(g, 'dot', cx + p[0] * gs, cy - p[1] * gs, r * 0.8, a, cols[k])
+          if (css > 40) {
+            g.globalAlpha = a * 0.9; g.fillStyle = cols[k]; g.font = `500 ${Math.round(css * 0.09)}px Geist, system-ui`
+            g.textAlign = 'center'; g.textBaseline = 'middle'
+            g.fillText('XYZ'[k], cx + p[0] * gs * 1.32, cy - p[1] * gs * 1.32)
+          }
+        }
+      }
+      g.globalAlpha = 1
+    }
+    const secs = Math.floor(t)
+    for (const el of clocks) el.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+    if (!reduced) requestAnimationFrame(frame)
+  }
+  requestAnimationFrame(frame)
+})()
+</script>
+</body>
+</html>

@@ -13,6 +13,7 @@ import {
 } from './lookdev/engine'
 import { HERO_PRESETS, HERO_ORDER } from './lookdev/materials'
 import { CITATIONS } from './lookdev/citations'
+import WorkIndicator from './WorkIndicator'
 
 const PASSES: { id: Pass; label: string }[] = [
   { id: 'beauty', label: 'Beauty' },
@@ -37,6 +38,42 @@ const EL_MIN = 0.05
 const EL_MAX = 1.35
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v))
 const deg = (r: number) => Math.round((r * 180) / Math.PI)
+// Render time as m:ss, as an IPR shows it.
+const clock = (ms: number) => {
+  const s = Math.floor(ms / 1000)
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+// A slider on the skill meters' track: --pct drives the teal fill (see .lab-range).
+function Range({
+  min,
+  max,
+  step,
+  value,
+  label,
+  onChange,
+}: {
+  min: number
+  max: number
+  step: number
+  value: number
+  label: string
+  onChange: (v: number) => void
+}) {
+  return (
+    <input
+      type="range"
+      className="lab-range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      aria-label={label}
+      style={{ '--pct': `${((value - min) / (max - min)) * 100}%` } as React.CSSProperties}
+      onChange={e => onChange(+e.target.value)}
+    />
+  )
+}
 
 function Pill({ on, onClick, children }: { on: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
@@ -80,7 +117,7 @@ export default function LookdevLab() {
   const touchStart = useRef<{ id: number; x: number; y: number } | null>(null)
 
   const [lab, setLab] = useState<LabState>(DEFAULT_STATE)
-  const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false, preview: false })
+  const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false, preview: false, ms: 0 })
   const [mode, setMode] = useState<'idle' | 'live' | 'fallback'>('idle')
   const [labels, setLabels] = useState<{ x: number; y: number }[]>([])
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
@@ -101,7 +138,7 @@ export default function LookdevLab() {
     // furnace reading no longer apply.
     if (Object.keys(patch).some(k => k !== 'exposure' && k !== 'view')) {
       setFurnaceMean(null)
-      setStatus(s => ({ ...s, spp: 0, converged: false, preview: false }))
+      setStatus(s => ({ ...s, spp: 0, converged: false, preview: false, ms: 0 }))
     }
     const toStill = isPosterState(next)
     if (toStill) setLiveShown(false)
@@ -342,9 +379,14 @@ export default function LookdevLab() {
         )}
         {mode !== 'fallback' && !ready && (
           <div className="lab-hud lab-hud-left">
-            {paused
-              ? 'Renderer paused. It resumes when the browser restores graphics.'
-              : 'Still frame. The live renderer is compiling its shaders.'}
+            {paused ? (
+              'Renderer paused. It resumes when the browser restores graphics.'
+            ) : (
+              <>
+                <WorkIndicator className="lab-work" />
+                Still frame. The live renderer is compiling its shaders.
+              </>
+            )}
           </div>
         )}
         {mode === 'live' &&
@@ -362,15 +404,14 @@ export default function LookdevLab() {
               {lab.furnace ? 'White furnace' : `Key ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el  ${lab.keyKelvin}K`}
             </div>
             <div className="lab-hud lab-hud-right">
+              {!pristine && !status.converged && <WorkIndicator className="lab-work" />}
               {PASSES.find(p => p.id === lab.pass)?.label}
               {'  '}
               {pristine
                 ? `${POSTER_SPP} spp`
                 : status.preview
                   ? 'Preview'
-                  : status.converged
-                    ? `${status.spp} spp`
-                    : `${status.spp} / ${status.target} spp`}
+                  : `${clock(status.ms)}  ${status.converged ? `${status.spp} spp` : `${status.spp} / ${status.target} spp`}`}
             </div>
             <div
               className="lab-progress"
@@ -405,28 +446,24 @@ export default function LookdevLab() {
 
           <div className="lab-row">
             <Group label="Key temp">
-              <input
-                type="range"
-                className="lab-range"
+              <Range
                 min={2500}
                 max={9000}
                 step={100}
                 value={lab.keyKelvin}
-                aria-label="Key temp, kelvin"
-                onChange={e => update({ keyKelvin: +e.target.value })}
+                label="Key temp, kelvin"
+                onChange={v => update({ keyKelvin: v })}
               />
               <span className="lab-readout">{lab.keyKelvin}K</span>
             </Group>
             <Group label="Exposure">
-              <input
-                type="range"
-                className="lab-range"
+              <Range
                 min={-3}
                 max={3}
                 step={0.1}
                 value={lab.exposure}
-                aria-label="Exposure, stops"
-                onChange={e => update({ exposure: +e.target.value })}
+                label="Exposure, stops"
+                onChange={v => update({ exposure: v })}
               />
               <span className="lab-readout">
                 {lab.exposure >= 0 ? '+' : ''}
@@ -434,15 +471,13 @@ export default function LookdevLab() {
               </span>
             </Group>
             <Group label={`${hero.label} roughness`}>
-              <input
-                type="range"
-                className="lab-range"
+              <Range
                 min={0}
                 max={1}
                 step={0.01}
                 value={heroRough}
-                aria-label={`${hero.label} roughness`}
-                onChange={e => update({ heroRoughness: +e.target.value })}
+                label={`${hero.label} roughness`}
+                onChange={v => update({ heroRoughness: v })}
               />
               <span className="lab-readout">{heroRough.toFixed(2)}</span>
             </Group>

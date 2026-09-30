@@ -56,6 +56,7 @@ export interface LabStatus {
   target: number
   converged: boolean
   preview: boolean // a proxy-resolution preview is on screen while the scene changes
+  ms: number // render time of the current image: time spent rendering since the last change, pauses excluded
 }
 
 type Vec3 = [number, number, number]
@@ -250,6 +251,7 @@ export class LookdevEngine {
   private lastChange = -Infinity
   private lastScroll = -Infinity
   private lastFrameT = 0
+  private renderMs = 0
   private frameTimes: number[] = []
   private frameMs = 1000 / 60
   private health = 1
@@ -526,7 +528,7 @@ export class LookdevEngine {
     // run to report it. Report the image already on the canvas so the still uncovers it.
     if (this.live && (this.spp > 0 || (this.previewK > 0 && this.previewGen === this.gen))) {
       const converged = this.spp >= this.target
-      this.onStatus({ spp: this.spp, target: this.target, converged, preview: this.showingPreview() })
+      this.onStatus({ spp: this.spp, target: this.target, converged, preview: this.showingPreview(), ms: this.renderMs })
     }
     this.kick()
   }
@@ -563,6 +565,7 @@ export class LookdevEngine {
   private reset() {
     this.spp = 0
     this.passN = 0
+    this.renderMs = 0
     this.kick()
   }
 
@@ -639,7 +642,9 @@ export class LookdevEngine {
     if (this.disposed || !this.active || !this.visible || this.spp >= this.target) return
     this.rafId = requestAnimationFrame(this.step)
     const gl = this.gl
-    this.trackFrame(this.lastFrameT ? t - this.lastFrameT : 0)
+    const dt = this.lastFrameT ? t - this.lastFrameT : 0
+    this.trackFrame(dt)
+    if (dt > 0 && dt < 250) this.renderMs += dt // the first frame after a pause adds nothing
     this.lastFrameT = t
     this.collectTimings()
 
@@ -663,7 +668,7 @@ export class LookdevEngine {
       this.tracePreview(k)
       this.submitted()
       this.display()
-      this.onStatus({ spp: 0, target: this.target, converged: false, preview: true })
+      this.onStatus({ spp: 0, target: this.target, converged: false, preview: true, ms: this.renderMs })
       return
     }
 
@@ -673,7 +678,7 @@ export class LookdevEngine {
     if (passDone) {
       this.display()
       const converged = this.spp >= this.target
-      this.onStatus({ spp: this.spp, target: this.target, converged, preview: this.showingPreview() })
+      this.onStatus({ spp: this.spp, target: this.target, converged, preview: this.showingPreview(), ms: this.renderMs })
       if (converged) this.stop()
     }
   }
@@ -853,7 +858,7 @@ export class LookdevEngine {
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     this.display()
-    this.onStatus({ spp: this.spp, target: this.target, converged: this.spp >= this.target, preview: false })
+    this.onStatus({ spp: this.spp, target: this.target, converged: this.spp >= this.target, preview: false, ms: this.renderMs })
   }
 
   // One slice of a trace pass: n new samples per pixel blended into the running mean, read from the current

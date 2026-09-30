@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Matthew Bell — VFX Artist & Creative Technologist",
+  title: "Matthew Bell | VFX Artist & Creative Technologist",
   description: "Senior VFX Artist specializing in lighting and look development. 27+ years across feature film, episodic television, and real-time production.",
 };
 

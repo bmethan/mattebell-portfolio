@@ -181,6 +181,10 @@ const PREVIEW_MAX_DIV = 6
 // so the first passes cannot stall the page while the estimate is still unknown.
 const MESH_GUESS_MS = 400
 const PREVIEW_HOLD_SPP = 4 // the preview stays up until the full-resolution image is at least this clean
+// The preview's path length cap: while something is being dragged, short paths keep the preview sharp (a smaller
+// proxy divisor fits the frame budget). Solid glass needs a few more to read as glass at all.
+const PREVIEW_BOUNCES = 3
+const PREVIEW_GLASS_BOUNCES = 8
 
 // Sobol' direction numbers for dimensions 1-3, verbatim from Burley 2020 ("Practical Hash-based Owen
 // Scrambling", JCGT 9(4)) supplemental sobol.cpp. Packed one bit per uvec4: (dim1, dim2, dim3, 0).
@@ -369,6 +373,8 @@ export class LookdevEngine {
   private visible = false
   private active = false
   private interacting = false
+  private bounces = MAX_BOUNCES // path length cap of the current scene
+  private previewBounces = PREVIEW_BOUNCES // and of its preview
   private sceneDirty = true
   private disposed = false
   private state: LabState
@@ -880,6 +886,8 @@ export class LookdevEngine {
         ? solidGlass ? GLASS_MAX_BOUNCES : MAX_BOUNCES
         : s.furnace ? MESH_FURNACE_BOUNCES : solidGlass ? MESH_GLASS_MAX_BOUNCES : MESH_MAX_BOUNCES
     gl.uniform1i(L('uMaxBounces'), bounces)
+    this.bounces = bounces
+    this.previewBounces = s.furnace ? bounces : Math.min(bounces, solidGlass ? PREVIEW_GLASS_BOUNCES : PREVIEW_BOUNCES)
     gl.uniform1i(L('uNumLights'), rigs.length)
     gl.uniform3fv(L('uEnv'), s.furnace ? [1, 1, 1] : [0.0012, 0.0013, 0.0016])
     gl.uniform1i(L('uFurnace'), s.furnace ? 1 : 0)
@@ -1039,10 +1047,9 @@ export class LookdevEngine {
   // Proxy divisor for the preview: the smallest one whose single-sample frame fits PREVIEW_BUDGET_MS.
   private previewDiv() {
     const key = this.costKey()
-    // The larger of the two estimates: the full-resolution one keeps updating even while no preview is drawn
-    // (so a GPU that slows down is noticed); unmeasured, assume a mid-range GPU.
-    const known = [this.previewMsPerSpp.get(key), this.msPerSpp.get(key)].filter((v): v is number => v !== undefined)
-    const ms = known.length ? Math.max(...known) : this.state.model === 'spheres' ? 40 : MESH_GUESS_MS
+    // The preview's own measured cost (its paths are shorter, see PREVIEW_BOUNCES); before it is known, the
+    // full-resolution one, an upper bound; unmeasured, assume a mid-range GPU.
+    const ms = this.previewMsPerSpp.get(key) ?? this.msPerSpp.get(key) ?? (this.state.model === 'spheres' ? 40 : MESH_GUESS_MS)
     const budget = Math.min(PREVIEW_BUDGET_MS, 0.5 * this.frameMs)
     return Math.max(1, Math.min(PREVIEW_MAX_DIV, Math.ceil(Math.sqrt(ms / budget))))
   }
@@ -1063,7 +1070,9 @@ export class LookdevEngine {
     gl.uniform2f(L('uResolution'), this.width / k, this.height / k)
     gl.uniform1i(L('uSppDone'), 0)
     gl.uniform1i(L('uSppNew'), 1)
+    gl.uniform1i(L('uMaxBounces'), this.previewBounces)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
+    gl.uniform1i(L('uMaxBounces'), this.bounces)
     if (q) {
       gl.endQuery(this.timer!.TIME_ELAPSED_EXT)
       this.queries.push({ q, n: 1, frac: 1 / (k * k), cost, preview: true, pass: -1, slices: 1 })

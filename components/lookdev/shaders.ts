@@ -771,6 +771,21 @@ vec4 lobeProbs(Surf s, int filt, out float pt) {
   return sum > 0.0 ? p / sum : vec4(0.0);
 }
 
+#ifdef THIN
+// Glass is sampled as one strategy, as in pbrt-v4's DielectricBxDF: a visible microfacet (spherical caps), then
+// reflect or refract by that microfacet's own Fresnel, weighted by how much of the substrate transmits. So no
+// sample is spent on a refraction that total internal reflection forbids, or on a reflection the Fresnel makes
+// negligible. vndfPdf: the visible normal density; glassReflectProb: the chance of reflecting at cosine cosM.
+float vndfPdf(vec3 wo, vec3 m, vec2 alpha) { return G1_GGX(wo, alpha) * max(dot(wo, m), 0.0) * D_GGX(m, alpha) / wo.z; }
+float glassReflectProb(Surf s, float cosM) {
+  float F = fresnelDielectric(cosM, s.etaT);
+  // With a film, much of the reflection is the film's (a soap film's bare surface has IOR 1, F = 0): blend in its
+  // albedo at the view angle. The clamp keeps both choices reachable wherever either could carry light.
+  if (s.tfW > 0.0) F = mix(F, sat(lum(s.EspecR3)), s.tfW);
+  return clamp(F / max(F + s.transW * (1.0 - F), 1e-6), 0.02, 0.98);
+}
+#endif
+
 // Returns the mixture pdf; fD and fS receive f * cos(theta_i), split into diffuse and everything else.
 float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
   fD = vec3(0.0);
@@ -787,14 +802,14 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
     // microfacet, and like it ignores multiple scattering between microfacets: smooth glass is exact, rough
     // glass loses some energy (the furnace test shows how much).
     if (pt <= 0.0) return 0.0;
-    float ft, cosM, pdfT;
+    float ft, cosM, pdfT; // pdfT: density of the sampled microfacet mapped to wi, before the reflect/refract choice
     if (s.thin) {
       // Thin-walled: the reflection lobe mirrored through the surface, so light passes straight through.
       vec3 wr = vec3(wi.xy, -wi.z);
       vec3 hr = normalize(wo + wr);
       cosM = sat(dot(wo, hr));
       ft = G2_GGX(wo, wr, s.aS) * D_GGX(hr, s.aS) / (4.0 * wo.z);
-      pdfT = pdfGGXReflection_Bounded(wo, wr, s.aS);
+      pdfT = cosM > 0.0 ? vndfPdf(wo, hr, s.aS) / (4.0 * cosM) : 0.0;
     } else {
 #ifndef GLASS
       return 0.0;
@@ -816,7 +831,7 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
     vec3 T3 = vec3(1.0 - fresnelDielectric(cosM, s.etaT));
     if (s.tfW > 0.0) T3 = mix(T3, vec3(1.0) - thinFilmF(cosM, s.tfIor, s.tfThick, vec3(f0FromEta(s.etaT))), s.tfW);
     fS = s.tBase * (1.0 - s.metal) * s.transW * s.transTint * T3 * ft * s.compT;
-    return pt * pdfT;
+    return (p.y + pt) * pdfT * (1.0 - glassReflectProb(s, cosM));
   }
 #endif
 
@@ -865,7 +880,12 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
         Fm = mix(Fm, s.specW * FtfM * s.compM, s.tfW);
       }
       fS += s.tBase * mix(Fd, Fm, s.metal) * g;
+#ifdef THIN
+      if (s.transW > 0.0) pdf += (p.y + pt) * vndfPdf(wo, h, s.aS) / (4.0 * max(voh, 1e-6)) * glassReflectProb(s, voh);
+      else pdf += p.y * pdfGGXReflection_Bounded(woS, wiS, s.aS);
+#else
       pdf += p.y * pdfGGXReflection_Bounded(woS, wiS, s.aS);
+#endif
     }
 
     if (s.coatW > 0.0) {
@@ -887,22 +907,42 @@ bool sampleSurf(Surf s, vec3 wo, int filt, vec3 u, out vec3 wi) {
   float pt;
   vec4 p = lobeProbs(s, filt, pt);
   float cCoat = p.x + p.y + p.z, cFuzz = cCoat + p.w;
-#ifdef THIN
-  bool trans = u.z >= cFuzz && pt > 0.0;
-#else
-  const bool trans = false;
-#endif
   if (u.z < p.x) {
     wi = sample_EON(wo, s.diffRough, u.x, u.y);
     return wi.z > 0.0;
   }
-  if (u.z < cCoat || (trans && s.thin)) {
-    // Base specular, coat, or thin-walled transmission (the reflection mirrored through the surface), through one
-    // call site (Direct3D inlines every call). The base specular on a flake is sampled in the flake's frame (see
-    // evalSurf) and brought back; otherwise the frame is the identity.
-    bool coat = !trans && u.z >= p.x + p.y;
+#ifdef THIN
+  bool specPick = u.z < p.x + p.y, transPick = u.z >= cFuzz && pt > 0.0;
+  if (s.transW > 0.0 && (specPick || transPick)) {
+    // Glass (see glassReflectProb): the base specular and transmission intervals form one strategy. Where u.z
+    // falls inside their union picks reflect or refract against the sampled microfacet's probability.
+    float t = (specPick ? u.z - p.x : p.y + u.z - cFuzz) / max(p.y + pt, 1e-9);
+    vec3 m = sampleVNDF_SphericalCap(u.xy, wo, s.aS);
+    float cosM = dot(wo, m);
+    if (cosM <= 0.0) return false;
+    vec3 wr = reflect(-wo, m);
+    if (t < glassReflectProb(s, cosM)) {
+      wi = wr;
+      return wi.z > 0.0;
+    }
+    if (s.thin) {
+      wi = vec3(wr.xy, -wr.z); // straight through
+      return wi.z < 0.0;
+    }
+#ifdef GLASS
+    wi = refract(-wo, m, 1.0 / s.etaT);
+    return dot(wi, wi) > 0.0 && wi.z < 0.0;
+#else
+    return false;
+#endif
+  }
+#endif
+  if (u.z < cCoat) {
+    // Base specular or coat, through one call site (Direct3D inlines every call). The base specular on a flake is
+    // sampled in the flake's frame (see evalSurf) and brought back; otherwise the frame is the identity.
+    bool coat = u.z >= p.x + p.y;
     vec3 b1 = vec3(1.0, 0.0, 0.0), b2 = vec3(0.0, 1.0, 0.0), b3 = vec3(0.0, 0.0, 1.0);
-    if (!coat && !trans && s.nf.z < 0.99999) {
+    if (!coat && s.nf.z < 0.99999) {
       onb(s.nf, b1, b2);
       b3 = s.nf;
     }
@@ -910,23 +950,13 @@ bool sampleSurf(Surf s, vec3 wo, int filt, vec3 u, out vec3 wi) {
     if (woS.z <= 0.0) return false;
     vec3 wiS = sampleGGXReflection_Bounded(u.xy, woS, coat ? s.aC : s.aS);
     wi = wiS.x * b1 + wiS.y * b2 + wiS.z * b3;
-    if (trans) wi.z = -wi.z;
-    return trans ? wi.z < 0.0 : wi.z > 0.0;
+    return wi.z > 0.0;
   }
   if (u.z < cFuzz && p.w > 0.0) {
     wi = sampleFuzz(wo, s.fuzzRough, u.xy);
     return wi.z > 0.0;
   }
-#ifdef GLASS
-  if (!trans) return false;
-  // Solid: refract through a visible microfacet normal (spherical caps). Total internal reflection yields no
-  // direction here; the reflection lobe carries that light.
-  vec3 m = sampleVNDF_SphericalCap(u.xy, wo, s.aS);
-  wi = refract(-wo, m, 1.0 / s.etaT);
-  return dot(wi, wi) > 0.0 && wi.z < 0.0;
-#else
   return false;
-#endif
 }
 
 vec3 albedoAOV(Mat m) {
@@ -1552,8 +1582,10 @@ void main() {
     // no light-sampling counterpart: it takes the full weight.
     bool prevTrans = false;
     // Dispersion: each path carries one wavelength through dispersive glass, drawn here and committed (weighted by
-    // its ACEScg response) at its first refraction through such glass.
-    float lambda = 380.0 + 400.0 * u01(pcg(hashCombine(pixSeed, sampleIndex * 3u + 1u)));
+    // its ACEScg response) at its first refraction through such glass. Drawn from the pixel's own scrambled
+    // Sobol' sequence (a dimension nothing else uses), so a pixel's samples sweep the spectrum evenly instead of
+    // landing at random: far less color noise for the same sample count.
+    float lambda = 380.0 + 400.0 * sample4(sampleIndex, pixSeed, 0, 6).x;
     bool colored = false;
 
     for (int depth = 0; depth < uMaxBounces; depth++) {

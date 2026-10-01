@@ -1,11 +1,11 @@
 import { VERT, E_TABLE_FRAG, DISPLAY_FRAG, DENOISE_PREP_FRAG, ATROUS_FRAG, traceFrag } from './shaders'
 import { kelvinToACEScg } from './color'
-import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, heroParams, type OpenPBR, type Hero, type PaintFinish, type Stage } from './materials'
-import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
+import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, BALLS_METERS_PER_UNIT, heroParams, subsurfaceScale, type OpenPBR, type Hero, type PaintFinish, type SkinTone, type Stage } from './materials'
+import { MODELS, MODEL_BALLS, loadModel, modelMaterials, type Model } from './models'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
-export type { Hero, Model, PaintFinish, Stage }
+export type { Hero, Model, PaintFinish, SkinTone, Stage }
 
 export interface LabState {
   keyAz: number
@@ -26,6 +26,7 @@ export interface LabState {
   hero: Hero
   paint: PaintFinish // car paint's finish
   flakes: boolean // car paint flakes (metallic, pearl and iridescent finishes)
+  skinTone: SkinTone // which official skin example the skin hero is
   heroRoughness: number | null
   heroAniso: number | null // anisotropy override for brushed heroes
   pass: Pass
@@ -54,6 +55,7 @@ export const DEFAULT_STATE: LabState = {
   hero: 'carpaint',
   paint: 'solid',
   flakes: false,
+  skinTone: 'iii',
   heroRoughness: null,
   heroAniso: null,
   pass: 'beauty',
@@ -75,7 +77,7 @@ export const isDisplayOnly = (patch: Partial<LabState>) => Object.keys(patch).ev
 // preset's own value is the same material). The turntable angle only matters with a model on the plate.
 export function isPosterState(s: LabState) {
   const d = DEFAULT_STATE
-  const base = (st: LabState) => heroParams(st.hero, st.paint, st.flakes)
+  const base = (st: LabState) => heroParams(st.hero, st.paint, st.flakes, st.skinTone)
   const rough = (st: LabState) => st.heroRoughness ?? base(st)[HERO_PRESETS[st.hero].roughnessParam]
   const aniso = (st: LabState) => st.heroAniso ?? base(st).specular_roughness_anisotropy
   return (Object.keys(d) as (keyof LabState)[]).every(k => {
@@ -89,7 +91,7 @@ export function isPosterState(s: LabState) {
 
 // The hero material as rendered: its preset (car paint by finish and flakes), then the slider edits.
 export function heroMaterial(s: LabState): OpenPBR {
-  const m: OpenPBR = { ...heroParams(s.hero, s.paint, s.flakes) }
+  const m: OpenPBR = { ...heroParams(s.hero, s.paint, s.flakes, s.skinTone) }
   if (s.heroRoughness !== null) m[HERO_PRESETS[s.hero].roughnessParam] = s.heroRoughness
   if (s.heroAniso !== null) m.specular_roughness_anisotropy = s.heroAniso
   return m
@@ -108,21 +110,25 @@ export interface LabStatus {
 // The tracer variant a scene needs: meshes for a model; full glass for a solid transmissive hero; the cheaper thin
 // glass for thin-walled transmission (a model's windows). On the balls any glass hero takes the full variant,
 // which is compiled ahead while the lab is in view.
-type VariantKey = 'base' | 'base+glass' | 'mesh' | 'mesh+thin' | 'mesh+glass'
+type VariantKey = 'base' | 'base+glass' | 'base+sss' | 'mesh' | 'mesh+thin' | 'mesh+glass' | 'mesh+sss'
 function variantOf(s: LabState): VariantKey {
   const hero = heroMaterial(s)
+  // Subsurface scattering is a medium under a refracting surface: its own solid variant, with the walk.
+  if (hero.subsurface_weight > 0 && hero.geometry_thin_walled < 0.5) return s.model === 'spheres' ? 'base+sss' : 'mesh+sss'
   const heroGlass = hero.transmission_weight > 0
   const heroSolid = heroGlass && hero.geometry_thin_walled < 0.5
   if (s.model === 'spheres') return heroGlass ? 'base+glass' : 'base'
   if (heroSolid) return 'mesh+glass'
   return heroGlass || MODELS[s.model].thinGlass ? 'mesh+thin' : 'mesh'
 }
-const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full'> = {
+const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full' | 'sss'> = {
   base: 'none',
   'base+glass': 'full',
+  'base+sss': 'sss',
   mesh: 'none',
   'mesh+thin': 'thin',
   'mesh+glass': 'full',
+  'mesh+sss': 'sss',
 }
 
 interface MeshGPU {
@@ -166,6 +172,13 @@ const DENOISE_LEVELS = 5 // a-trous levels: taps 1, 2, 4, 8 and 16 pixels apart
 // (log-linearly) by the target: the finished image is unfiltered. (Fully converged, the filter would still
 // soften the antialiased edges of the brightest highlights, whose samples are all or nothing.)
 const DENOISE_FULL_SPP = 64
+// Subsurface random walks: scattering events per path, beyond the bounces. Skin's red channel scatters some 70
+// times before it is absorbed (albedo 0.986 for tone I), most walks far fewer before they leave.
+const MAX_SCATTER = 256
+// In the furnace nothing is absorbed, so walks only end by leaving: a longer cap, though on Winged Victory, whose
+// skin's blue mean free path is under a millimeter at the statue's size, it still trims the longest walks (blue
+// reads about 0.97; 8192 reads 0.98 at six times the cost).
+const FURNACE_MAX_SCATTER = 2048
 const MAX_NODE_VISITS = 4096 // per mesh ray; a typical one visits well under a hundred BVH nodes
 
 // Frame pacing. The GPU is shared with the browser's compositor, and a single draw cannot be interrupted, so
@@ -863,7 +876,7 @@ export class LookdevEngine {
 
   private camera() {
     const plate = this.state.model !== 'spheres'
-    const target = plate ? MODEL_CAM_TARGET : CAM_TARGET
+    const target: Vec3 = plate ? [0, MODELS[this.state.model as Exclude<Model, 'spheres'>].camTargetY ?? MODEL_CAM_TARGET[1], 0] : CAM_TARGET
     const fwd = normalize(sub(target, CAM_POS))
     const right = normalize(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
@@ -948,7 +961,7 @@ export class LookdevEngine {
     // (shadowT in the tracer); otherwise they keep the cheaper any-hit test.
     const hero = heroMaterial(s)
     const smoothThin = (m: OpenPBR) => m.geometry_thin_walled > 0.5 && m.transmission_weight > 0 && m.specular_roughness <= 0.01 && m.coat_weight <= 0
-    const thinGlass = smoothThin(hero) || (s.model !== 'spheres' && MODELS[s.model].thinGlass && MESH_MATERIALS.some(smoothThin))
+    const thinGlass = smoothThin(hero) || (s.model !== 'spheres' && MODELS[s.model].thinGlass && modelMaterials(s.model).some(smoothThin))
     gl.uniform1i(L('uThinGlass'), thinGlass ? 1 : 0)
     gl.uniform1i(L('uETableT'), 5)
     gl.uniform1i(L('uCyc'), stage.cyc ? 1 : 0)
@@ -959,7 +972,7 @@ export class LookdevEngine {
     if (s.model === 'spheres') {
       gl.uniform3fv(L('uBallX'), BALL_X)
     } else {
-      mats.push(...MESH_MATERIALS)
+      mats.push(...modelMaterials(s.model))
       MODEL_BALLS.forEach((b, i) => gl.uniform4fv(L(`uBall[${i}]`), b))
       const c = Math.cos(s.modelYaw), sn = Math.sin(s.modelYaw)
       // Turntable: rotation about y, column major.
@@ -967,15 +980,18 @@ export class LookdevEngine {
       gl.uniform3fv(L('uModelPos'), [0, 0, 0])
       gl.uniform1f(L('uModelScale'), MODELS[s.model].scale)
       gl.uniform1i(L('uMaxNodeVisits'), MAX_NODE_VISITS)
-      // Slot 4 (MESH_MATERIALS[0]) is the glass; shadow rays pass through it when the model uses it.
-      gl.uniform1i(L('uThinSlot'), MODELS[s.model].thinGlass && smoothThin(MESH_MATERIALS[0]) ? 4 : -1)
+      // Slot 4 is the glass on a model that has it (thinGlass); shadow rays pass through it.
+      gl.uniform1i(L('uThinSlot'), MODELS[s.model].thinGlass && smoothThin(modelMaterials(s.model)[0]) ? 4 : -1)
       gl.uniform1i(L('uBvh'), 2)
       gl.uniform1i(L('uTriPos'), 3)
       gl.uniform1i(L('uTriNrm'), 4)
     }
+    // Subsurface radii are given in centimeters (the presets'); the walk needs scene units.
+    const sss = subsurfaceScale(s.model === 'spheres' ? BALLS_METERS_PER_UNIT : MODELS[s.model].metersPerUnit)
+    gl.uniform1i(L('uMaxScatter'), s.furnace ? FURNACE_MAX_SCATTER : MAX_SCATTER)
     mats.forEach((m, i) => {
       for (const f of MATERIAL_FIELDS) {
-        const v = m[f]
+        const v = f === 'subsurface_radius' ? m[f] * sss : m[f]
         const loc = L(`uMat[${i}].${f}`)
         if (Array.isArray(v)) gl.uniform3fv(loc, v)
         else gl.uniform1f(loc, v)

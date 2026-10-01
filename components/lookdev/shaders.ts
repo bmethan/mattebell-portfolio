@@ -540,6 +540,8 @@ struct Mat {
   float thin_film_weight; float thin_film_thickness; float thin_film_ior;
   float transmission_weight; vec3 transmission_color; float transmission_depth;
   float transmission_dispersion_scale; float transmission_dispersion_abbe_number;
+  float subsurface_weight; vec3 subsurface_color; float subsurface_radius; vec3 subsurface_radius_scale;
+  float subsurface_scatter_anisotropy;
   float geometry_thin_walled; // 0 or 1
   float lab_flake_coverage; float lab_flake_size; float lab_flake_tilt; // lab extension (see materials.ts)
 };
@@ -667,15 +669,24 @@ Surf setupSurf(Mat m, vec3 wo, bool back, float lambda, bool colored) {
   s.transTint = vec3(1.0);
 #endif
 #else
+#ifdef NO_DISPERSION
+  float nChan = nd;
+#else
   float nChan = disperses(m) ? cauchyIor(nd, m.transmission_dispersion_abbe_number / m.transmission_dispersion_scale, lambda) : nd;
+#endif
   s.eta = openpbrSpecularEta(colored ? nChan : nd, s.coatIor, s.coatW, s.specW);
   s.etaT = openpbrSpecularEta(nChan, s.coatIor, s.coatW, s.specW);
-  s.transW = sat(m.transmission_weight);
+  // Subsurface (spec, Subsurface): the opaque base mixes diffuse and subsurface by subsurface_weight, and the
+  // subsurface part refracts through the same rough dielectric interface into a scattering medium (the random
+  // walk in main). Under transmission it is the translucent base's complement. (The lab's presets use one or the
+  // other; a path that refracts into a material with any subsurface walks.)
+  float sssW = sat(m.subsurface_weight) * (1.0 - sat(m.transmission_weight));
+  s.transW = sat(m.transmission_weight) + sssW;
   // An IOR of 1 does not refract, and the refraction half vector is undefined there: pass straight through, as
   // thin-walled glass does (the same light, with no bending).
   s.thin = m.geometry_thin_walled > 0.5 || abs(s.etaT - 1.0) < 1e-3;
   // With no depth there is no medium, and the color tints the refraction instead (spec).
-  s.transTint = m.transmission_depth > 0.0 ? vec3(1.0) : max(m.transmission_color, vec3(0.0));
+  s.transTint = m.transmission_depth > 0.0 || sssW > 0.0 ? vec3(1.0) : max(m.transmission_color, vec3(0.0));
   if (back && !s.thin) {
     // Leaving a solid: the IOR ratio inverts (total internal reflection follows from the Fresnel terms).
     s.eta = 1.0 / s.eta;
@@ -961,6 +972,7 @@ bool sampleSurf(Surf s, vec3 wo, int filt, vec3 u, out vec3 wi) {
 
 vec3 albedoAOV(Mat m) {
   vec3 a = mix(m.base_color * m.base_weight, m.base_color, m.base_metalness);
+  a = mix(a, m.subsurface_color, m.subsurface_weight * (1.0 - m.base_metalness));
   a = mix(a, m.transmission_color, m.transmission_weight * (1.0 - m.base_metalness));
   a *= mix(vec3(1.0), m.coat_color, m.coat_weight);
   return mix(a, m.fuzz_color, m.fuzz_weight);
@@ -1266,10 +1278,13 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
 // variant first and the others only when a scene needs them.
 // THIN is the cheaper subset for thin-walled glass only (car windows, a soap film): straight-through transmission
 // and shadows through it, without solid refraction, absorption or dispersion. GLASS includes it.
+// SSS is the solid variant for subsurface media: refraction and the random walk, without dispersion (skin does
+// not disperse), so neither glass nor skin compiles the other's code.
 // AUX adds the denoiser's guide images and noise statistics (two more render targets), on GPUs that can draw
 // five at once.
-export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' = 'none', aux = false) {
-  const defs = `${mesh ? '#define MESH 1\n' : ''}${glass === 'full' ? '#define GLASS 1\n' : ''}${glass !== 'none' ? '#define THIN 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
+export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' | 'sss' = 'none', aux = false) {
+  const solid = glass === 'full' || glass === 'sss'
+  const defs = `${mesh ? '#define MESH 1\n' : ''}${solid ? '#define GLASS 1\n' : ''}${glass === 'sss' ? '#define SSS 1\n#define NO_DISPERSION 1\n' : ''}${glass !== 'none' ? '#define THIN 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
   return /* glsl */ `${HEADER}${defs}
 ${COMMON}
 ${MICROFACET}
@@ -1548,6 +1563,7 @@ Mat getMat(int i) {
     m.coat_color = vec3(1.0);
     m.fuzz_color = vec3(1.0);
     m.transmission_color = vec3(1.0);
+    m.subsurface_color = vec3(1.0);
   }
   return m;
 }
@@ -1570,6 +1586,32 @@ vec3 clampIndirect(vec3 c) {
   return (uIndirectClamp > 0.0 && m > uIndirectClamp) ? c * (uIndirectClamp / m) : c;
 }
 bool nonFinite(float x) { return (floatBitsToUint(x) & 0x7f800000u) == 0x7f800000u; }
+
+uniform int uMaxScatter; // a path's scattering events inside subsurface media
+// Cosine-weighted direction about +z (the Lambertian exit of a walk).
+vec3 sampleCosine(vec2 u) {
+  float r = sqrt(u.x), phi = TWO_PI * u.y;
+  return vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u.x)));
+}
+#ifdef SSS
+// Random numbers for the subsurface walk (its dimensions are unbounded, past the Sobol' sequence's).
+float walkRand(inout uint seed) {
+  seed = pcg(seed);
+  return u01(seed);
+}
+// Henyey-Greenstein phase function, sampled about the direction of travel d (g > 0 scatters forward).
+vec3 sampleHG(vec3 d, float g, float u1, float u2) {
+  float c = 1.0 - 2.0 * u1;
+  if (abs(g) > 1e-3) {
+    float q = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+    c = clamp((1.0 + g * g - q * q) / (2.0 * g), -1.0, 1.0);
+  }
+  float sn = sqrt(max(0.0, 1.0 - c * c)), phi = TWO_PI * u2;
+  vec3 b1, b2;
+  onb(d, b1, b2);
+  return normalize(b1 * (sn * cos(phi)) + b2 * (sn * sin(phi)) + d * c);
+}
+#endif
 
 void main() {
   ivec2 pix = ivec2(gl_FragCoord.xy);
@@ -1618,6 +1660,30 @@ void main() {
     bool solidInside = false, last = false;
     vec3 pending = vec3(0.0); // what the shadow ray in flight delivers if it gets through
     int maxSteps = uMaxBounces * (uNumLights + 1) + 1;
+    // Subsurface random walk (spec, Subsurface). The path refracts into the medium through the material's own
+    // rough dielectric surface (so the specular reflection and the Fresnel split are OpenPBR's), then walks:
+    // free flights with extinction 1 / mean free path per channel, scattering with the single-scattering albedo
+    // the spec derives from subsurface_color (its inversion of van de Hulst's relation), in Henyey-Greenstein
+    // directions. The walk leaves at the first surface it reaches, through a Lambertian exit, as in Cycles' random
+    // walk: light that has scattered many times beneath a surface leaves it close to diffusely, and an exact
+    // rough-dielectric exit (tried first) made every exit's light depend on the angle the walk happened to arrive
+    // at, sixteen times plastic's noise at the same sample count. Colors: each walk samples its flights by one
+    // hero channel's extinction, picked on entry, and tracks the walk's probability under every channel relative to
+    // the hero's (walkR); light leaving is weighted by the walk's balance heuristic over the three channels, as in
+    // pbrt-v4's chromatic media (weights per flight multiply up to 3 each: unbiased but heavy-tailed, the furnace
+    // read 0.7-1.1). Walk events spend uMaxScatter, not the bounces.
+    bool vBack = false;   // the current vertex was reached from inside its object
+    bool sssExit = false; // the current vertex is where a walk left its medium (shaded as Lambertian)
+    int sssCross = 0;     // media entered: the light that comes out is direct light, exempt from the indirect clamp
+#ifdef SSS
+    bool inSSS = false;
+    vec3 sigT = vec3(1.0), ssAlb = vec3(0.0), walkR = vec3(1.0);
+    vec3 heroMask = vec3(1.0, 0.0, 0.0); // the hero channel, one-hot (a dynamic vector index costs Direct3D dearly)
+    float hgG = 0.0, betaIn = 1.0;
+    int scatters = 0;
+    uint walkSeed = pcg3d(uvec3(uvec2(pix), sampleIndex)).x;
+    maxSteps += uMaxScatter;
+#endif
 
     for (int step = 0; step < maxSteps; step++) {
       vec3 tro = ro, trd = rd;
@@ -1635,11 +1701,25 @@ void main() {
           wi = vec3(dot(dirW, t1), dot(dirW, t2), dot(dirW, n));
           if (wi.z <= 0.0) { k++; continue; }
         } else {
+#ifdef SSS
+          if (sssExit) wi = sampleCosine(u.xy);
+          else
+#endif
           if (!sampleSurf(s, wo, filt, u.xyz, wi)) break;
           dirW = normalize(t1 * wi.x + t2 * wi.y + n * wi.z);
         }
         vec3 fD, fS;
-        float bpdf = evalSurf(s, wo, wi, filt, fD, fS);
+        float bpdf;
+#ifdef SSS
+        if (sssExit) {
+          fD = vec3(wi.z / PI); // Lambertian exit, white: the walk's weight carries the color
+          fS = vec3(0.0);
+          bpdf = wi.z / PI;
+        } else
+#endif
+        {
+          bpdf = evalSurf(s, wo, wi, filt, fD, fS);
+        }
         vec3 f = fD + fS;
         if (isLight) {
           if (maxc(f) <= 0.0) { k++; continue; }
@@ -1661,7 +1741,7 @@ void main() {
           }
           // A refracted path leaves from the far side of the surface.
           bool through = wi.z < 0.0;
-#ifdef GLASS
+#if defined(GLASS) && !defined(NO_DISPERSION)
           if (through && !colored && disperses(m)) {
             colored = true;
             beta *= spectralWeight(lambda);
@@ -1674,6 +1754,25 @@ void main() {
           bool passed = through && s.thin && uThinGlass == 1 && smoothThin(m);
 #else
           const bool passed = false;
+#endif
+#ifdef SSS
+          if (through && !sssExit && !s.thin && !vBack && m.subsurface_weight > 0.0) {
+            // Into the medium. The refraction carried radiance's 1 / eta^2; the Lambertian exit does not give it
+            // back, so undo it here (the walk carries the light that entered).
+            inSSS = true;
+            sssCross++;
+            beta *= sq(s.etaT);
+            betaIn = max(maxc(beta), 1e-20);
+            float uh = walkRand(walkSeed) * 3.0;
+            heroMask = vec3(float(uh < 1.0), float(uh >= 1.0 && uh < 2.0), float(uh >= 2.0));
+            walkR = vec3(1.0);
+            vec3 r = max(m.subsurface_radius * m.subsurface_radius_scale, vec3(1e-6));
+            sigT = 1.0 / r;
+            hgG = clamp(m.subsurface_scatter_anisotropy, -0.95, 0.95);
+            vec3 C = sat3(m.subsurface_color);
+            vec3 sv = 4.09712 + 4.20863 * C - sqrt(9.59217 + 41.6808 * C + 17.7126 * C * C);
+            ssAlb = sat3((1.0 - sv * sv) / (1.0 - hgG * sv * sv));
+          }
 #endif
           if (!passed) {
             prevPdf = bpdf;
@@ -1688,39 +1787,87 @@ void main() {
         }
       }
 
+      bool walkExit = false; // this step's walk reached the surface
+#ifdef SSS
+      float tFlight = 1e30;
+      if (!shadow && inSSS) {
+        tFlight = -log(max(1.0 - walkRand(walkSeed), 1e-30)) / dot(sigT, heroMask);
+        tMax = tFlight;
+      }
+#endif
       vec3 T = vec3(1.0);
       Hit h = trace(tro, trd, tMax, shadow, !shadow && depth > 0, T);
 
       if (shadow) {
         if (h.mat < 0 && maxc(T) > 0.0) {
           vec3 c = pending * T;
-          addLight(k, depth >= 1 ? clampIndirect(c) : c, L, L1, L2);
+          addLight(k, depth - sssCross >= 1 ? clampIndirect(c) : c, L, L1, L2);
         }
         k++;
         continue;
       }
+#ifdef SSS
+      if (inSSS) {
+        bool scattered = h.mat < 0 && h.light < 0; // no surface before the flight ends
+        float tt = scattered ? tFlight : h.t;
+        vec3 Tr = exp(-sigT * tt);
+        // Each channel's flight density (scattered) or probability of flying this far (surface), over the hero's,
+        // which sampled the distance (so its value never underflows).
+        vec3 pc = scattered ? sigT * Tr : Tr;
+        float ph = max(dot(pc, heroMask), 1e-30);
+        beta *= (scattered ? ssAlb * sigT * Tr : Tr) / ph; // sigma_s Tr when it scatters
+        walkR *= pc / ph;
+        // Only beta / mean(walkR) matters until the walk ends: keep mean(walkR) at 1, so neither drifts out of
+        // range on a long walk.
+        float wn = dot(walkR, vec3(1.0 / 3.0));
+        beta /= wn;
+        walkR /= wn;
+        if (scattered) {
+          if (++scatters > uMaxScatter || maxc(beta) <= 0.0) break;
+          // Russian roulette only once the walk has lost weight (absorption): a floor on the kill rate (say 1% per
+          // event) leaves a long lossless walk alive at odds like 1 in 25,000 with a matching weight, so few that
+          // the mean reads low (the furnace on Winged Victory read 0.90-0.96 that way).
+          float q = min(maxc(beta) / betaIn, 1.0);
+          if (q < 1.0) {
+            if (walkRand(walkSeed) >= q) break;
+            beta /= q;
+          }
+          ro += rd * tt;
+          rd = sampleHG(rd, hgG, walkRand(walkSeed), walkRand(walkSeed));
+          continue;
+        }
+        // Reached the surface: the walk leaves here.
+        inSSS = false;
+        walkExit = true;
+      }
+#endif
 
       if (h.light >= 0) {
         // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling.
         float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.t));
         vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
-        addLight(h.light, depth >= 2 ? clampIndirect(c) : c, L, L1, L2);
+        addLight(h.light, depth - sssCross >= 2 ? clampIndirect(c) : c, L, L1, L2);
         break;
       }
       if (h.mat < 0) {
         if (!(depth == 0 && uPass >= 3)) {
           vec3 c = beta * uEnv;
-          L += depth >= 2 ? clampIndirect(c) : c;
+          L += depth - sssCross >= 2 ? clampIndirect(c) : c;
         }
         break;
       }
 
-      p = ro + rd * h.t;
-      n = h.n;
-      ng = h.ng;
+      p = tro + trd * h.t;
+      // A walk's exit is a white Lambertian surface facing out of the medium (the trace's normals face the ray);
+      // it shares the vertex setup below but takes no material.
+      sssExit = walkExit;
+      bool flip = walkExit && h.back;
+      n = flip ? -h.n : h.n;
+      ng = flip ? -h.ng : h.ng;
       m = getMat(h.mat);
+      vBack = h.back && !walkExit;
 #ifdef GLASS
-      solidInside = h.back && m.transmission_weight > 0.0 && m.geometry_thin_walled < 0.5;
+      solidInside = vBack && (m.transmission_weight > 0.0 || m.subsurface_weight > 0.0) && m.geometry_thin_walled < 0.5;
       if (solidInside && m.transmission_depth > 0.0) {
         // The segment just traced ran through the medium: Beer-Lambert with mu_t = -ln(color) / depth (spec).
         beta *= exp(log(clamp(m.transmission_color, 1e-4, 1.0)) / m.transmission_depth * h.t);
@@ -1737,7 +1884,7 @@ void main() {
       filt = depth == 0 ? (uPass == 1 ? 1 : (uPass == 2 ? 2 : 0)) : 0;
 
       onb(n, t1, t2);
-      if (m.specular_roughness_anisotropy > 0.0) {
+      if (m.specular_roughness_anisotropy > 0.0 && !walkExit) {
         // Anisotropic lobes need a tangent field: the surface is brushed around the vertical axis, as on a lathe,
         // so the tangent (the rougher direction) runs pole to pole and highlights stretch that way.
         vec3 Tg = vec3(0.0, 1.0, 0.0) - n * n.y;
@@ -1748,8 +1895,8 @@ void main() {
         }
       }
       wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
-      if (wo.z <= 1e-6) break;
-      s = setupSurf(m, wo, h.back, lambda, colored);
+      if (wo.z <= 1e-6 && !walkExit) break;
+      if (!walkExit) s = setupSurf(m, wo, h.back, lambda, colored);
 #ifdef MESH
       s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
 #else

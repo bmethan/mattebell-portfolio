@@ -29,6 +29,11 @@ export interface OpenPBR {
   transmission_depth: number // scene units; 0 = no medium, the color tints the refraction instead
   transmission_dispersion_scale: number
   transmission_dispersion_abbe_number: number
+  subsurface_weight: number
+  subsurface_color: RGB // the color the medium shows when deep (its multiple-scattering albedo)
+  subsurface_radius: number // mean free path length scale: centimeters in the presets (see subsurfaceScale)
+  subsurface_radius_scale: RGB // per-channel multiplier of the radius
+  subsurface_scatter_anisotropy: number // Henyey-Greenstein g
   geometry_thin_walled: number // 0 or 1 (a boolean in OpenPBR)
   // Lab extension, not part of OpenPBR 1.1: metallic flakes in the base layer, under the coat. A flake is a cell
   // of a 3D grid (lab_flake_size world units) present with probability lab_flake_coverage, whose normal is tilted
@@ -64,6 +69,11 @@ export const MATERIAL_FIELDS = [
   'transmission_depth',
   'transmission_dispersion_scale',
   'transmission_dispersion_abbe_number',
+  'subsurface_weight',
+  'subsurface_color',
+  'subsurface_radius',
+  'subsurface_radius_scale',
+  'subsurface_scatter_anisotropy',
   'geometry_thin_walled',
   'lab_flake_coverage',
   'lab_flake_size',
@@ -97,6 +107,11 @@ export const OPENPBR_DEFAULTS: OpenPBR = {
   transmission_depth: 0,
   transmission_dispersion_scale: 0,
   transmission_dispersion_abbe_number: 20,
+  subsurface_weight: 0,
+  subsurface_color: [0.8, 0.8, 0.8],
+  subsurface_radius: 1,
+  subsurface_radius_scale: [1, 0.5, 0.25],
+  subsurface_scatter_anisotropy: 0,
   geometry_thin_walled: 0,
   lab_flake_coverage: 0,
   lab_flake_size: 0.012,
@@ -133,10 +148,11 @@ export const STAGES: Record<Stage, { label: string; cyc: boolean; material: Open
 
 export type Hero =
   | 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium' | 'glass' | 'diamond' | 'soapbubble'
+  | 'skin'
 type RoughnessParam = 'specular_roughness' | 'fuzz_roughness' | 'coat_roughness'
 
 export const HERO_ORDER: Hero[] = [
-  'carpaint', 'gold', 'brushed', 'titanium', 'glass', 'diamond', 'soapbubble', 'velvet', 'thinfilm', 'plastic',
+  'carpaint', 'gold', 'brushed', 'titanium', 'glass', 'diamond', 'soapbubble', 'skin', 'velvet', 'thinfilm', 'plastic',
 ]
 
 export interface HeroPreset {
@@ -267,6 +283,13 @@ export const HERO_PRESETS: Record<Hero, HeroPreset> = {
       transmission_dispersion_abbe_number: 55.3,
     }),
   },
+  // Official: examples/open_pbr_skin_*.mtlx (the tone row picks which; see SKIN_TONES).
+  skin: {
+    label: 'Skin',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({}), // replaced by the tone's preset in heroParams
+  },
   // Official: examples/open_pbr_soapbubble.mtlx. Thin-walled, IOR 1, so every color comes from the film.
   soapbubble: {
     label: 'Soap bubble',
@@ -283,6 +306,36 @@ export const HERO_PRESETS: Record<Hero, HeroPreset> = {
     }),
   },
 }
+
+// Skin: the six official examples, examples/open_pbr_skin_i.mtlx to _vi.mtlx (lightest to darkest), verbatim.
+// Each is a subsurface medium under a rough dielectric (IOR 1.40, roughness 0.5) with the default radius of 1;
+// the radius scale gives the per-channel mean free path. The examples do not state a length unit; the lab reads
+// them as centimeters (red light's mean free path near 5 mm for tones I to III), see subsurfaceScale.
+export type SkinTone = 'i' | 'ii' | 'iii' | 'iv' | 'v' | 'vi'
+export const SKIN_ORDER: SkinTone[] = ['i', 'ii', 'iii', 'iv', 'v', 'vi']
+const skin = (color: RGB, radiusScale: RGB): OpenPBR =>
+  mat({
+    specular_roughness: 0.5,
+    specular_ior: 1.4,
+    subsurface_weight: 1,
+    subsurface_color: color,
+    subsurface_radius_scale: radiusScale,
+  })
+const SKIN_LIGHT: RGB = [0.482, 0.169, 0.109]
+const SKIN_DARK: RGB = [0.367, 0.137, 0.068]
+export const SKIN_TONES: Record<SkinTone, { label: string; params: OpenPBR }> = {
+  i: { label: 'I', params: skin([0.762, 0.652, 0.568], SKIN_LIGHT) },
+  ii: { label: 'II', params: skin([0.671, 0.505, 0.371], SKIN_LIGHT) },
+  iii: { label: 'III', params: skin([0.545, 0.445, 0.359], SKIN_LIGHT) },
+  iv: { label: 'IV', params: skin([0.351, 0.24, 0.148], SKIN_DARK) },
+  v: { label: 'V', params: skin([0.227, 0.157, 0.091], SKIN_DARK) },
+  vi: { label: 'VI', params: skin([0.073, 0.052, 0.025], SKIN_DARK) },
+}
+
+// Subsurface radii are lengths; the scene's units are not centimeters, so each scene converts: scene units per
+// centimeter = 0.01 / meters per scene unit (see the models' metersPerUnit, and BALLS_METERS_PER_UNIT).
+export const BALLS_METERS_PER_UNIT = 0.09 // the reference balls taken as 18 cm across (radius 1 unit)
+export const subsurfaceScale = (metersPerUnit: number) => 0.01 / metersPerUnit
 
 // Car paint finishes. Solid is the official example; the others are authored for the lab on the same layering
 // (base, then the thin film that OpenPBR places between base and coat, then the clear coat).
@@ -345,8 +398,10 @@ export const PAINT_FINISHES: Record<PaintFinish, { label: string; params: OpenPB
 const FLAKES: Partial<OpenPBR> = { lab_flake_coverage: 0.55, lab_flake_size: 0.006, lab_flake_tilt: 0.18 }
 export const paintHasFlakes = (finish: PaintFinish, flakes: boolean) => flakes && finish !== 'solid'
 
-// The hero's parameters before any slider edits: car paint takes its finish (and flakes); the others their preset.
-export function heroParams(hero: Hero, finish: PaintFinish, flakes: boolean): OpenPBR {
+// The hero's parameters before any slider edits: car paint takes its finish (and flakes), skin its tone; the
+// others their preset.
+export function heroParams(hero: Hero, finish: PaintFinish, flakes: boolean, tone: SkinTone = 'iii'): OpenPBR {
+  if (hero === 'skin') return SKIN_TONES[tone].params
   if (hero !== 'carpaint') return HERO_PRESETS[hero].params
   const p = PAINT_FINISHES[finish].params
   if (!paintHasFlakes(finish, flakes)) return p

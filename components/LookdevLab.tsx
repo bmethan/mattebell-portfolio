@@ -12,8 +12,8 @@ import {
   type Pass,
   type View,
 } from './lookdev/engine'
-import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
-import { MODELS, MODEL_ORDER } from './lookdev/models'
+import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, SKIN_ORDER, SKIN_TONES, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
+import { MODELS, MODEL_ORDER, type Model } from './lookdev/models'
 import { CITATIONS } from './lookdev/citations'
 import WorkIndicator from './WorkIndicator'
 
@@ -95,6 +95,13 @@ function Still({ alt }: { alt: string }) {
       <img className="lab-still-img" src="/lookdev/poster.jpg" alt={alt} decoding="async" />
     </picture>
   )
+}
+
+// Picking a model also dresses it in its own hero material, if it has one (the statue in skin).
+function modelPatch(m: Model): Partial<LabState> {
+  if (m === 'spheres') return { model: m }
+  const { hero, yaw } = MODELS[m]
+  return { model: m, ...(hero ? { hero, heroRoughness: null, heroAniso: null } : {}), ...(yaw !== undefined ? { modelYaw: yaw } : {}) }
 }
 
 const MIXER_LIGHTS = [
@@ -397,7 +404,7 @@ export default function LookdevLab() {
   }
 
   const hero = HERO_PRESETS[lab.hero]
-  const heroBase = heroParams(lab.hero, lab.paint, lab.flakes)
+  const heroBase = heroParams(lab.hero, lab.paint, lab.flakes, lab.skinTone)
   const heroRough = lab.heroRoughness ?? heroBase[hero.roughnessParam]
   const brushed = heroBase.specular_roughness_anisotropy > 0
   const heroAniso = lab.heroAniso ?? heroBase.specular_roughness_anisotropy
@@ -521,7 +528,7 @@ export default function LookdevLab() {
           <div className="lab-row">
             <Group label="Model">
               {MODEL_ORDER.map(m => (
-                <Pill key={m} on={lab.model === m} onClick={() => update({ model: m })}>
+                <Pill key={m} on={lab.model === m} onClick={() => update(modelPatch(m))}>
                   {m === 'spheres' ? 'Reference balls' : MODELS[m].label}
                 </Pill>
               ))}
@@ -576,6 +583,18 @@ export default function LookdevLab() {
                   </Pill>
                 </Group>
               )}
+            </div>
+          )}
+
+          {lab.hero === 'skin' && (
+            <div className="lab-row">
+              <Group label="Tone">
+                {SKIN_ORDER.map(t => (
+                  <Pill key={t} on={lab.skinTone === t} onClick={() => update({ skinTone: t, heroRoughness: null })}>
+                    {SKIN_TONES[t].label}
+                  </Pill>
+                ))}
+              </Group>
             </div>
           )}
 
@@ -661,6 +680,8 @@ export default function LookdevLab() {
                   ` Measured mean over the ${model ? 'balls and model' : 'spheres'}: ${furnaceMean.toFixed(3)} (ideal 1.000).`}
                 {model &&
                   ` A model reads a little under 1: light caught in its cavities needs dozens of bounces to escape, and the renderer stops at ${MESH_FURNACE_BOUNCES}.`}
+                {lab.hero === 'skin' &&
+                  ' Skin reads a little under 1 in blue: with nothing absorbed, a walk ends only by leaving, and the lab stops the longest walks.'}
               </span>
             )}
           </div>
@@ -690,6 +711,10 @@ export default function LookdevLab() {
           dims and recolors a light without starting a new render. While it renders, the image is shown through
           a denoiser (an edge-avoiding wavelet filter guided by albedo, normals and each pixel&apos;s noise), labelled in
           the frame and handing over to the raw render as it converges: the finished image is never filtered.
+          Skin is OpenPBR&apos;s subsurface: light refracts in through the rough surface and walks a scattering medium
+          (the spec&apos;s albedo mapping, each walk weighted across the three color channels as in pbrt-v4), leaving
+          through a diffuse exit as in Cycles&apos; random walk. The official skin presets do not state a length unit; the
+          lab reads them as centimeters, at each scene&apos;s real size (Winged Victory at the statue&apos;s 2.75 m).
         </p>
         <span className="lab-label">Methods</span>
         <ul>

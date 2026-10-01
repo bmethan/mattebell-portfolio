@@ -20,7 +20,9 @@ await MeshoptSimplifier.ready
 
 // Material slots shared with the renderer (components/lookdev/models.ts): 0-3 are the scene's own (gray ball,
 // chrome, hero, floor); the mesh adds 4-9.
-export const SLOT = { chrome: 1, hero: 2, glass: 4, rubber: 5, trim: 6, aluminum: 7, lamp: 8, plastic: 9 }
+// A model may give 4-9 its own materials (MODELS[...].materials there); the names below are the car's, plus the
+// fountain's enamel.
+export const SLOT = { chrome: 1, hero: 2, glass: 4, rubber: 5, trim: 6, aluminum: 7, lamp: 8, plastic: 9, enamel: 4 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // PLY (binary little endian, as exported for the pbrt-v4 scenes).
@@ -209,6 +211,85 @@ async function loadTeapot(dir, resolution) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// glTF 2.0 (.gltf + .bin, as Sketchfab exports it): every mesh primitive (triangles) under the default scene, with
+// its node transforms applied, mapped onto a slot by its material's name. glTF is y up, like the lab.
+// ---------------------------------------------------------------------------------------------------------------
+function loadGltf(dir, slots) {
+  const g = JSON.parse(fs.readFileSync(path.join(dir, 'scene.gltf'), 'utf8'))
+  const bins = g.buffers.map(b => fs.readFileSync(path.join(dir, b.uri)))
+  const read = (accessorIndex, Type) => {
+    const a = g.accessors[accessorIndex]
+    const v = g.bufferViews[a.bufferView]
+    const comps = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 }[a.type]
+    if (v.byteStride && v.byteStride !== comps * Type.BYTES_PER_ELEMENT) throw new Error('interleaved buffers are not supported')
+    const buf = bins[v.buffer]
+    const offset = buf.byteOffset + (v.byteOffset ?? 0) + (a.byteOffset ?? 0)
+    return new Type(buf.buffer.slice(offset, offset + a.count * comps * Type.BYTES_PER_ELEMENT))
+  }
+  const indexType = { 5121: Uint8Array, 5123: Uint16Array, 5125: Uint32Array }
+  const mul = (a, b) => { // column-major 4 x 4
+    const r = new Array(16).fill(0)
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) for (let k = 0; k < 4; k++) r[j * 4 + i] += a[k * 4 + i] * b[j * 4 + k]
+    return r
+  }
+  const local = n => {
+    if (n.matrix) return n.matrix
+    const [x, y, z, w] = n.rotation ?? [0, 0, 0, 1]
+    const [sx, sy, sz] = n.scale ?? [1, 1, 1]
+    const [tx, ty, tz] = n.translation ?? [0, 0, 0]
+    return [
+      (1 - 2 * (y * y + z * z)) * sx, 2 * (x * y + z * w) * sx, 2 * (x * z - y * w) * sx, 0,
+      2 * (x * y - z * w) * sy, (1 - 2 * (x * x + z * z)) * sy, 2 * (y * z + x * w) * sy, 0,
+      2 * (x * z + y * w) * sz, 2 * (y * z - x * w) * sz, (1 - 2 * (x * x + y * y)) * sz, 0,
+      tx, ty, tz, 1,
+    ]
+  }
+  const parts = []
+  const visit = (ni, parent) => {
+    const n = g.nodes[ni]
+    const m = mul(parent, local(n))
+    if (n.mesh !== undefined) {
+      for (const p of g.meshes[n.mesh].primitives) {
+        if ((p.mode ?? 4) !== 4) continue
+        const name = g.materials[p.material]?.name ?? ''
+        if (!(name in slots)) throw new Error(`Unmapped material ${name}`)
+        const src = read(p.attributes.POSITION, Float32Array)
+        const srcN = p.attributes.NORMAL !== undefined ? read(p.attributes.NORMAL, Float32Array) : null
+        const nv = src.length / 3
+        const pos = new Float32Array(nv * 3), nrm = srcN ? new Float32Array(nv * 3) : null
+        for (let i = 0; i < nv; i++) {
+          const [x, y, z] = src.subarray(i * 3, i * 3 + 3)
+          for (let k = 0; k < 3; k++) pos[i * 3 + k] = m[k] * x + m[4 + k] * y + m[8 + k] * z + m[12 + k]
+          if (srcN) {
+            // Normals by the upper 3 x 3 (these files have rotation and uniform scale only), renormalized.
+            const [a, b, c] = srcN.subarray(i * 3, i * 3 + 3)
+            const v = [0, 1, 2].map(k => m[k] * a + m[4 + k] * b + m[8 + k] * c)
+            const l = Math.hypot(...v) || 1
+            nrm.set(v.map(e => e / l), i * 3)
+          }
+        }
+        const idx = p.indices !== undefined
+          ? Uint32Array.from(read(p.indices, indexType[g.accessors[p.indices].componentType]))
+          : Uint32Array.from({ length: nv }, (_, i) => i)
+        parts.push({ file: `node ${ni}`, material: name, slot: slots[name], pos, nrm, idx })
+      }
+    }
+    for (const c of n.children ?? []) visit(c, m)
+  }
+  const I = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+  for (const ni of g.scenes[g.scene ?? 0].nodes) visit(ni, I)
+  return parts
+}
+
+// Winged Victory of Samothrace (CosmoWenman, CC BY 4.0, captured from the Skulpturhalle Basel's plaster cast): its
+// nine texture tiles are one surface; all of it takes the hero material.
+const VICTORY_SLOTS = Object.fromEntries(
+  [...Array.from({ length: 9 }, (_, i) => `Texture_${i}.001`), 'Untextured.001'].map(n => [n, SLOT.hero]),
+)
+// Table Fountain, Cleveland Museum of Art 1924.859 (CC0): gilt silver (the hero) and translucent enamel.
+const FOUNTAIN_SLOTS = { Fountain_Mats: SLOT.hero, Enamel_Mats: SLOT.enamel }
+
+// ---------------------------------------------------------------------------------------------------------------
 // Reduction: one triangle budget for the model, shared by the parts in proportion to their triangle counts, with
 // part borders locked so neighbouring parts still meet.
 // ---------------------------------------------------------------------------------------------------------------
@@ -255,6 +336,76 @@ function merge(parts) {
     }
   })
   return { pos, nrm, idx, mat }
+}
+
+// Close a scan into a solid, for subsurface scattering (a random walk needs an inside): drop duplicated
+// triangles, then fill each closed boundary loop with a fan around its centroid, wound to match the surface.
+// Loops are found on positions (parts that meet at a seam share positions, not indices).
+function closeHoles(mesh) {
+  const { pos, idx, mat } = mesh
+  const nv = pos.length / 3
+  const byPos = new Map(), weld = new Uint32Array(nv)
+  for (let v = 0; v < nv; v++) {
+    const k = `${pos[v * 3]},${pos[v * 3 + 1]},${pos[v * 3 + 2]}`
+    if (!byPos.has(k)) byPos.set(k, v)
+    weld[v] = byPos.get(k)
+  }
+  const keep = [], seen = new Set(), dir = new Map()
+  for (let t = 0; t < idx.length / 3; t++) {
+    const w = [weld[idx[t * 3]], weld[idx[t * 3 + 1]], weld[idx[t * 3 + 2]]]
+    const tk = [...w].sort((a, b) => a - b).join(',')
+    if (seen.has(tk)) continue
+    seen.add(tk)
+    keep.push(t)
+    for (let i = 0; i < 3; i++) dir.set(`${w[i]},${w[(i + 1) % 3]}`, mat[t])
+  }
+  // Boundary edges: a directed edge whose reverse no triangle uses.
+  const next = new Map()
+  for (const [k, slot] of dir) {
+    const [a, b] = k.split(',').map(Number)
+    if (dir.has(`${b},${a}`)) continue
+    if (!next.has(a)) next.set(a, [])
+    next.get(a).push({ b, slot })
+  }
+  const used = new Set(), fills = []
+  for (const [a0, outs] of next) {
+    for (const { b: b0, slot } of outs) {
+      if (used.has(`${a0},${b0}`)) continue
+      const loop = [a0]
+      let a = a0, b = b0
+      used.add(`${a},${b}`)
+      while (b !== a0) {
+        loop.push(b)
+        const n = (next.get(b) ?? []).find(e => !used.has(`${b},${e.b}`))
+        if (!n) break
+        used.add(`${b},${n.b}`)
+        a = b
+        b = n.b
+      }
+      if (b === a0 && loop.length >= 3) fills.push({ loop, slot })
+    }
+  }
+  const extraPos = [], newIdx = [], newMat = []
+  for (const t of keep) { newIdx.push(idx[t * 3], idx[t * 3 + 1], idx[t * 3 + 2]); newMat.push(mat[t]) }
+  let v = nv
+  for (const { loop, slot } of fills) {
+    const c = [0, 1, 2].map(k => loop.reduce((s, i) => s + pos[i * 3 + k], 0) / loop.length)
+    extraPos.push(...c)
+    // The loop runs along the surface's boundary edges (a -> b); a fill triangle uses each edge reversed.
+    for (let i = 0; i < loop.length; i++) {
+      newIdx.push(loop[(i + 1) % loop.length], loop[i], v)
+      newMat.push(slot)
+    }
+    v++
+  }
+  const pos2 = new Float32Array(pos.length + extraPos.length)
+  pos2.set(pos)
+  pos2.set(extraPos, pos.length)
+  const nrm2 = new Float32Array(pos2.length)
+  nrm2.set(mesh.nrm)
+  // Fill vertices get no normal here: fillMissingNormals gives them the area-weighted face normal.
+  console.error(`closeHoles: dropped ${idx.length / 3 - keep.length} duplicate triangles, filled ${fills.length} holes (${fills.reduce((s, f) => s + f.loop.length, 0)} edges)`)
+  return { pos: pos2, nrm: nrm2, idx: Uint32Array.from(newIdx), mat: Uint8Array.from(newMat) }
 }
 
 // Smooth normals where a part has none: area-weighted face normals.
@@ -488,16 +639,20 @@ const [, , which, src, arg] = process.argv
 const SOURCES = {
   sportscar: { load: () => loadSportsCar(src), budget: arg ? +arg : 100_000, credit: 'Sports Car by Yasutoshi Mori (CC BY 4.0)' },
   teapot: { load: () => loadTeapot(src, arg ? +arg : 24), budget: Infinity, credit: 'Utah Teapot, University of Utah (2026 version, Cem Yuksel)' },
+  victory: { load: () => loadGltf(src, VICTORY_SLOTS), budget: arg ? +arg : 160_000, credit: 'Winged Victory of Samothrace by CosmoWenman (CC BY 4.0)', solid: true },
+  fountain: { load: () => loadGltf(src, FOUNTAIN_SLOTS), budget: arg ? +arg : 180_000, credit: 'Table Fountain 1924.859, Cleveland Museum of Art (CC0)' },
 }
 if (!SOURCES[which] || !src) {
   console.error('usage: node tools/lookdev-models/build.mjs sportscar <pbrt-v4-scenes/sportscar dir> [triangle budget]')
   console.error('       node tools/lookdev-models/build.mjs teapot <dir with teapot_generator.js and .wasm> [resolution]')
+  console.error('       node tools/lookdev-models/build.mjs victory|fountain <dir with scene.gltf> [triangle budget]')
   process.exit(1)
 }
 const parts = await SOURCES[which].load()
 const before = parts.reduce((n, p) => n + p.idx.length / 3, 0)
 const reduced = reduce(parts, SOURCES[which].budget)
-const mesh = merge(reduced)
+let mesh = merge(reduced)
+if (SOURCES[which].solid) mesh = closeHoles(mesh)
 fillMissingNormals(mesh)
 const frame = normalizeFrame(mesh)
 const bvh = buildBvh(mesh)

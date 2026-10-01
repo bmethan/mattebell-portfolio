@@ -63,6 +63,15 @@ export default function About({ settings, years }: { settings: Settings; years: 
 
       <div className="grid-2col-gap">
         <div>
+          <img
+            src="/images/matthew-bell.webp"
+            alt="Matthew Bell"
+            width={800}
+            height={1144}
+            loading="lazy"
+            decoding="async"
+            style={{ display: 'block', width: '100%', maxWidth: 280, height: 'auto', marginBottom: 28, border: '0.5px solid var(--border)' }}
+          />
           {bio.map((p, i) => (
             <p key={i} style={{ fontSize: 15, color: 'var(--text-muted)', lineHeight: 1.8, marginBottom: 16 }}
               dangerouslySetInnerHTML={{ __html: p }} />

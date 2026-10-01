@@ -53,6 +53,7 @@ function jsonLd(years: number) {
         name: NAME,
         alternateName: ['Matt Bell', 'Matthew E. Bell'],
         url: `${SITE}/`,
+        image: `${SITE}/images/matthew-bell.webp`,
         jobTitle: ['VFX Artist, Lighting and Look Development', 'Creative Technologist'],
         description: description(years),
         knowsAbout: [

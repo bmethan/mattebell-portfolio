@@ -3,6 +3,7 @@ import { useEffect, useId, useRef, useState } from 'react'
 import {
   LookdevEngine,
   DEFAULT_STATE,
+  isDisplayOnly,
   isPosterState,
   TARGET_SPP,
   MESH_FURNACE_BOUNCES,
@@ -96,6 +97,59 @@ function Still({ alt }: { alt: string }) {
   )
 }
 
+const MIXER_LIGHTS = [
+  { id: 'key', label: 'Key', gain: 'keyGain', kelvin: 'keyKelvin' },
+  { id: 'fill', label: 'Fill', gain: 'fillGain', kelvin: 'fillKelvin' },
+  { id: 'rim', label: 'Rim', gain: 'rimGain', kelvin: 'rimKelvin' },
+] as const
+
+// Light mixer: each light renders into its own image, so switching one, its intensity and its color temperature
+// recombine the images on the spot instead of starting a new render. Moving the key still re-renders.
+function LightMixer({ lab, update }: { lab: LabState; update: (patch: Partial<LabState>) => void }) {
+  const id = useId()
+  return (
+    <div className="lab-mixer" role="group" aria-labelledby={id}>
+      <span id={id} className="lab-label lab-mixer-title">
+        Light mixer
+      </span>
+      <span className="lab-label lab-mixer-head" aria-hidden="true">
+        Intensity
+      </span>
+      <span className="lab-label lab-mixer-head" aria-hidden="true">
+        Color temp
+      </span>
+      {MIXER_LIGHTS.map(l => (
+        <div key={l.id} className="lab-mixer-row">
+          <Pill on={lab[l.id]} onClick={() => update({ [l.id]: !lab[l.id] })}>
+            {l.label}
+          </Pill>
+          <Range
+            min={-3}
+            max={3}
+            step={0.1}
+            value={lab[l.gain]}
+            label={`${l.label} intensity, stops`}
+            onChange={v => update({ [l.gain]: v })}
+          />
+          <span className="lab-readout">
+            {lab[l.gain] >= 0 ? '+' : ''}
+            {lab[l.gain].toFixed(1)}
+          </span>
+          <Range
+            min={2500}
+            max={9000}
+            step={100}
+            value={lab[l.kelvin]}
+            label={`${l.label} color temperature, kelvin`}
+            onChange={v => update({ [l.kelvin]: v })}
+          />
+          <span className="lab-readout">{lab[l.kelvin]}K</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function Group({ label, children }: { label: string; children: React.ReactNode }) {
   const id = useId()
   return (
@@ -135,9 +189,9 @@ export default function LookdevLab() {
     const next = { ...labRef.current, ...patch }
     labRef.current = next
     setLab(next)
-    // Anything beyond exposure or view transform re-renders from zero samples, so the previous count and
-    // furnace reading no longer apply.
-    if (Object.keys(patch).some(k => k !== 'exposure' && k !== 'view')) {
+    // Anything beyond exposure, view transform and the light mixer re-renders from zero samples, so the previous
+    // count and furnace reading no longer apply.
+    if (!isDisplayOnly(patch)) {
       setFurnaceMean(null)
       setStatus(s => ({ ...s, spp: 0, converged: false, preview: false, ms: 0 }))
     }
@@ -486,12 +540,9 @@ export default function LookdevLab() {
             )}
           </div>
 
+          <LightMixer lab={lab} update={update} />
+
           <div className="lab-row">
-            <Group label="Lights">
-              <Pill on={lab.key} onClick={() => update({ key: !lab.key })}>Key</Pill>
-              <Pill on={lab.fill} onClick={() => update({ fill: !lab.fill })}>Fill</Pill>
-              <Pill on={lab.rim} onClick={() => update({ rim: !lab.rim })}>Rim</Pill>
-            </Group>
             <Group label="Hero">
               {HERO_ORDER.map(h => (
                 <Pill key={h} on={lab.hero === h} onClick={() => update({ hero: h, heroRoughness: null, heroAniso: null })}>
@@ -521,17 +572,6 @@ export default function LookdevLab() {
           )}
 
           <div className="lab-row">
-            <Group label="Key temp">
-              <Range
-                min={2500}
-                max={9000}
-                step={100}
-                value={lab.keyKelvin}
-                label="Key temp, kelvin"
-                onChange={v => update({ keyKelvin: v })}
-              />
-              <span className="lab-readout">{lab.keyKelvin}K</span>
-            </Group>
             <Group label="Exposure">
               <Range
                 min={-3}
@@ -630,7 +670,9 @@ export default function LookdevLab() {
           Rendered in ACEScg. With multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of
           1.0 in a white furnace test, and rough glass, compensated for multiple scattering, stays within about 1.5%
           through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%. Dispersion is
-          spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm.
+          spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm. Each
+          light renders into its own image, like a production renderer&apos;s light groups, so the light mixer switches,
+          dims and recolors a light without starting a new render.
         </p>
         <span className="lab-label">Methods</span>
         <ul>

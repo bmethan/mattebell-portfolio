@@ -1270,7 +1270,10 @@ ${THIN_FILM}
 ${OPENPBR}
 ${LIGHTS}
 
-uniform sampler2D uPrev;
+// The running means of the three per-light images (see main): key (with the dim environment), fill, rim.
+uniform sampler2D uPrev0;
+uniform sampler2D uPrev1;
+uniform sampler2D uPrev2;
 uniform vec2 uResolution;
 uniform int uSppDone;
 uniform int uSppNew;
@@ -1299,7 +1302,17 @@ uniform vec3 uBallX;
 uniform Mat uMat[4];
 #endif
 
-out vec4 outColor;
+// Light mixer: every softbox's light lands in its own image, traced in white, so the display can recolor,
+// rescale or switch off each light exactly without tracing again (light transport is linear in each light's
+// emission). The environment rides with the key; alpha of the key image is the coverage mask.
+layout(location = 0) out vec4 outKey;
+layout(location = 1) out vec4 outFill;
+layout(location = 2) out vec4 outRim;
+void addLight(int k, vec3 c, inout vec3 L0, inout vec3 L1, inout vec3 L2) {
+  if (k == 0) L0 += c;
+  else if (k == 1) L1 += c;
+  else L2 += c;
+}
 
 // Loop bounds come from uniforms so the Direct3D compiler cannot unroll the path loop (compile time).
 uniform int uMaxBounces;
@@ -1563,7 +1576,7 @@ bool nonFinite(float x) { return (floatBitsToUint(x) & 0x7f800000u) == 0x7f80000
 void main() {
   ivec2 pix = ivec2(gl_FragCoord.xy);
   uint pixSeed = pcg3d(uvec3(uvec2(pix), 0x9e37u)).x;
-  vec3 acc = vec3(0.0);
+  vec3 acc0 = vec3(0.0), acc1 = vec3(0.0), acc2 = vec3(0.0);
   float accMask = 0.0;
 
   for (int sIdx = 0; sIdx < uSppNew; sIdx++) {
@@ -1573,7 +1586,7 @@ void main() {
     vec3 ro = uCamPos;
     vec3 rd = normalize(uCamFwd + ndc.x * uTanHalf.x * uCamRight + ndc.y * uTanHalf.y * uCamUp);
 
-    vec3 L = vec3(0.0);
+    vec3 L = vec3(0.0), L1 = vec3(0.0), L2 = vec3(0.0); // per light: key (and environment), fill, rim
     vec3 beta = vec3(1.0);
     float mask = 0.0;
     float prevPdf = 0.0;
@@ -1595,7 +1608,7 @@ void main() {
         // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling.
         float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.t));
         vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
-        L += depth >= 2 ? clampIndirect(c) : c;
+        addLight(h.light, depth >= 2 ? clampIndirect(c) : c, L, L1, L2);
         break;
       }
       if (h.mat < 0) {
@@ -1678,7 +1691,7 @@ void main() {
           // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
           float wl = last ? 1.0 : powerHeuristic(lpdf, bpdf);
           vec3 c = beta * Tsh * f * uLightRadiance[k] * (wl / lpdf);
-          L += depth >= 1 ? clampIndirect(c) : c;
+          addLight(k, depth >= 1 ? clampIndirect(c) : c, L, L1, L2);
         } else {
           if (bpdf <= 0.0) break;
           beta *= f / bpdf;
@@ -1715,18 +1728,30 @@ void main() {
       }
       if (!continued) break;
     }
-    if (nonFinite(L.r) || nonFinite(L.g) || nonFinite(L.b)) L = vec3(0.0);
-    acc += L;
+    // A sample with any non-finite light is dropped whole, so the three images stay consistent.
+    vec3 all = L + L1 + L2;
+    if (!(nonFinite(all.r) || nonFinite(all.g) || nonFinite(all.b))) {
+      acc0 += L;
+      acc1 += L1;
+      acc2 += L2;
+    }
     accMask += mask;
   }
 
   float nNew = float(uSppNew);
-  vec4 cur = min(vec4(acc / nNew, accMask / nNew), vec4(65504.0)); // stay finite on RGBA16F targets
+  float w = uSppDone == 0 ? 1.0 : nNew / (float(uSppDone) + nNew);
+  // min(): stay finite on RGBA16F targets.
+  vec4 cur0 = min(vec4(acc0 / nNew, accMask / nNew), vec4(65504.0));
+  vec4 cur1 = min(vec4(acc1 / nNew, 1.0), vec4(65504.0));
+  vec4 cur2 = min(vec4(acc2 / nNew, 1.0), vec4(65504.0));
   if (uSppDone == 0) {
-    outColor = cur;
+    outKey = cur0;
+    outFill = cur1;
+    outRim = cur2;
   } else {
-    vec4 prev = texelFetch(uPrev, pix, 0);
-    outColor = mix(prev, cur, nNew / (float(uSppDone) + nNew));
+    outKey = mix(texelFetch(uPrev0, pix, 0), cur0, w);
+    outFill = mix(texelFetch(uPrev1, pix, 0), cur1, w);
+    outRim = mix(texelFetch(uPrev2, pix, 0), cur2, w);
   }
 }
 `
@@ -1743,7 +1768,10 @@ export const TRACE_FRAG_MESH = traceFrag(true)
 // ------------------------------------------------------------------------------------------------------------
 export const DISPLAY_FRAG = /* glsl */ `${HEADER}
 ${COMMON}
-uniform sampler2D uAccum;
+uniform sampler2D uAccum0; // key (and environment); the AOV passes use this one alone
+uniform sampler2D uAccum1; // fill
+uniform sampler2D uAccum2; // rim
+uniform vec3 uMix[3];      // light mixer: each light's color times its intensity (traced in white)
 uniform int uAccumDiv;  // 1 for the accumulation; k for a 1/k-resolution preview (nearest, like an IPR proxy)
 uniform sampler3D uAcesLut;
 uniform int uAcesReady;
@@ -1823,9 +1851,11 @@ vec3 aces2(vec3 ap1) {
 }
 
 void main() {
-  vec3 c = texelFetch(uAccum, ivec2(gl_FragCoord.xy) / uAccumDiv, 0).rgb;
+  ivec2 px = ivec2(gl_FragCoord.xy) / uAccumDiv;
+  vec3 c = texelFetch(uAccum0, px, 0).rgb;
   if (uPass == 4) { outColor = vec4(c, 1.0); return; }                                   // normals: raw data
   if (uPass == 3) { outColor = vec4(srgbOETF(max(AP1_TO_REC709 * c, 0.0)), 1.0); return; } // albedo
+  c = c * uMix[0] + texelFetch(uAccum1, px, 0).rgb * uMix[1] + texelFetch(uAccum2, px, 0).rgb * uMix[2];
   c = max(c, 0.0) * exp2(uExposure);
   if (uView == 0 && uAcesReady == 1) { outColor = vec4(aces2(c), 1.0); return; }
   vec3 r = max(AP1_TO_REC709 * c, 0.0);

@@ -14,6 +14,11 @@ export interface LabState {
   fill: boolean
   rim: boolean
   keyKelvin: number
+  fillKelvin: number
+  rimKelvin: number
+  keyGain: number // light mixer intensities, in stops over each light's base power
+  fillGain: number
+  rimGain: number
   exposure: number
   model: Model
   modelYaw: number // turntable angle of a model, radians
@@ -36,6 +41,11 @@ export const DEFAULT_STATE: LabState = {
   fill: true,
   rim: true,
   keyKelvin: 4300,
+  fillKelvin: 8000,
+  rimKelvin: 4300,
+  keyGain: 0,
+  fillGain: 0,
+  rimGain: 0,
   exposure: 0.5,
   model: 'spheres',
   modelYaw: 0.6,
@@ -50,6 +60,12 @@ export const DEFAULT_STATE: LabState = {
   multiscatter: true,
   furnace: false,
 }
+
+// Settings the display applies to the accumulated images (each light has its own), so they never re-render.
+const DISPLAY_KEYS = new Set<string>([
+  'exposure', 'view', 'key', 'fill', 'rim', 'keyKelvin', 'fillKelvin', 'rimKelvin', 'keyGain', 'fillGain', 'rimGain',
+])
+export const isDisplayOnly = (patch: Partial<LabState>) => Object.keys(patch).every(k => DISPLAY_KEYS.has(k))
 
 // poster.jpg is this renderer's converged (2048 spp) image of DEFAULT_STATE, so that state never needs a live
 // render. Angles and roughness compare with a tolerance (arrow keys step in floats; a roughness equal to the
@@ -193,6 +209,10 @@ const LUT_SIZE = 65
 const LUT_URL = '/lookdev/aces2-sdr-rec709-65.png'
 const INDIRECT_CLAMP = 12
 
+// Base radiance of key, fill and rim (unit luminance color): the key alone lights the 18% gray ball to about middle
+// gray (it subtends ~0.16 sr, so L ~ pi / 0.16), the fill near a 1:6 ratio, a hot rim. The mixer scales these.
+const LIGHT_POWER = [20, 1.8, 36]
+
 // Cyc: the floor ends 4 units behind the balls and sweeps up a 3-unit radius into a wall 7 units back, behind the
 // rim light (its nearest corner sits about 4.7 back) so no softbox pokes through.
 const CYC_Z = -4
@@ -295,7 +315,7 @@ export class LookdevEngine {
   private uploadedFor: WebGLProgram | null = null // the trace program the scene uniforms were last set on
   private live = false
   private uniformCache = new Map<WebGLProgram, Map<string, WebGLUniformLocation | null>>()
-  private accumTex: WebGLTexture[] = []
+  private accumTex: WebGLTexture[][] = [] // [ping][key, fill, rim]
   private accumFbo: WebGLFramebuffer[] = []
   private eTable: WebGLTexture
   private eTableT: WebGLTexture // dielectric albedo for glass compensation
@@ -332,7 +352,7 @@ export class LookdevEngine {
   private maxInFlight = MAX_IN_FLIGHT
   // Preview: while the scene is changing, one sample per pixel at a proxy resolution (1/previewK) is drawn
   // each frame, outside the accumulation, so dragging the light stays at the display rate.
-  private previewTex: WebGLTexture | null = null
+  private previewTex: WebGLTexture[] = [] // key, fill, rim
   private previewFbo: WebGLFramebuffer | null = null
   private previewK = 0 // proxy divisor of the preview on screen; 0 = none
   private previewDirty = false
@@ -665,9 +685,21 @@ export class LookdevEngine {
     return m.get(name) ?? null
   }
 
+  // A render target of three images (the light mixer's key, fill and rim), drawn together with draw buffers.
+  private makeTargets(w: number, h: number) {
+    const gl = this.gl
+    const tex = [0, 1, 2].map(() => this.makeTex(w, h, this.accumFmt.internal, this.accumFmt.type))
+    const fbo = gl.createFramebuffer()!
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    tex.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0))
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2])
+    return { tex, fbo }
+  }
+
   resize(cssW: number, cssH: number, dpr: number) {
-    // Cap the internal resolution so the path tracer stays interactive on large or dense displays.
-    const maxPixels = 1_400_000
+    // Cap the internal resolution so the path tracer stays interactive on large or dense displays (and the light
+    // mixer's three float images per buffer stay modest in GPU memory).
+    const maxPixels = 1_200_000
     let scaleF = Math.min(dpr, 1.5)
     if (cssW * cssH * scaleF * scaleF > maxPixels) scaleF = Math.sqrt(maxPixels / (cssW * cssH))
     const w = Math.max(1, Math.round(cssW * scaleF))
@@ -679,25 +711,21 @@ export class LookdevEngine {
     this.canvas.height = h
 
     const gl = this.gl
-    this.accumTex.forEach(t => gl.deleteTexture(t))
+    this.accumTex.flat().forEach(t => gl.deleteTexture(t))
     this.accumFbo.forEach(f => gl.deleteFramebuffer(f))
     this.accumTex = []
     this.accumFbo = []
     for (let i = 0; i < 2; i++) {
-      const tex = this.makeTex(w, h, this.accumFmt.internal, this.accumFmt.type)
-      const fbo = gl.createFramebuffer()!
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+      const { tex, fbo } = this.makeTargets(w, h)
       this.accumTex.push(tex)
       this.accumFbo.push(fbo)
     }
     // Preview target: big enough for the finest proxy resolution (half); coarser ones use part of it.
-    if (this.previewTex) gl.deleteTexture(this.previewTex)
+    this.previewTex.forEach(t => gl.deleteTexture(t))
     if (this.previewFbo) gl.deleteFramebuffer(this.previewFbo)
-    this.previewTex = this.makeTex(Math.ceil(w / 2), Math.ceil(h / 2), this.accumFmt.internal, this.accumFmt.type)
-    this.previewFbo = gl.createFramebuffer()!
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.previewFbo)
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.previewTex, 0)
+    const preview = this.makeTargets(Math.ceil(w / 2), Math.ceil(h / 2))
+    this.previewTex = preview.tex
+    this.previewFbo = preview.fbo
     this.previewK = 0
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     // Resizing the canvas clears it, so treat it like a scene change: a quick preview fills the frame at once
@@ -710,10 +738,10 @@ export class LookdevEngine {
   }
 
   setState(patch: Partial<LabState>) {
-    const displayOnly = Object.keys(patch).every(k => k === 'exposure' || k === 'view')
+    const displayOnly = isDisplayOnly(patch)
     this.state = { ...this.state, ...patch }
     if (displayOnly && (this.spp > 0 || (this.previewK > 0 && this.previewGen === this.gen))) {
-      // Exposure and view transform act on the accumulated radiance, so no re-render is needed.
+      // Exposure, view transform and the light mixer act on the accumulated radiance, so no re-render is needed.
       this.display()
       return
     }
@@ -828,20 +856,19 @@ export class LookdevEngine {
     // Three-point rig. Fill sits opposite the key; the rim strip sits behind, opposite the key.
     // Radiances are set from solid angle so the key alone lights the 18% gray card to about middle gray
     // (the key subtends ~0.16 sr, so L ~ pi / 0.16), with the fill near a 1:6 ratio and a hot rim.
+    // Light mixer: every light is traced in white at its base power, always on, into its own image; its switch,
+    // color temperature and intensity are applied in the display (mixWeights), so changing them is instant.
     const side = s.keyAz >= 0 ? 1 : -1
-    const keyRGB = kelvinToACEScg(s.keyKelvin)
-    const fillRGB = kelvinToACEScg(8000)
     const rigs = [
-      { on: s.key, rect: rectLight(s.keyAz, s.keyEl, 6.5, 2.6, 2.6), rgb: keyRGB, power: 20 },
-      { on: s.fill, rect: rectLight(-side * 0.95, 0.18, 7.5, 4.5, 3.5), rgb: fillRGB, power: 1.8 },
-      { on: s.rim, rect: rectLight(-side * 2.45, 0.45, 6.0, 0.9, 3.4), rgb: keyRGB, power: 36 },
+      { rect: rectLight(s.keyAz, s.keyEl, 6.5, 2.6, 2.6), power: LIGHT_POWER[0] },
+      { rect: rectLight(-side * 0.95, 0.18, 7.5, 4.5, 3.5), power: LIGHT_POWER[1] },
+      { rect: rectLight(-side * 2.45, 0.45, 6.0, 0.9, 3.4), power: LIGHT_POWER[2] },
     ]
     rigs.forEach((r, i) => {
-      const on = r.on && !s.furnace
       gl.uniform3fv(L(`uLightCorner[${i}]`), r.rect.corner)
       gl.uniform3fv(L(`uLightU[${i}]`), r.rect.U)
       gl.uniform3fv(L(`uLightV[${i}]`), r.rect.V)
-      gl.uniform3fv(L(`uLightRadiance[${i}]`), on ? scale(r.rgb, r.power) : [0, 0, 0])
+      gl.uniform3fv(L(`uLightRadiance[${i}]`), s.furnace ? [0, 0, 0] : [r.power, r.power, r.power])
     })
 
     gl.uniform4uiv(L('uSobol'), SOBOL_UNIFORM)
@@ -1031,12 +1058,7 @@ export class LookdevEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.previewFbo)
     gl.viewport(0, 0, Math.ceil(this.width / k), Math.ceil(this.height / k))
     const L = this.useTrace()
-    gl.activeTexture(gl.TEXTURE0)
-    gl.bindTexture(gl.TEXTURE_2D, this.accumTex[this.ping]) // not read when uSppDone is 0
-    gl.activeTexture(gl.TEXTURE1)
-    gl.bindTexture(gl.TEXTURE_3D, this.eTable)
-    gl.uniform1i(L('uPrev'), 0)
-    gl.uniform1i(L('uETable'), 1)
+    this.bindPrev(L) // not read when uSppDone is 0
     // Fractional size, so preview pixel i covers exactly full-resolution pixels [k i, k i + k) on screen.
     gl.uniform2f(L('uResolution'), this.width / k, this.height / k)
     gl.uniform1i(L('uSppDone'), 0)
@@ -1175,6 +1197,20 @@ export class LookdevEngine {
     this.onStatus({ spp: this.spp, target: this.goal, converged: this.spp >= this.goal, preview: false, ms: this.renderMs, model: 'ready' })
   }
 
+  // The current running means (key, fill, rim) on units 0, 6 and 7, and the albedo table on unit 1.
+  private bindPrev(L: (name: string) => WebGLUniformLocation | null) {
+    const gl = this.gl
+    const units = [0, 6, 7]
+    this.accumTex[this.ping].forEach((t, i) => {
+      gl.activeTexture(gl.TEXTURE0 + units[i])
+      gl.bindTexture(gl.TEXTURE_2D, t)
+      gl.uniform1i(L(`uPrev${i}`), units[i])
+    })
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_3D, this.eTable)
+    gl.uniform1i(L('uETable'), 1)
+  }
+
   // One slice of a trace pass: n new samples per pixel blended into the running mean, read from the current
   // buffer and written to the other (ping-pong). A slice is every sliceCount-th block of SLICE_ROWS rows, each
   // drawn under a scissor so pixels outside it are never shaded (a shader discard would still run the whole
@@ -1185,12 +1221,7 @@ export class LookdevEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFbo[1 - this.ping])
     gl.viewport(0, 0, this.width, this.height)
     const L = this.useTrace()
-    gl.activeTexture(gl.TEXTURE0)
-    gl.bindTexture(gl.TEXTURE_2D, this.accumTex[this.ping])
-    gl.activeTexture(gl.TEXTURE1)
-    gl.bindTexture(gl.TEXTURE_3D, this.eTable)
-    gl.uniform1i(L('uPrev'), 0)
-    gl.uniform1i(L('uETable'), 1)
+    this.bindPrev(L)
     gl.uniform2f(L('uResolution'), this.width, this.height)
     gl.uniform1i(L('uSppDone'), this.spp)
     gl.uniform1i(L('uSppNew'), n)
@@ -1222,13 +1253,17 @@ export class LookdevEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
     gl.useProgram(p)
-    gl.activeTexture(gl.TEXTURE0)
     const preview = this.showingPreview()
-    gl.bindTexture(gl.TEXTURE_2D, preview ? this.previewTex : this.accumTex[this.ping])
+    const units = [0, 2, 3]
+    ;(preview ? this.previewTex : this.accumTex[this.ping]).forEach((t, i) => {
+      gl.activeTexture(gl.TEXTURE0 + units[i])
+      gl.bindTexture(gl.TEXTURE_2D, t)
+      gl.uniform1i(this.loc(p, `uAccum${i}`), units[i])
+    })
     gl.activeTexture(gl.TEXTURE1)
     gl.bindTexture(gl.TEXTURE_3D, this.acesLut)
     gl.uniform1i(this.loc(p, 'uAccumDiv'), preview ? this.previewK : 1)
-    gl.uniform1i(this.loc(p, 'uAccum'), 0)
+    gl.uniform3fv(this.loc(p, 'uMix'), this.mixWeights().flat())
     gl.uniform1i(this.loc(p, 'uAcesLut'), 1)
     gl.uniform1i(this.loc(p, 'uAcesReady'), this.acesReady ? 1 : 0)
     gl.uniform1f(this.loc(p, 'uExposure'), s.furnace ? 0 : s.exposure)
@@ -1237,19 +1272,43 @@ export class LookdevEngine {
     gl.drawArrays(gl.TRIANGLES, 0, 3)
   }
 
+  // Light mixer: the weight of each light's image (key, fill, rim). Light transport is linear in emission, so a
+  // light traced in white and scaled here by its color (unit luminance) and 2^gain is the same image as one traced
+  // in that color at that power. The faint environment rides with the key's image.
+  private mixWeights(): [number, number, number][] {
+    const s = this.state
+    if (s.furnace) return [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
+    const w = (on: boolean, kelvin: number, gain: number) => (on ? scale(kelvinToACEScg(kelvin), 2 ** gain) : [0, 0, 0]) as Vec3
+    return [w(s.key, s.keyKelvin, s.keyGain), w(s.fill, s.fillKelvin, s.fillGain), w(s.rim, s.rimKelvin, s.rimGain)]
+  }
+
   // Encoded image of the current frame (used to produce the static fallback poster).
   snapshot(type = 'image/png', quality?: number): Promise<Blob | null> {
     this.display()
     return new Promise(resolve => this.canvas.toBlob(resolve, type, quality))
   }
 
-  // Raw accumulation buffer: linear ACEScg radiance, alpha = accumulated sphere coverage. Rows start at the bottom.
+  // The image as displayed before the view transform: linear ACEScg radiance, the three lights mixed as the mixer
+  // is set; alpha = accumulated sphere coverage. Rows start at the bottom.
   readAccum(): { w: number; h: number; px: Float32Array } | null {
     if (this.accumFmt.type !== this.gl.FLOAT) return null
     const gl = this.gl
+    const n = this.width * this.height * 4
+    const px = new Float32Array(n)
+    const layer = new Float32Array(n)
+    const mix = this.mixWeights()
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFbo[this.ping])
-    const px = new Float32Array(this.width * this.height * 4)
-    gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, px)
+    for (let k = 0; k < 3; k++) {
+      gl.readBuffer(gl.COLOR_ATTACHMENT0 + k)
+      gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, layer)
+      for (let i = 0; i < n; i += 4) {
+        px[i] += layer[i] * mix[k][0]
+        px[i + 1] += layer[i + 1] * mix[k][1]
+        px[i + 2] += layer[i + 2] * mix[k][2]
+        if (k === 0) px[i + 3] = layer[i + 3]
+      }
+    }
+    gl.readBuffer(gl.COLOR_ATTACHMENT0)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     return { w: this.width, h: this.height, px }
   }
@@ -1281,7 +1340,7 @@ export class LookdevEngine {
     this.fences = []
     this.queries.forEach(({ q }) => gl.deleteQuery(q))
     this.queries = []
-    this.accumTex.forEach(t => gl.deleteTexture(t))
+    this.accumTex.flat().forEach(t => gl.deleteTexture(t))
     this.accumFbo.forEach(f => gl.deleteFramebuffer(f))
     gl.deleteTexture(this.eTable)
     gl.deleteTexture(this.eTableT)
@@ -1293,7 +1352,7 @@ export class LookdevEngine {
     this.meshes.clear()
     gl.deleteProgram(this.progDisplay)
     gl.deleteProgram(this.progTable)
-    if (this.previewTex) gl.deleteTexture(this.previewTex)
+    this.previewTex.forEach(t => gl.deleteTexture(t))
     if (this.previewFbo) gl.deleteFramebuffer(this.previewFbo)
     gl.deleteVertexArray(this.vao)
   }

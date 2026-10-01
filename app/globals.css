@@ -90,6 +90,12 @@ body {
 .lab-range:focus-visible::-moz-range-thumb { background: linear-gradient(90deg, transparent 3px, var(--accent) 3px 9px, transparent 9px); }
 .lab-work { color: var(--accent); margin-right: 8px; }
 .lab-readout { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; min-width: 44px; }
+/* Light mixer: one row per light (switch, intensity, color temperature), columns aligned under two headings */
+.lab-mixer { display: grid; grid-template-columns: auto 120px auto 120px auto; gap: 6px 10px; align-items: center; justify-content: start; }
+.lab-mixer-row { display: contents; }
+.lab-mixer-head { grid-column: span 2; }
+.lab-mixer .lab-pill { min-width: 64px; }
+.lab-mixer .lab-range { width: 100%; }
 .lab-note { font-size: 12px; color: var(--text-muted); line-height: 1.6; max-width: 560px; }
 .lab-methods { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; margin-top: 24px; padding-top: 16px; border-top: 0.5px solid var(--border-subtle); }
 .lab-methods ul { display: flex; flex-wrap: wrap; gap: 6px 16px; list-style: none; margin: 0; padding: 0; }
@@ -157,6 +163,9 @@ section[id], .anchor-target { scroll-margin-top: 80px; }
   .lab-frame { aspect-ratio: 4 / 3; } /* keep in step with the <source> media query in LookdevLab's Still */
   .lab-hud-left, .lab-hud-right { max-width: calc(50% - 20px); }
   .lab-row { gap: 12px 20px; }
+  .lab-mixer { grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) auto; justify-content: stretch; gap: 6px 8px; }
+  .lab-mixer .lab-pill { min-width: 0; }
+  .lab-mixer .lab-readout { min-width: 36px; }
 
   /* Nav */
   .nav-pad { padding: 16px 20px; position: relative; flex-wrap: wrap; }

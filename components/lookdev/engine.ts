@@ -1,4 +1,4 @@
-import { VERT, E_TABLE_FRAG, TRACE_FRAG, DISPLAY_FRAG, traceFrag } from './shaders'
+import { VERT, E_TABLE_FRAG, DISPLAY_FRAG, DENOISE_PREP_FRAG, ATROUS_FRAG, traceFrag } from './shaders'
 import { kelvinToACEScg } from './color'
 import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, heroParams, type OpenPBR, type Hero, type PaintFinish, type Stage } from './materials'
 import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
@@ -31,6 +31,7 @@ export interface LabState {
   pass: Pass
   view: View
   multiscatter: boolean
+  denoise: boolean // display the denoised image (only while rendering: the still is the raw 2048 spp render)
   furnace: boolean
 }
 
@@ -58,12 +59,14 @@ export const DEFAULT_STATE: LabState = {
   pass: 'beauty',
   view: 'aces',
   multiscatter: true,
+  denoise: true,
   furnace: false,
 }
 
 // Settings the display applies to the accumulated images (each light has its own), so they never re-render.
 const DISPLAY_KEYS = new Set<string>([
   'exposure', 'view', 'key', 'fill', 'rim', 'keyKelvin', 'fillKelvin', 'rimKelvin', 'keyGain', 'fillGain', 'rimGain',
+  'denoise',
 ])
 export const isDisplayOnly = (patch: Partial<LabState>) => Object.keys(patch).every(k => DISPLAY_KEYS.has(k))
 
@@ -158,6 +161,11 @@ export const MESH_FURNACE_BOUNCES = 32
 // 0.949 at 32 bounces, 0.976 at 128); roulette ends most paths long before the cap.
 const GLASS_MAX_BOUNCES = 64
 const MESH_GLASS_MAX_BOUNCES = 16 // a solid glass hero on a model (each bounce costs a BVH traversal)
+const DENOISE_LEVELS = 5 // a-trous levels: taps 1, 2, 4, 8 and 16 pixels apart
+// The display shows the denoised image alone up to DENOISE_FULL_SPP samples, then hands over to the raw render
+// (log-linearly) by the target: the finished image is unfiltered. (Fully converged, the filter would still
+// soften the antialiased edges of the brightest highlights, whose samples are all or nothing.)
+const DENOISE_FULL_SPP = 64
 const MAX_NODE_VISITS = 4096 // per mesh ray; a typical one visits well under a hundred BVH nodes
 
 // Frame pacing. The GPU is shared with the browser's compositor, and a single draw cannot be interrupted, so
@@ -308,6 +316,14 @@ export class LookdevEngine {
   private vao: WebGLVertexArrayObject
   private progTrace: WebGLProgram
   private progDisplay: WebGLProgram
+  // Denoiser and adaptive sampling need the tracer's two extra images (five render targets at once).
+  readonly canDenoise: boolean
+  private progPrep: WebGLProgram | null = null
+  private progAtrous: WebGLProgram | null = null
+  private dnTex: WebGLTexture[] = []
+  private dnFbo: WebGLFramebuffer[] = []
+  private dnGuide: WebGLTexture | null = null
+  private dnPrepFbo: WebGLFramebuffer | null = null
   private progTable: WebGLProgram
   // Tracer variants beyond the plain one (progTrace), compiled the first time a scene needs them, and each
   // model's textures.
@@ -412,7 +428,12 @@ export class LookdevEngine {
     this.timer = gl.getExtension('EXT_disjoint_timer_query_webgl2')
     const parallel = !!gl.getExtension('KHR_parallel_shader_compile')
     this.parallel = parallel
-    this.progTrace = startProgram(gl, TRACE_FRAG)
+    this.canDenoise = gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 5 && gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) >= 5
+    this.progTrace = startProgram(gl, traceFrag(false, 'none', this.canDenoise))
+    if (this.canDenoise) {
+      this.progPrep = startProgram(gl, DENOISE_PREP_FRAG)
+      this.progAtrous = startProgram(gl, ATROUS_FRAG)
+    }
     this.progDisplay = startProgram(gl, DISPLAY_FRAG)
     this.progTable = startProgram(gl, E_TABLE_FRAG)
 
@@ -453,7 +474,7 @@ export class LookdevEngine {
 
   private async warmUp(parallel: boolean) {
     const gl = this.gl
-    const progs = [this.progTrace, this.progDisplay, this.progTable]
+    const progs = [this.progTrace, this.progDisplay, this.progTable, this.progPrep, this.progAtrous].filter((p): p is WebGLProgram => !!p)
     // Without the extension there is nothing to poll: yield once, then the status query below blocks.
     for (;;) {
       await sleep(parallel ? 50 : 0)
@@ -485,7 +506,7 @@ export class LookdevEngine {
 
   private ensureVariant(key: VariantKey) {
     if (key === 'base' || this.variants.has(key) || this.disposed || !this.live) return
-    const v = { prog: startProgram(this.gl, traceFrag(key.startsWith('mesh'), VARIANT_GLASS[key])), ready: false, failed: false }
+    const v = { prog: startProgram(this.gl, traceFrag(key.startsWith('mesh'), VARIANT_GLASS[key], this.canDenoise)), ready: false, failed: false }
     this.variants.set(key, v)
     this.compileVariant(v)
   }
@@ -691,14 +712,15 @@ export class LookdevEngine {
     return m.get(name) ?? null
   }
 
-  // A render target of three images (the light mixer's key, fill and rim), drawn together with draw buffers.
+  // A render target of three images (the light mixer's key, fill and rim), drawn together with draw buffers,
+  // plus the denoiser's two (albedo, normal; see AUX in the shader) where the GPU can draw five.
   private makeTargets(w: number, h: number) {
     const gl = this.gl
-    const tex = [0, 1, 2].map(() => this.makeTex(w, h, this.accumFmt.internal, this.accumFmt.type))
+    const tex = Array.from({ length: this.canDenoise ? 5 : 3 }, () => this.makeTex(w, h, this.accumFmt.internal, this.accumFmt.type))
     const fbo = gl.createFramebuffer()!
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     tex.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0))
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2])
+    gl.drawBuffers(tex.map((_, i) => gl.COLOR_ATTACHMENT0 + i))
     return { tex, fbo }
   }
 
@@ -733,6 +755,31 @@ export class LookdevEngine {
     this.previewTex = preview.tex
     this.previewFbo = preview.fbo
     this.previewK = 0
+    // The denoiser's ping-pong pair and guide, full size (a preview uses part of them), in half float: it only
+    // feeds the display.
+    this.dnTex.forEach(t => gl.deleteTexture(t))
+    this.dnFbo.forEach(f => gl.deleteFramebuffer(f))
+    if (this.dnGuide) gl.deleteTexture(this.dnGuide)
+    if (this.dnPrepFbo) gl.deleteFramebuffer(this.dnPrepFbo)
+    this.dnTex = []
+    this.dnFbo = []
+    if (this.canDenoise) {
+      const half = () => this.makeTex(w, h, gl.RGBA16F, gl.HALF_FLOAT)
+      for (let i = 0; i < 2; i++) {
+        const t = half()
+        const f = gl.createFramebuffer()!
+        gl.bindFramebuffer(gl.FRAMEBUFFER, f)
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0)
+        this.dnTex.push(t)
+        this.dnFbo.push(f)
+      }
+      this.dnGuide = half()
+      this.dnPrepFbo = gl.createFramebuffer()!
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.dnPrepFbo)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.dnTex[0], 0)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, this.dnGuide, 0)
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1])
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     // Resizing the canvas clears it, so treat it like a scene change: a quick preview fills the frame at once
     // (and keeps up during a continuous window resize) while the new full-resolution passes are sliced.
@@ -1206,10 +1253,11 @@ export class LookdevEngine {
     this.onStatus({ spp: this.spp, target: this.goal, converged: this.spp >= this.goal, preview: false, ms: this.renderMs, model: 'ready' })
   }
 
-  // The current running means (key, fill, rim) on units 0, 6 and 7, and the albedo table on unit 1.
+  // The current running means (key, fill, rim; and the denoiser's two) on units 0, 6, 7, 8 and 9, and the
+  // albedo table on unit 1.
   private bindPrev(L: (name: string) => WebGLUniformLocation | null) {
     const gl = this.gl
-    const units = [0, 6, 7]
+    const units = [0, 6, 7, 8, 9]
     this.accumTex[this.ping].forEach((t, i) => {
       gl.activeTexture(gl.TEXTURE0 + units[i])
       gl.bindTexture(gl.TEXTURE_2D, t)
@@ -1261,14 +1309,24 @@ export class LookdevEngine {
     gl.bindVertexArray(this.vao)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
-    gl.useProgram(p)
     const preview = this.showingPreview()
+    const src = preview ? this.previewTex : this.accumTex[this.ping]
+    const k = preview ? this.previewK : 1
+    const mix = this.denoiseMix(preview)
+    const denoised = mix > 0 ? this.denoise(src, Math.ceil(this.width / k), Math.ceil(this.height / k), preview ? 1 : this.spp) : null
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, this.width, this.height)
+    gl.useProgram(p)
     const units = [0, 2, 3]
-    ;(preview ? this.previewTex : this.accumTex[this.ping]).forEach((t, i) => {
+    src.slice(0, 3).forEach((t, i) => {
       gl.activeTexture(gl.TEXTURE0 + units[i])
       gl.bindTexture(gl.TEXTURE_2D, t)
       gl.uniform1i(this.loc(p, `uAccum${i}`), units[i])
     })
+    gl.activeTexture(gl.TEXTURE4)
+    gl.bindTexture(gl.TEXTURE_2D, denoised)
+    gl.uniform1i(this.loc(p, 'uDenoised'), 4)
+    gl.uniform1f(this.loc(p, 'uDenoiseMix'), mix)
     gl.activeTexture(gl.TEXTURE1)
     gl.bindTexture(gl.TEXTURE_3D, this.acesLut)
     gl.uniform1i(this.loc(p, 'uAccumDiv'), preview ? this.previewK : 1)
@@ -1279,6 +1337,53 @@ export class LookdevEngine {
     gl.uniform1i(this.loc(p, 'uView'), s.furnace ? VIEW_ID.standard : VIEW_ID[s.view])
     gl.uniform1i(this.loc(p, 'uPass'), PASS_ID[s.pass])
     gl.drawArrays(gl.TRIANGLES, 0, 3)
+  }
+
+  // The denoiser's share of the displayed image (see DENOISE_FULL_SPP). It runs on the beauty and lobe passes,
+  // never on the AOVs or the furnace test (a measurement).
+  private denoiseMix(preview: boolean) {
+    const s = this.state
+    if (!this.canDenoise || !s.denoise || s.furnace || !(s.pass === 'beauty' || s.pass === 'diffuse' || s.pass === 'specular')) return 0
+    if (preview || this.spp <= DENOISE_FULL_SPP) return 1
+    return Math.max(0, 1 - Math.log2(this.spp / DENOISE_FULL_SPP) / Math.log2(Math.max(this.goal, 2 * DENOISE_FULL_SPP) / DENOISE_FULL_SPP))
+  }
+
+  // Filters the mixed image of src (w x h of it) for display; returns the texture holding the result. Costs a
+  // few milliseconds of GPU time at full resolution, once per displayed update.
+  private denoise(src: WebGLTexture[], w: number, h: number, spp: number) {
+    const gl = this.gl
+    const prep = this.progPrep!
+    const atrous = this.progAtrous!
+    const bind = (prog: WebGLProgram, name: string, unit: number, tex: WebGLTexture) => {
+      gl.activeTexture(gl.TEXTURE0 + unit)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      gl.uniform1i(this.loc(prog, name), unit)
+    }
+    gl.bindVertexArray(this.vao)
+    gl.viewport(0, 0, w, h)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.dnPrepFbo)
+    gl.useProgram(prep)
+    bind(prep, 'uAccum0', 0, src[0])
+    bind(prep, 'uAccum1', 2, src[1])
+    bind(prep, 'uAccum2', 3, src[2])
+    bind(prep, 'uAux0', 5, src[3])
+    bind(prep, 'uAux1', 6, src[4])
+    gl.uniform3fv(this.loc(prep, 'uMix'), this.mixWeights().flat())
+    gl.uniform2i(this.loc(prep, 'uSize'), w, h)
+    gl.uniform1f(this.loc(prep, 'uSpp'), spp)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+    gl.useProgram(atrous)
+    bind(atrous, 'uAux0', 5, src[3])
+    bind(atrous, 'uGuide', 6, this.dnGuide!)
+    gl.uniform2i(this.loc(atrous, 'uSize'), w, h)
+    for (let i = 0; i < DENOISE_LEVELS; i++) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.dnFbo[(i + 1) % 2])
+      bind(atrous, 'uIn', 0, this.dnTex[i % 2])
+      gl.uniform1i(this.loc(atrous, 'uStep'), 1 << i)
+      gl.uniform1i(this.loc(atrous, 'uLast'), i === DENOISE_LEVELS - 1 ? 1 : 0)
+      gl.drawArrays(gl.TRIANGLES, 0, 3)
+    }
+    return this.dnTex[DENOISE_LEVELS % 2]
   }
 
   // Light mixer: the weight of each light's image (key, fill, rim). Light transport is linear in emission, so a
@@ -1361,6 +1466,12 @@ export class LookdevEngine {
     this.meshes.clear()
     gl.deleteProgram(this.progDisplay)
     gl.deleteProgram(this.progTable)
+    if (this.progPrep) gl.deleteProgram(this.progPrep)
+    if (this.progAtrous) gl.deleteProgram(this.progAtrous)
+    this.dnTex.forEach(t => gl.deleteTexture(t))
+    this.dnFbo.forEach(f => gl.deleteFramebuffer(f))
+    if (this.dnGuide) gl.deleteTexture(this.dnGuide)
+    if (this.dnPrepFbo) gl.deleteFramebuffer(this.dnPrepFbo)
     this.previewTex.forEach(t => gl.deleteTexture(t))
     if (this.previewFbo) gl.deleteFramebuffer(this.previewFbo)
     gl.deleteVertexArray(this.vao)

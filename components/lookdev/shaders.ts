@@ -1258,8 +1258,10 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
 // variant first and the others only when a scene needs them.
 // THIN is the cheaper subset for thin-walled glass only (car windows, a soap film): straight-through transmission
 // and shadows through it, without solid refraction, absorption or dispersion. GLASS includes it.
-export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' = 'none') {
-  const defs = `${mesh ? '#define MESH 1\n' : ''}${glass === 'full' ? '#define GLASS 1\n' : ''}${glass !== 'none' ? '#define THIN 1\n' : ''}`
+// AUX adds the denoiser's guide images and noise statistics (two more render targets), on GPUs that can draw
+// five at once.
+export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' = 'none', aux = false) {
+  const defs = `${mesh ? '#define MESH 1\n' : ''}${glass === 'full' ? '#define GLASS 1\n' : ''}${glass !== 'none' ? '#define THIN 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
   return /* glsl */ `${HEADER}${defs}
 ${COMMON}
 ${MICROFACET}
@@ -1308,6 +1310,15 @@ uniform Mat uMat[4];
 layout(location = 0) out vec4 outKey;
 layout(location = 1) out vec4 outFill;
 layout(location = 2) out vec4 outRim;
+#ifdef AUX
+// For the denoiser, as running means like the light images: fill.a, the mean of Y^2, where Y is the luminance
+// of the pixel's light (all three lights, in white); outAux0, the first-hit albedo with a = mean of Y; outAux1,
+// the first-hit normal.
+layout(location = 3) out vec4 outAux0;
+layout(location = 4) out vec4 outAux1;
+uniform sampler2D uPrev3;
+uniform sampler2D uPrev4;
+#endif
 void addLight(int k, vec3 c, inout vec3 L0, inout vec3 L1, inout vec3 L2) {
   if (k == 0) L0 += c;
   else if (k == 1) L1 += c;
@@ -1557,6 +1568,8 @@ void main() {
   uint pixSeed = pcg3d(uvec3(uvec2(pix), 0x9e37u)).x;
   vec3 acc0 = vec3(0.0), acc1 = vec3(0.0), acc2 = vec3(0.0);
   float accMask = 0.0;
+  vec3 accAlbedo = vec3(0.0), accN = vec3(0.0);
+  float accY = 0.0, accY2 = 0.0;
 
   for (int sIdx = 0; sIdx < uSppNew; sIdx++) {
     uint sampleIndex = uint(uSppDone + sIdx);
@@ -1566,6 +1579,7 @@ void main() {
     vec3 rd = normalize(uCamFwd + ndc.x * uTanHalf.x * uCamRight + ndc.y * uTanHalf.y * uCamUp);
 
     vec3 L = vec3(0.0), L1 = vec3(0.0), L2 = vec3(0.0); // per light: key (and environment), fill, rim
+    vec3 firstAlbedo = vec3(0.0), firstN = vec3(0.0); // at the camera ray's hit (zero on a miss)
     vec3 beta = vec3(1.0);
     float mask = 0.0;
     float prevPdf = 0.0;
@@ -1707,7 +1721,9 @@ void main() {
 
       if (depth == 0) {
         mask = h.mat != 3 ? 1.0 : 0.0; // everything but the floor
-        if (uPass == 3) { L = albedoAOV(m); break; }
+        firstAlbedo = albedoAOV(m);
+        firstN = n;
+        if (uPass == 3) { L = firstAlbedo; break; }
         if (uPass == 4) { L = n * 0.5 + 0.5; break; }
       }
       filt = depth == 0 ? (uPass == 1 ? 1 : (uPass == 2 ? 2 : 0)) : 0;
@@ -1742,15 +1758,21 @@ void main() {
       acc0 += L;
       acc1 += L1;
       acc2 += L2;
+      float Y = lum(all);
+      accY += Y;
+      accY2 += Y * Y;
     }
     accMask += mask;
+    accAlbedo += firstAlbedo;
+    accN += firstN;
   }
 
+  // The running means: each pass's new samples blend in with weight new / (done + new).
   float nNew = float(uSppNew);
   float w = uSppDone == 0 ? 1.0 : nNew / (float(uSppDone) + nNew);
   // min(): stay finite on RGBA16F targets.
   vec4 cur0 = min(vec4(acc0 / nNew, accMask / nNew), vec4(65504.0));
-  vec4 cur1 = min(vec4(acc1 / nNew, 1.0), vec4(65504.0));
+  vec4 cur1 = min(vec4(acc1 / nNew, accY2 / nNew), vec4(65504.0));
   vec4 cur2 = min(vec4(acc2 / nNew, 1.0), vec4(65504.0));
   if (uSppDone == 0) {
     outKey = cur0;
@@ -1761,13 +1783,16 @@ void main() {
     outFill = mix(texelFetch(uPrev1, pix, 0), cur1, w);
     outRim = mix(texelFetch(uPrev2, pix, 0), cur2, w);
   }
+#ifdef AUX
+  vec4 cur3 = min(vec4(accAlbedo / nNew, accY / nNew), vec4(65504.0));
+  vec4 cur4 = vec4(accN / nNew, 1.0);
+  outAux0 = uSppDone == 0 ? cur3 : mix(texelFetch(uPrev3, pix, 0), cur3, w);
+  outAux1 = uSppDone == 0 ? cur4 : mix(texelFetch(uPrev4, pix, 0), cur4, w);
+#endif
 }
 `
 }
 
-export const TRACE_FRAG = traceFrag(false)
-// Compiled only when a visitor first picks a model, so the reference-ball scene never pays for it.
-export const TRACE_FRAG_MESH = traceFrag(true)
 
 // ------------------------------------------------------------------------------------------------------------
 // Display: exposure in EV, then a view transform. ACES 2.0 is the real Output Transform baked from OpenColorIO
@@ -1786,6 +1811,8 @@ uniform int uAcesReady;
 uniform float uExposure;
 uniform int uView;   // 0 ACES 2.0, 1 AgX, 2 PBR Neutral, 3 Standard
 uniform int uPass;
+uniform sampler2D uDenoised; // the denoiser's output (mixed radiance)
+uniform float uDenoiseMix;   // its share of the displayed image: 1 while noisy, falling to 0 as the render converges
 out vec4 outColor;
 
 // IEC 61966-2-1 sRGB encoding.
@@ -1864,11 +1891,139 @@ void main() {
   if (uPass == 4) { outColor = vec4(c, 1.0); return; }                                   // normals: raw data
   if (uPass == 3) { outColor = vec4(srgbOETF(max(AP1_TO_REC709 * c, 0.0)), 1.0); return; } // albedo
   c = c * uMix[0] + texelFetch(uAccum1, px, 0).rgb * uMix[1] + texelFetch(uAccum2, px, 0).rgb * uMix[2];
+  if (uDenoiseMix > 0.0) c = mix(c, texelFetch(uDenoised, px, 0).rgb, uDenoiseMix);
   c = max(c, 0.0) * exp2(uExposure);
   if (uView == 0 && uAcesReady == 1) { outColor = vec4(aces2(c), 1.0); return; }
   vec3 r = max(AP1_TO_REC709 * c, 0.0);
   if (uView == 2) r = PBRNeutralToneMapping(r);
   else if (uView != 3) r = AgXToneMapping(r); // AgX, and the fallback while the ACES LUT loads
   outColor = vec4(srgbOETF(r), 1.0);
+}
+`
+
+// ------------------------------------------------------------------------------------------------------------
+// Denoiser (optional, labelled in the lab): an edge-avoiding a-trous wavelet filter, Dammertz et al. 2010,
+// "Edge-Avoiding A-Trous Wavelet Transform for fast Global Illumination Filtering" (HPG), with the luminance
+// edge-stopping scaled by each pixel's variance as in Schied et al. 2017, "Spatiotemporal Variance-Guided
+// Filtering" (SVGF, HPG). It filters the mixed image divided by the first-hit albedo, so texture and material
+// edges are restored afterward, and it only ever changes what is displayed: the accumulated images, the furnace
+// test and the readouts stay raw. As samples accumulate, each pixel's variance falls and the filter backs off,
+// and the display hands over to the raw render (uDenoiseMix), so the finished image is unfiltered.
+// ------------------------------------------------------------------------------------------------------------
+const DENOISE_COMMON = /* glsl */ `
+uniform ivec2 uSize; // the image being filtered (the accumulation, or a preview's part of its target)
+ivec2 clampPx(ivec2 q) { return clamp(q, ivec2(0), uSize - 1); }
+// Albedo to divide out: misses (no albedo) and near-black surfaces keep their radiance as is.
+vec3 demodBase(vec3 a) { return lum(a) < 1e-3 ? vec3(1.0) : max(a, vec3(0.02)); }
+`
+
+// Mixed radiance over albedo with the variance of its luminance (of the pixel's mean), and the guide the
+// filter compares pixels by: unit normal and albedo luminance, in one texel. The variance comes from the
+// pixel's own samples (their second moment); with fewer than four (a preview, the first passes), from its
+// 3 x 3 neighborhood instead, as SVGF does before a pixel has history.
+export const DENOISE_PREP_FRAG = /* glsl */ `${HEADER}
+${COMMON}
+${DENOISE_COMMON}
+uniform sampler2D uAccum0;
+uniform sampler2D uAccum1;
+uniform sampler2D uAccum2;
+uniform sampler2D uAux0;
+uniform sampler2D uAux1;
+uniform vec3 uMix[3];
+uniform float uSpp; // samples per pixel in the image
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outGuide;
+
+vec3 demod(ivec2 q) {
+  vec3 c = texelFetch(uAccum0, q, 0).rgb * uMix[0] + texelFetch(uAccum1, q, 0).rgb * uMix[1] + texelFetch(uAccum2, q, 0).rgb * uMix[2];
+  return max(c, 0.0) / demodBase(texelFetch(uAux0, q, 0).rgb);
+}
+
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec3 d = demod(p);
+  vec4 aux0 = texelFetch(uAux0, p, 0);
+  float n = uSpp;
+  float var;
+  if (n >= 4.0) {
+    // Variance of the mean of the white luminance Y, scaled to this pixel's mixed and demodulated value
+    // (exact when the lights keep their ratio from sample to sample).
+    float m1 = aux0.a;
+    float m2 = texelFetch(uAccum1, p, 0).a;
+    float s = lum(d) / max(m1, 1e-6);
+    var = max(m2 - m1 * m1, 0.0) / (n - 1.0) * s * s;
+  } else {
+    float sum = 0.0, sum2 = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) {
+        float l = lum(demod(clampPx(p + ivec2(dx, dy))));
+        sum += l;
+        sum2 += l * l;
+      }
+    var = max(sum2 / 9.0 - sq(sum / 9.0), 0.0) / max(n, 1.0);
+  }
+  vec3 nrm = texelFetch(uAux1, p, 0).rgb;
+  float len = length(nrm);
+  outColor = vec4(d, var);
+  outGuide = vec4(len < 0.1 ? vec3(0.0) : nrm / len, lum(aux0.rgb)); // zero normal: no surface (background)
+}
+`
+
+// One a-trous level: a 3 x 3 kernel (1/4, 1/2, 1/4) with holes, taps uStep pixels apart, weighted by normal,
+// albedo and luminance similarity. The variance is filtered alongside with squared weights. The first level
+// steers by a 3 x 3 blur of the variance (a single pixel's estimate is noisy); later ones by the filtered
+// variance. The last level multiplies the albedo back in.
+export const ATROUS_FRAG = /* glsl */ `${HEADER}
+${COMMON}
+${DENOISE_COMMON}
+uniform sampler2D uIn;    // demodulated color, a = variance
+uniform sampler2D uGuide; // unit normal (zero for background), albedo luminance
+uniform sampler2D uAux0;  // albedo, for the last level
+uniform int uStep;
+uniform int uLast;
+out vec4 outColor;
+
+const float SIGMA_L = 4.0;   // luminance edge-stopping, in standard deviations (SVGF)
+const float SIGMA_N = 128.0; // normal edge-stopping exponent (SVGF)
+const float SIGMA_A = 0.05;  // albedo luminance difference that cuts a tap's weight by e
+
+float h(int i) { return i == 0 ? 0.5 : 0.25; }
+
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 cP = texelFetch(uIn, p, 0);
+  vec4 gP = texelFetch(uGuide, p, 0);
+  bool bgP = dot(gP.xyz, gP.xyz) < 0.01;
+  float lP = lum(cP.rgb);
+  float v = cP.a;
+  if (uStep == 1) {
+    v = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) v += h(dx) * h(dy) * texelFetch(uIn, clampPx(p + ivec2(dx, dy)), 0).a;
+  }
+  float sigL = SIGMA_L * sqrt(max(v, 0.0)) + 1e-5;
+
+  vec3 sum = vec3(0.0);
+  float wSum = 0.0, vSum = 0.0;
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+      ivec2 q = p + ivec2(dx, dy) * uStep;
+      if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, uSize))) continue;
+      vec4 cQ = texelFetch(uIn, q, 0);
+      vec4 gQ = texelFetch(uGuide, q, 0);
+      bool bgQ = dot(gQ.xyz, gQ.xyz) < 0.01;
+      // Background (no surface) only mixes with background.
+      float wN = (bgP || bgQ) ? float(bgP && bgQ) : pow(max(dot(gP.xyz, gQ.xyz), 0.0), SIGMA_N);
+      float wA = exp(-abs(gP.w - gQ.w) / SIGMA_A);
+      float wL = exp(-abs(lP - lum(cQ.rgb)) / sigL);
+      float w = h(dx) * h(dy) * wN * wA * wL;
+      sum += w * cQ.rgb;
+      wSum += w;
+      vSum += w * w * cQ.a;
+    }
+  vec3 c = sum / wSum; // the center tap always has weight h(0)^2
+  float var = vSum / (wSum * wSum);
+  if (uLast == 1) c *= demodBase(texelFetch(uAux0, p, 0).rgb);
+  outColor = vec4(c, var);
 }
 `

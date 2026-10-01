@@ -178,12 +178,18 @@ export default function LookdevLab() {
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
   const [paused, setPaused] = useState(false)
   const [ready, setReady] = useState(false)
+  const [canDenoise, setCanDenoise] = useState(false) // the GPU can draw the denoiser's extra images
   // The still is the renderer's own converged image of the default settings, so the live render (IPR) only
   // runs once something differs: the first edit (a click or drag on the frame, an arrow key, any control)
   // starts it, and putting every setting back shows the still again with the GPU idle. Hover and scrolling
   // past never cost anything.
   const pristine = isPosterState(lab)
   const [liveShown, setLiveShown] = useState(false) // the live render has drawn a frame since it (re)started
+  // While it renders, the live image is shown through the denoiser, handing over to the raw render by the time
+  // it converges (the still is never filtered); the HUD says so.
+  const denoised =
+    canDenoise && lab.denoise && !lab.furnace && !pristine && !status.converged &&
+    (lab.pass === 'beauty' || lab.pass === 'diffuse' || lab.pass === 'specular')
 
   const update = (patch: Partial<LabState>) => {
     const next = { ...labRef.current, ...patch }
@@ -249,6 +255,7 @@ export default function LookdevLab() {
           ;(window as unknown as { __lookdev?: LookdevEngine }).__lookdev = e
         }
         setMode('live')
+        setCanDenoise(e.canDenoise)
         layout()
         e.setVisible(visible)
         e.setActive(!isPosterState(labRef.current))
@@ -485,6 +492,7 @@ export default function LookdevLab() {
                 <>
                   {!pristine && !status.converged && <WorkIndicator className="lab-work" />}
                   {PASSES.find(p => p.id === lab.pass)?.label}
+                  {denoised && ', denoised'}
                   {'  '}
                   {pristine
                     ? `${POSTER_SPP} spp`
@@ -627,6 +635,13 @@ export default function LookdevLab() {
                 </Pill>
               ))}
             </Group>
+            {canDenoise && (
+              <Group label="Denoiser">
+                <Pill on={lab.denoise} onClick={() => update({ denoise: !lab.denoise })}>
+                  Denoiser {lab.denoise ? 'on' : 'off'}
+                </Pill>
+              </Group>
+            )}
           </div>
 
           <div className="lab-row">
@@ -672,7 +687,9 @@ export default function LookdevLab() {
           through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%. Dispersion is
           spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm. Each
           light renders into its own image, like a production renderer&apos;s light groups, so the light mixer switches,
-          dims and recolors a light without starting a new render.
+          dims and recolors a light without starting a new render. While it renders, the image is shown through
+          a denoiser (an edge-avoiding wavelet filter guided by albedo, normals and each pixel&apos;s noise), labelled in
+          the frame and handing over to the raw render as it converges: the finished image is never filtered.
         </p>
         <span className="lab-label">Methods</span>
         <ul>

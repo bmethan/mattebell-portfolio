@@ -210,4 +210,22 @@ export const CITATIONS: Citation[] = [
     year: '2002',
     url: 'https://web.archive.org/web/20190303161843/http://pdfs.semanticscholar.org/cc7f/c2e67601ccb1a8fec048c9b78a4224c34d26.pdf',
   },
+  {
+    id: 'atrous',
+    short: 'A-trous denoiser',
+    authors: 'Holger Dammertz, Daniel Sewtz, Johannes Hanika, Hendrik P. A. Lensch',
+    title: 'Edge-Avoiding A-Trous Wavelet Transform for fast Global Illumination Filtering',
+    venue: 'High Performance Graphics',
+    year: '2010',
+    url: 'https://doi.org/10.2312/EGGH/HPG10/067-075',
+  },
+  {
+    id: 'svgf',
+    short: 'SVGF variance guide',
+    authors: 'Christoph Schied, Anton Kaplanyan, Chris Wyman, Anjul Patney, Chakravarty R. Alla Chaitanya, John Burgess, Shiqiu Liu, Carsten Dachsbacher, Aaron Lefohn, Marco Salvi',
+    title: 'Spatiotemporal Variance-Guided Filtering: Real-Time Reconstruction for Path-Traced Global Illumination',
+    venue: 'High Performance Graphics',
+    year: '2017',
+    url: 'https://doi.org/10.1145/3105762.3105770',
+  },
 ]

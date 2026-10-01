@@ -11,7 +11,7 @@ import {
   type Pass,
   type View,
 } from './lookdev/engine'
-import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
+import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
 import { MODELS, MODEL_ORDER } from './lookdev/models'
 import { CITATIONS } from './lookdev/citations'
 import WorkIndicator from './WorkIndicator'
@@ -461,6 +461,13 @@ export default function LookdevLab() {
               {MODEL_ORDER.map(m => (
                 <Pill key={m} on={lab.model === m} onClick={() => update({ model: m })}>
                   {m === 'spheres' ? 'Reference balls' : MODELS[m].label}
+                </Pill>
+              ))}
+            </Group>
+            <Group label="Stage">
+              {STAGE_ORDER.map(st => (
+                <Pill key={st} on={lab.stage === st} onClick={() => update({ stage: st })}>
+                  {STAGES[st].label}
                 </Pill>
               ))}
             </Group>

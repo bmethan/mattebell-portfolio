@@ -99,6 +99,18 @@ export const SCENE_MATERIALS = {
   }),
   // Authored: a dark studio floor with a soft sheen so the balls get a grounded reflection.
   floor: mat({ base_color: [0.05, 0.05, 0.05], base_diffuse_roughness: 0.5, specular_weight: 0.7, specular_roughness: 0.42 }),
+  // Authored: a neutral gray cyc, painted like a studio sweep (matte, a faint sheen).
+  grayCyc: mat({ base_color: [0.18, 0.18, 0.18], base_diffuse_roughness: 0.6, specular_weight: 0.5, specular_roughness: 0.55 }),
+}
+
+// The stage: the black void the still was rendered in, or a cyc (floor sweeping up into a back wall) in the
+// floor's own charcoal or in neutral gray.
+export type Stage = 'void' | 'charcoal' | 'gray'
+export const STAGE_ORDER: Stage[] = ['void', 'charcoal', 'gray']
+export const STAGES: Record<Stage, { label: string; cyc: boolean; material: OpenPBR }> = {
+  void: { label: 'Void', cyc: false, material: SCENE_MATERIALS.floor },
+  charcoal: { label: 'Charcoal cyc', cyc: true, material: SCENE_MATERIALS.floor },
+  gray: { label: 'Gray cyc', cyc: true, material: SCENE_MATERIALS.grayCyc },
 }
 
 export type Hero = 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium'

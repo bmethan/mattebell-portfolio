@@ -1016,6 +1016,11 @@ uniform vec3 uEnv;
 uniform int uFurnace;
 uniform int uPass;
 uniform float uIndirectClamp;
+// Cyc: the floor runs back to z = uCycZ, sweeps up a quarter cylinder of radius uCycR (axis along x), and
+// becomes a wall at z = uCycZ - uCycR. Off (uCyc 0), the floor is an endless plane in a black void.
+uniform int uCyc;
+uniform float uCycZ;
+uniform float uCycR;
 #ifdef MESH
 // Material slots: 0 gray ball, 1 chrome, 2 hero, 3 floor, 4-9 the model's other parts.
 uniform vec4 uBall[3]; // center, radius (0 = absent)
@@ -1071,6 +1076,37 @@ vec3 offsetRay(vec3 p, vec3 n) {
 // n: shading normal; ng: geometric normal on the side the ray arrived from (they differ only on meshes).
 struct Hit { float t; vec3 n; vec3 ng; int mat; int light; };
 
+// The cyc's back wall and sweep (the floor is the plane test in intersect()): nearest hit before tMax, with the
+// normal facing into the room, or -1. Also a shadow occluder: a key light dragged low and behind can end up
+// partly behind the wall.
+float cycHit(vec3 ro, vec3 rd, float tMax, out vec3 n) {
+  n = vec3(0.0, 0.0, 1.0);
+  float best = -1.0;
+  // Back wall, above the sweep.
+  if (rd.z < 0.0) {
+    float t = (uCycZ - uCycR - ro.z) / rd.z;
+    if (t > 1e-4 && t < tMax && ro.y + rd.y * t >= uCycR) { best = t; tMax = t; }
+  }
+  // The sweep: the quarter of the cylinder below its axis and behind the floor's end, seen from inside.
+  vec2 o2 = vec2(ro.y - uCycR, ro.z - uCycZ);
+  vec2 d2 = rd.yz;
+  float a = dot(d2, d2), b = dot(o2, d2), c = dot(o2, o2) - uCycR * uCycR;
+  float disc = b * b - a * c;
+  if (a > 0.0 && disc > 0.0) {
+    float sq = sqrt(disc);
+    for (int i = 0; i < 2; i++) {
+      float t = (-b + (i == 0 ? -sq : sq)) / a;
+      vec2 q = o2 + d2 * t;
+      if (t > 1e-4 && t < tMax && q.x <= 0.0 && q.y <= 0.0) {
+        best = t;
+        n = vec3(0.0, -q.x, -q.y) / uCycR;
+        break;
+      }
+    }
+  }
+  return best;
+}
+
 #ifdef MESH
 ${MESH_GLSL}
 float intersectBall(vec3 ro, vec3 rd, vec4 s, float tMax) {
@@ -1117,7 +1153,14 @@ Hit intersect(vec3 ro, vec3 rd, bool withLights) {
 #endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
-    if (t > 0.0 && t < h.t) { h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3; }
+    if (t > 0.0 && t < h.t && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) {
+      h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3;
+    }
+  }
+  if (uFurnace == 0 && uCyc == 1) {
+    vec3 nc;
+    float t = cycHit(ro, rd, h.t, nc);
+    if (t > 0.0) { h.t = t; h.n = nc; h.ng = nc; h.mat = 3; }
   }
   if (withLights) {
     for (int k = 0; k < uNumLights; k++) {
@@ -1144,7 +1187,11 @@ bool occluded(vec3 ro, vec3 rd, float tMax) {
 #endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
-    if (t > 0.0 && t < tMax) return true;
+    if (t > 0.0 && t < tMax && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) return true;
+  }
+  if (uFurnace == 0 && uCyc == 1) {
+    vec3 nc;
+    if (cycHit(ro, rd, tMax, nc) > 0.0) return true;
   }
   return false;
 }

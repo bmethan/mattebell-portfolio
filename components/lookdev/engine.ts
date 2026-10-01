@@ -1,11 +1,11 @@
 import { VERT, E_TABLE_FRAG, TRACE_FRAG, TRACE_FRAG_MESH, DISPLAY_FRAG } from './shaders'
 import { kelvinToACEScg } from './color'
-import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, heroParams, type OpenPBR, type Hero, type PaintFinish } from './materials'
+import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, heroParams, type OpenPBR, type Hero, type PaintFinish, type Stage } from './materials'
 import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
-export type { Hero, Model, PaintFinish }
+export type { Hero, Model, PaintFinish, Stage }
 
 export interface LabState {
   keyAz: number
@@ -17,6 +17,7 @@ export interface LabState {
   exposure: number
   model: Model
   modelYaw: number // turntable angle of a model, radians
+  stage: Stage
   hero: Hero
   paint: PaintFinish // car paint's finish
   flakes: boolean // car paint flakes (metallic, pearl and iridescent finishes)
@@ -38,6 +39,7 @@ export const DEFAULT_STATE: LabState = {
   exposure: 0.5,
   model: 'spheres',
   modelYaw: 0.6,
+  stage: 'void',
   hero: 'carpaint',
   paint: 'solid',
   flakes: false,
@@ -165,6 +167,11 @@ const E_LAYERS = 16 // IOR resolution
 const LUT_SIZE = 65
 const LUT_URL = '/lookdev/aces2-sdr-rec709-65.png'
 const INDIRECT_CLAMP = 12
+
+// Cyc: the floor ends 4 units behind the balls and sweeps up a 3-unit radius into a wall 7 units back, behind the
+// rim light (its nearest corner sits about 4.7 back) so no softbox pokes through.
+const CYC_Z = -4
+const CYC_R = 3
 
 // Scene: three unit spheres resting on a floor at y = 0.
 export const BALL_X = [-2.4, 0, 2.4]
@@ -797,7 +804,11 @@ export class LookdevEngine {
     gl.uniform1i(L('uPass'), PASS_ID[s.pass])
 
     // Materials: 0 gray card, 1 chromium, 2 hero, 3 floor; with a model, 4-9 dress its other parts.
-    const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, heroMaterial(s), SCENE_MATERIALS.floor]
+    const stage = STAGES[s.stage]
+    gl.uniform1i(L('uCyc'), stage.cyc ? 1 : 0)
+    gl.uniform1f(L('uCycZ'), CYC_Z)
+    gl.uniform1f(L('uCycR'), CYC_R)
+    const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, heroMaterial(s), stage.material]
 
     if (s.model === 'spheres') {
       gl.uniform3fv(L('uBallX'), BALL_X)

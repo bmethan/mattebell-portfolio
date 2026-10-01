@@ -240,7 +240,24 @@ uniform vec2 uSize;
 uniform float uLayer;   // normalized x coordinate of this slice, k / (layers - 1)
 uniform int uSamples;   // 2048 VNDF samples; from a uniform so the loop is not unrolled at compile time
 uniform int uFresnelSamples; // 256
+uniform int uMode;      // 0: the reflection tables above; 1: the dielectric tables below
 out vec4 outColor;
+
+// Total single-scattering albedo of a rough dielectric interface, reflection plus refraction, with the IOR ratio
+// eta (transmitted over incident): by visible-normal sampling the weight is F G2/G1 for the reflected direction
+// and (1 - F) G2/G1 for the refracted one (energy, i.e. without radiance's 1/eta^2). Its shortfall from 1 is
+// what multiple scattering between microfacets would return; Turquin 2019's compensation idea, applied to the
+// whole dielectric lobe.
+float dielectricAlbedo(vec3 wo, vec3 m, vec2 alpha, float eta) {
+  float F = fresnelDielectric(dot(wo, m), eta);
+  float e = 0.0;
+  vec3 wr = reflect(-wo, m);
+  if (wr.z > 0.0) e += F * G2_GGX(wo, wr, alpha) / G1_GGX(wo, alpha);
+  vec3 wt = refract(-wo, m, 1.0 / eta);
+  if (dot(wt, wt) > 0.0 && wt.z < 0.0) e += (1.0 - F) * G2_GGX(wo, wt, alpha) / G1_GGX(wo, alpha);
+  return e;
+}
+
 void main() {
   vec2 uv = (gl_FragCoord.xy - 0.5) / (uSize - 1.0); // texel i holds mu = i / (N - 1)
   float mu = max(uv.x, 1e-4);
@@ -250,6 +267,18 @@ void main() {
   float eta = (1.0 + x) / (1.0 - x);
   vec3 wo = vec3(sqrt(max(0.0, 1.0 - mu * mu)), 0.0, mu);
   int N = uSamples;
+  if (uMode == 1) {
+    // R: entering the denser medium (eta); G: leaving it (1 / eta, with total internal reflection).
+    float eIn = 0.0, eOut = 0.0;
+    for (int i = 0; i < N; i++) {
+      vec2 u = vec2((float(i) + 0.5) / float(N), u01(reverseBits32(uint(i))));
+      vec3 m = sampleVNDF_SphericalCap(u, wo, alpha);
+      eIn += dielectricAlbedo(wo, m, alpha, eta);
+      eOut += dielectricAlbedo(wo, m, alpha, 1.0 / eta);
+    }
+    outColor = vec4(eIn / float(N), eOut / float(N), 0.0, 1.0);
+    return;
+  }
   float e1 = 0.0, ed = 0.0;
   for (int i = 0; i < N; i++) {
     vec2 u = vec2((float(i) + 0.5) / float(N), u01(reverseBits32(uint(i))));
@@ -532,9 +561,11 @@ struct Surf {
   // diffuse. etaT is the IOR ratio the refraction uses (the path's channel when the glass disperses).
   float transW; float etaT; bool thin; vec3 transTint;
   float pT;     // lobe selection weight of the transmission lobe
+  float compT;  // multiple-scattering compensation of the transmissive dielectric lobe (reflection + refraction)
 };
 
 uniform sampler3D uETable;
+uniform sampler3D uETableT; // dielectric albedo: R entering, G leaving (see E_TABLE_FRAG)
 uniform int uMultiScatter;
 
 // Coat roughens the base specular (spec, Coat > Roughening). Products instead of pow() for pow(0, y) safety.
@@ -562,9 +593,9 @@ vec3 openpbrCoatBaseFactor(vec3 baseColor, float specWeight, float M, float C, v
 }
 
 // Dispersion (spec, Transmission > Dispersion): Cauchy's n(lambda) = A + B / lambda^2 through n_d at the
-// Fraunhofer d line, with B set by the Abbe number V_d = abbe / scale (F and C lines). This RGB renderer gives
-// each channel one representative wavelength (an approximation of the spectral spec).
-const vec3 CHANNEL_NM = vec3(610.0, 550.0, 465.0);
+// Fraunhofer d line, with B set by the Abbe number V_d = abbe / scale (F and C lines). Each path that refracts
+// through dispersive glass is traced at one wavelength, drawn uniformly from 380-780 nm, and weighted by that
+// wavelength's ACEScg response (below), so the spectrum is sampled continuously.
 float cauchyIor(float nd, float vd, float nm) {
   const float LF = 486.13, LC = 656.27, LD = 587.56;
   float B = (nd - 1.0) / (vd * (1.0 / (LF * LF) - 1.0 / (LC * LC)));
@@ -575,9 +606,26 @@ bool disperses(Mat m) {
   return m.transmission_weight > 0.0 && m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0;
 }
 
-// back: the ray reached the surface from inside the object. chan: the path's color channel for dispersion;
-// colored: the path has already refracted through dispersive glass, so it now carries that channel alone.
-Surf setupSurf(Mat m, vec3 wo, bool back, int chan, bool colored) {
+// CIE 1931 color matching functions: the multi-lobe Gaussian fit of Wyman, Sloan, Shirley 2013, "Simple Analytic
+// Approximations to the CIE XYZ Color Matching Functions", JCGT 2(2), Listing 1.
+float cmfLobe(float w, float mu, float a, float b) { float t = (w - mu) * (w < mu ? a : b); return exp(-0.5 * t * t); }
+vec3 cieXYZ(float w) {
+  return vec3(
+    0.362 * cmfLobe(w, 442.0, 0.0624, 0.0374) + 1.056 * cmfLobe(w, 599.8, 0.0264, 0.0323) - 0.065 * cmfLobe(w, 501.1, 0.0490, 0.0382),
+    0.821 * cmfLobe(w, 568.8, 0.0213, 0.0247) + 0.286 * cmfLobe(w, 530.9, 0.0613, 0.0322),
+    1.217 * cmfLobe(w, 437.0, 0.0845, 0.0278) + 0.681 * cmfLobe(w, 459.0, 0.0385, 0.0725));
+}
+// Path weight for a wavelength drawn uniformly over 380-780 nm (pdf 1/400): its ACEScg response over the
+// response's integral, per channel, so the weights average to exactly (1, 1, 1) and white stays white. (Some
+// wavelengths fall outside the gamut; their negative components still average out.)
+const vec3 SPECTRAL_NORM = vec3(117.6829, 103.4330, 98.1822); // integrals over 380-780 nm, computed offline
+vec3 spectralWeight(float nm) {
+  return REC709_TO_AP1 * (XYZ_TO_REC709 * cieXYZ(nm)) * 400.0 / SPECTRAL_NORM;
+}
+
+// back: the ray reached the surface from inside the object. lambda: the path's wavelength for dispersion (nm);
+// colored: the path has already refracted through dispersive glass, so it now carries that wavelength alone.
+Surf setupSurf(Mat m, vec3 wo, bool back, float lambda, bool colored) {
   Surf s;
   s.baseColor = max(m.base_color, vec3(0.0));
   s.baseWeight = max(m.base_weight, 0.0);
@@ -619,13 +667,13 @@ Surf setupSurf(Mat m, vec3 wo, bool back, int chan, bool colored) {
   s.transTint = vec3(1.0);
 #endif
 #else
-  float nChan = disperses(m)
-    ? cauchyIor(nd, m.transmission_dispersion_abbe_number / m.transmission_dispersion_scale, chan == 0 ? CHANNEL_NM.r : (chan == 1 ? CHANNEL_NM.g : CHANNEL_NM.b))
-    : nd;
+  float nChan = disperses(m) ? cauchyIor(nd, m.transmission_dispersion_abbe_number / m.transmission_dispersion_scale, lambda) : nd;
   s.eta = openpbrSpecularEta(colored ? nChan : nd, s.coatIor, s.coatW, s.specW);
   s.etaT = openpbrSpecularEta(nChan, s.coatIor, s.coatW, s.specW);
   s.transW = sat(m.transmission_weight);
-  s.thin = m.geometry_thin_walled > 0.5;
+  // An IOR of 1 does not refract, and the refraction half vector is undefined there: pass straight through, as
+  // thin-walled glass does (the same light, with no bending).
+  s.thin = m.geometry_thin_walled > 0.5 || abs(s.etaT - 1.0) < 1e-3;
   // With no depth there is no medium, and the color tints the refraction instead (spec).
   s.transTint = m.transmission_depth > 0.0 ? vec3(1.0) : max(m.transmission_color, vec3(0.0));
   if (back && !s.thin) {
@@ -660,6 +708,24 @@ Surf setupSurf(Mat m, vec3 wo, bool back, int chan, bool colored) {
     s.EspecR3 = sat3(mix(vec3(s.EspecR), withFilm, s.tfW));
   }
 
+  // Transmissive glass scatters between microfacets too: scale its whole dielectric lobe (reflection and
+  // refraction) by 1 / its single-scattering albedo, read for entering or leaving (total internal reflection
+  // included). Thin-walled glass mirrors the reflection lobe, so its albedo is the F = 1 one, Ess.
+  s.compT = 1.0;
+#ifdef THIN
+  if (ms && s.transW > 0.0) {
+    if (s.thin) {
+      s.compT = 1.0 / Ess;
+    }
+#ifdef GLASS
+    else {
+      vec2 tT = textureLod(uETableT, eTableCoord(mu, rTable, s.etaT >= 1.0 ? s.etaT : 1.0 / s.etaT), 0.0).rg;
+      s.compT = 1.0 / max(s.etaT >= 1.0 ? tT.r : tT.g, 1e-3);
+    }
+#endif
+  }
+#endif
+
   vec3 tC = textureLod(uETable, eTableCoord(mu, s.coatRough, s.coatIor), 0.0).rgb;
   float EssC = max(tC.r, 1e-4);
   s.compC = ms ? 1.0 + tC.b * (1.0 - EssC) / EssC : 1.0;
@@ -678,6 +744,18 @@ Surf setupSurf(Mat m, vec3 wo, bool back, int chan, bool colored) {
     tFuzz * s.coatW * s.Ecoat,
     s.fuzzW * s.Efuzz * max(lum(s.fuzzColor), 0.05));
   s.pT = tb * (1.0 - s.metal) * s.transW * max(lum((1.0 - s.EspecR3) * s.transTint), 0.05);
+#ifdef THIN
+  if (s.transW > 0.0) {
+    // Glass: split reflection and refraction by the actual Fresnel at the view angle, total internal reflection
+    // included (the albedo tables only know the view from outside). Inside past the critical angle nearly every
+    // sample must reflect; picking refraction there only fails. Floors keep both lobes reachable (rough
+    // microfacets can still refract near the critical angle, or reflect where F is tiny).
+    float Fmu = fresnelDielectric(mu, s.eta);
+    float dielW = tb * (1.0 - s.metal) * s.transW;
+    s.p.y = mix(s.p.y, dielW * max(Fmu, 0.05), s.transW);
+    s.pT = dielW * max((1.0 - Fmu) * lum(s.transTint), 0.05);
+  }
+#endif
   return s;
 }
 
@@ -737,7 +815,7 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
     }
     vec3 T3 = vec3(1.0 - fresnelDielectric(cosM, s.etaT));
     if (s.tfW > 0.0) T3 = mix(T3, vec3(1.0) - thinFilmF(cosM, s.tfIor, s.tfThick, vec3(f0FromEta(s.etaT))), s.tfW);
-    fS = s.tBase * (1.0 - s.metal) * s.transW * s.transTint * T3 * ft;
+    fS = s.tBase * (1.0 - s.metal) * s.transW * s.transTint * T3 * ft * s.compT;
     return pt * pdfT;
   }
 #endif
@@ -767,7 +845,9 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
     if (woS.z > 0.0 && wiS.z > 0.0) {
       float g = G2_GGX(woS, wiS, s.aS) * D_GGX(hS, s.aS) / (4.0 * woS.z);
       if (flaked) g *= wi.z / wiS.z;
-      vec3 Fd = s.specColor * fresnelDielectric(voh, s.eta) * s.compD;
+      // Over the transmissive substrate, the dielectric reflection takes the glass compensation (compT) instead.
+      float compR = mix(s.compD, s.compT, s.transW);
+      vec3 Fd = s.specColor * fresnelDielectric(voh, s.eta) * compR;
       vec3 Fm = s.specW * fresnelF82Tint(voh, s.baseWeight * s.baseColor, s.specColor) * s.compM;
       if (s.tfW > 0.0) {
         // The film over each substrate it can sit on: the dielectric, the metal, or both when metalness is
@@ -781,7 +861,7 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
           if (overMetal) FtfM = f;
           else FtfD = f;
         }
-        Fd = mix(Fd, s.specColor * FtfD * s.compD, s.tfW);
+        Fd = mix(Fd, s.specColor * FtfD * compR, s.tfW);
         Fm = mix(Fm, s.specW * FtfM * s.compM, s.tfW);
       }
       fS += s.tBase * mix(Fd, Fm, s.metal) * g;
@@ -1471,9 +1551,9 @@ void main() {
     // Next-event estimation only samples lights on the incident side, so a light reached through a refraction had
     // no light-sampling counterpart: it takes the full weight.
     bool prevTrans = false;
-    // Dispersion: each path carries one color channel through dispersive glass, picked here and committed (with
-    // weight 3 on that channel) at its first refraction through such glass.
-    int chan = int(pcg(hashCombine(pixSeed, sampleIndex * 3u + 1u)) % 3u);
+    // Dispersion: each path carries one wavelength through dispersive glass, drawn here and committed (weighted by
+    // its ACEScg response) at its first refraction through such glass.
+    float lambda = 380.0 + 400.0 * u01(pcg(hashCombine(pixSeed, sampleIndex * 3u + 1u)));
     bool colored = false;
 
     for (int depth = 0; depth < uMaxBounces; depth++) {
@@ -1528,7 +1608,7 @@ void main() {
       }
       vec3 wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
       if (wo.z <= 1e-6) break;
-      Surf s = setupSurf(m, wo, h.back, chan, colored);
+      Surf s = setupSurf(m, wo, h.back, lambda, colored);
 #ifdef MESH
       s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
 #else
@@ -1581,7 +1661,7 @@ void main() {
 #ifdef GLASS
           if (through && !colored && disperses(m)) {
             colored = true;
-            beta *= 3.0 * vec3(chan == 0 ? 1.0 : 0.0, chan == 1 ? 1.0 : 0.0, chan == 2 ? 1.0 : 0.0);
+            beta *= spectralWeight(lambda);
           }
 #endif
           ro = through ? offsetRay(p, -h.ng) : po;

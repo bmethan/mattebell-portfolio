@@ -112,6 +112,15 @@ export const CITATIONS: Citation[] = [
     url: 'https://www.graphics.cornell.edu/~bjw/microfacetbsdf.pdf',
   },
   {
+    id: 'cmf',
+    short: 'CIE color matching fit',
+    authors: 'Chris Wyman, Peter-Pike Sloan, Peter Shirley',
+    title: 'Simple Analytic Approximations to the CIE XYZ Color Matching Functions',
+    venue: 'Journal of Computer Graphics Techniques 2(2)',
+    year: '2013',
+    url: 'https://jcgt.org/published/0002/02/01/',
+  },
+  {
     id: 'sah',
     short: 'Binned SAH BVH',
     authors: 'Ingo Wald',

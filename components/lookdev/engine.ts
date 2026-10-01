@@ -138,6 +138,10 @@ const MESH_MAX_BOUNCES = 5
 // The furnace test is a measurement, and light trapped in a model's cavities needs many bounces to escape: at 5
 // the car reads 0.924, at 32 it reads 0.974 (the balls, with nothing to trap light, read 1.000 at 8).
 export const MESH_FURNACE_BOUNCES = 32
+// A solid glass hero on the balls. Very rough, high-IOR glass traps light longest (rough diamond at roughness 0.4:
+// 0.949 at 32 bounces, 0.976 at 128); roulette ends most paths long before the cap.
+const GLASS_MAX_BOUNCES = 64
+const MESH_GLASS_MAX_BOUNCES = 16 // a solid glass hero on a model (each bounce costs a BVH traversal)
 const MAX_NODE_VISITS = 4096 // per mesh ray; a typical one visits well under a hundred BVH nodes
 
 // Frame pacing. The GPU is shared with the browser's compositor, and a single draw cannot be interrupted, so
@@ -294,6 +298,7 @@ export class LookdevEngine {
   private accumTex: WebGLTexture[] = []
   private accumFbo: WebGLFramebuffer[] = []
   private eTable: WebGLTexture
+  private eTableT: WebGLTexture // dielectric albedo for glass compensation
   private acesLut: WebGLTexture
   private acesReady = false
   private accumFmt: { internal: number; type: number }
@@ -390,6 +395,7 @@ export class LookdevEngine {
     gl.bindTexture(gl.TEXTURE_3D, this.acesLut)
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]))
     this.eTable = this.createAlbedoTexture()
+    this.eTableT = this.createAlbedoTexture()
     this.loadAcesLut()
 
     canvas.addEventListener('webglcontextlost', this.handleLost)
@@ -593,11 +599,16 @@ export class LookdevEngine {
     gl.uniform1i(gl.getUniformLocation(prog, 'uSamples'), 2048)
     gl.uniform1i(gl.getUniformLocation(prog, 'uFresnelSamples'), 256)
     const uLayer = gl.getUniformLocation(prog, 'uLayer')
-    for (let layer = 0; layer < E_LAYERS; layer++) {
-      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, layer)
-      gl.uniform1f(uLayer, layer / (E_LAYERS - 1))
-      gl.drawArrays(gl.TRIANGLES, 0, 3)
-    }
+    const uMode = gl.getUniformLocation(prog, 'uMode')
+    // Mode 0: the reflection tables; mode 1: the dielectric (reflection + refraction) albedo glass is compensated by.
+    ;[tex, this.eTableT].forEach((target, mode) => {
+      gl.uniform1i(uMode, mode)
+      for (let layer = 0; layer < E_LAYERS; layer++) {
+        gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, target, 0, layer)
+        gl.uniform1f(uLayer, layer / (E_LAYERS - 1))
+        gl.drawArrays(gl.TRIANGLES, 0, 3)
+      }
+    })
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.deleteFramebuffer(fbo)
   }
@@ -834,7 +845,14 @@ export class LookdevEngine {
     })
 
     gl.uniform4uiv(L('uSobol'), SOBOL_UNIFORM)
-    gl.uniform1i(L('uMaxBounces'), s.model === 'spheres' ? MAX_BOUNCES : s.furnace ? MESH_FURNACE_BOUNCES : MESH_MAX_BOUNCES)
+    // Solid glass traps light by total internal reflection, so its paths need many more bounces to get out (rough
+    // glass in the furnace: 0.91 at 8 bounces, 0.987 at 32). Russian roulette keeps the average path short.
+    const solidGlass = variantOf(s).endsWith('+glass')
+    const bounces =
+      s.model === 'spheres'
+        ? solidGlass ? GLASS_MAX_BOUNCES : MAX_BOUNCES
+        : s.furnace ? MESH_FURNACE_BOUNCES : solidGlass ? MESH_GLASS_MAX_BOUNCES : MESH_MAX_BOUNCES
+    gl.uniform1i(L('uMaxBounces'), bounces)
     gl.uniform1i(L('uNumLights'), rigs.length)
     gl.uniform3fv(L('uEnv'), s.furnace ? [1, 1, 1] : [0.0012, 0.0013, 0.0016])
     gl.uniform1i(L('uFurnace'), s.furnace ? 1 : 0)
@@ -850,6 +868,7 @@ export class LookdevEngine {
     const smoothThin = (m: OpenPBR) => m.geometry_thin_walled > 0.5 && m.transmission_weight > 0 && m.specular_roughness <= 0.01 && m.coat_weight <= 0
     const thinGlass = smoothThin(hero) || (s.model !== 'spheres' && MODELS[s.model].thinGlass && MESH_MATERIALS.some(smoothThin))
     gl.uniform1i(L('uThinGlass'), thinGlass ? 1 : 0)
+    gl.uniform1i(L('uETableT'), 5)
     gl.uniform1i(L('uCyc'), stage.cyc ? 1 : 0)
     gl.uniform1f(L('uCycZ'), CYC_Z)
     gl.uniform1f(L('uCycR'), CYC_R)
@@ -890,6 +909,8 @@ export class LookdevEngine {
     const prog = this.traceProg()
     gl.useProgram(prog)
     if (this.sceneDirty || this.uploadedFor !== prog) this.uploadScene()
+    gl.activeTexture(gl.TEXTURE5)
+    gl.bindTexture(gl.TEXTURE_3D, this.eTableT)
     const mesh = this.state.model === 'spheres' ? null : this.meshes.get(this.state.model)
     if (mesh) {
       gl.activeTexture(gl.TEXTURE2)
@@ -1263,6 +1284,7 @@ export class LookdevEngine {
     this.accumTex.forEach(t => gl.deleteTexture(t))
     this.accumFbo.forEach(f => gl.deleteFramebuffer(f))
     gl.deleteTexture(this.eTable)
+    gl.deleteTexture(this.eTableT)
     gl.deleteTexture(this.acesLut)
     gl.deleteProgram(this.progTrace)
     this.variants.forEach(v => gl.deleteProgram(v.prog))

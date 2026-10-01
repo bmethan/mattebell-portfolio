@@ -826,7 +826,129 @@ float powerHeuristic(float f, float g) {
 }
 `
 
-export const TRACE_FRAG = /* glsl */ `${HEADER}
+// Triangle meshes for the hero models: a bounding volume hierarchy and triangles in float textures, traversed with
+// a short stack in object space so the model can turn without rebuilding anything. Only the MESH variant of the
+// tracer includes it; the reference-ball scene compiles without it.
+const MESH_GLSL = /* glsl */ `
+precision highp usampler2D;
+uniform sampler2D uBvh;      // 4 texels per inner node: each child's bmin.xyz + ref, bmax.xyz (see the builder)
+uniform sampler2D uTriPos;   // 3 texels per triangle: v0, v1 - v0, v2 - v0
+uniform usampler2D uTriNrm;  // 1 texel per triangle: three octahedral vertex normals (snorm16 x2), material slot
+uniform mat3 uModelRot;      // object to world rotation
+uniform vec3 uModelPos;
+uniform float uModelScale;
+uniform int uMaxNodeVisits;  // from a uniform so the traversal loop is never unrolled
+
+const int TEX_W_SHIFT = 11;  // textures are 2048 texels wide
+ivec2 texAt(int i) { return ivec2(i & 2047, i >> TEX_W_SHIFT); }
+
+// Octahedral normal decoding: Cigolle et al. 2014, "A Survey of Efficient Representations for Independent Unit
+// Vectors", JCGT 3(2).
+vec3 octDecode(uint u) {
+  vec2 f = unpackSnorm2x16(u);
+  vec3 n = vec3(f, 1.0 - abs(f.x) - abs(f.y));
+  float t = max(-n.z, 0.0);
+  n.xy += vec2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+  return normalize(n);
+}
+
+// Entry distance of a box, or 1e30 when the ray misses it or it lies beyond tBest.
+float boxEnter(vec3 bmin, vec3 bmax, vec3 o, vec3 invD, float tBest) {
+  vec3 t0 = (bmin - o) * invD, t1 = (bmax - o) * invD;
+  vec3 tn = min(t0, t1), tf = max(t0, t1);
+  float tEnter = max(max(tn.x, tn.y), max(tn.z, 0.0));
+  float tExit = min(min(tf.x, tf.y), tf.z);
+  return tEnter <= tExit && tEnter < tBest ? tEnter : 1e30;
+}
+
+const int BVH_STACK = 32;
+// Closest hit before tMax (or, with anyHit, the first hit found). Ray/triangle: Moller and Trumbore 1997.
+// Returns the distance (the object-space ray is scaled so it equals the world distance) or -1.
+// cur packs (index << 5) | count: a leaf of count triangles, or with count 0 the inner node at index. Each inner
+// node holds both children's boxes, so only entered children are visited, nearer first; the farther one waits on
+// the stack with its entry distance and is skipped if a closer hit has been found by then. One loop body handles
+// leaves and inner nodes, so the triangle test is compiled once.
+float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out vec2 bary) {
+  triHit = -1;
+  bary = vec2(0.0);
+  mat3 toObj = transpose(uModelRot);
+  vec3 o = toObj * (roW - uModelPos) / uModelScale;
+  vec3 d = toObj * rdW / uModelScale;
+  vec3 dSafe = vec3(abs(d.x) < 1e-20 ? 1e-20 : d.x, abs(d.y) < 1e-20 ? 1e-20 : d.y, abs(d.z) < 1e-20 ? 1e-20 : d.z);
+  vec3 invD = 1.0 / dSafe;
+  float tBest = tMax;
+  int stackRef[BVH_STACK];
+  float stackT[BVH_STACK];
+  int sp = 0;
+  int cur = 0; // the root, an inner node
+  for (int visit = 0; visit < uMaxNodeVisits; visit++) {
+    int count = cur & 31;
+    int index = cur >> 5;
+    if (count == 0) {
+      vec4 la = texelFetch(uBvh, texAt(4 * index), 0);
+      vec4 lb = texelFetch(uBvh, texAt(4 * index + 1), 0);
+      vec4 ra = texelFetch(uBvh, texAt(4 * index + 2), 0);
+      vec4 rb = texelFetch(uBvh, texAt(4 * index + 3), 0);
+      float tl = boxEnter(la.xyz, lb.xyz, o, invD, tBest);
+      float tr = boxEnter(ra.xyz, rb.xyz, o, invD, tBest);
+      bool hitL = tl < 1e30, hitR = tr < 1e30;
+      if (hitL && hitR) {
+        bool leftFirst = tl <= tr;
+        if (sp < BVH_STACK) {
+          stackRef[sp] = int(leftFirst ? ra.w : la.w);
+          stackT[sp] = leftFirst ? tr : tl;
+          sp++;
+        }
+        cur = int(leftFirst ? la.w : ra.w);
+        continue;
+      }
+      if (hitL || hitR) {
+        cur = int(hitL ? la.w : ra.w);
+        continue;
+      }
+    } else {
+      for (int i = 0; i < count; i++) {
+        int tri = index + i;
+        vec3 v0 = texelFetch(uTriPos, texAt(3 * tri), 0).xyz;
+        vec3 e1 = texelFetch(uTriPos, texAt(3 * tri + 1), 0).xyz;
+        vec3 e2 = texelFetch(uTriPos, texAt(3 * tri + 2), 0).xyz;
+        vec3 pv = cross(d, e2);
+        float det = dot(e1, pv);
+        if (det == 0.0) continue;
+        float inv = 1.0 / det;
+        vec3 tv = o - v0;
+        float u = dot(tv, pv) * inv;
+        if (u < 0.0 || u > 1.0) continue;
+        vec3 qv = cross(tv, e1);
+        float v = dot(d, qv) * inv;
+        if (v < 0.0 || u + v > 1.0) continue;
+        float t = dot(e2, qv) * inv;
+        if (t > 0.0 && t < tBest) {
+          tBest = t;
+          triHit = tri;
+          bary = vec2(u, v);
+        }
+      }
+      if (anyHit && triHit >= 0) return tBest;
+    }
+    // Next: the nearest deferred child still in front of the closest hit.
+    bool found = false;
+    while (sp > 0) {
+      sp--;
+      if (stackT[sp] < tBest) {
+        cur = stackRef[sp];
+        found = true;
+        break;
+      }
+    }
+    if (!found) break;
+  }
+  return triHit >= 0 ? tBest : -1.0;
+}
+`
+
+function traceFrag(mesh: boolean) {
+  return /* glsl */ `${HEADER}${mesh ? '#define MESH 1\n' : ''}
 ${COMMON}
 ${MICROFACET}
 ${TABLE_CONSTS}
@@ -849,8 +971,14 @@ uniform vec3 uEnv;
 uniform int uFurnace;
 uniform int uPass;
 uniform float uIndirectClamp;
+#ifdef MESH
+// Material slots: 0 gray ball, 1 chrome, 2 hero, 3 floor, 4-9 the model's other parts.
+uniform vec4 uBall[3]; // center, radius (0 = absent)
+uniform Mat uMat[10];
+#else
 uniform vec3 uBallX;
 uniform Mat uMat[4];
+#endif
 
 out vec4 outColor;
 
@@ -858,7 +986,9 @@ out vec4 outColor;
 uniform int uMaxBounces;
 uniform int uNumLights;
 
+#ifndef MESH
 float ballX(int i) { return i == 0 ? uBallX.x : (i == 1 ? uBallX.y : uBallX.z); }
+#endif
 
 // Ray/sphere with the precision improvements of Haines, Guenther, Akenine-Moller, Ray Tracing Gems ch. 7.
 float intersectSphere(vec3 ro, vec3 rd, vec3 center, float tMax) {
@@ -893,19 +1023,56 @@ vec3 offsetRay(vec3 p, vec3 n) {
     abs(p.z) < ORIGIN ? p.z + FLOAT_SCALE * n.z : p_i.z);
 }
 
-struct Hit { float t; vec3 n; int mat; int light; };
+// n: shading normal; ng: geometric normal on the side the ray arrived from (they differ only on meshes).
+struct Hit { float t; vec3 n; vec3 ng; int mat; int light; };
+
+#ifdef MESH
+${MESH_GLSL}
+float intersectBall(vec3 ro, vec3 rd, vec4 s, float tMax) {
+  if (s.w <= 0.0) return -1.0;
+  float t = intersectSphere((ro - s.xyz) / s.w, rd, vec3(0.0), tMax / s.w);
+  return t > 0.0 ? t * s.w : -1.0;
+}
+#endif
 
 Hit intersect(vec3 ro, vec3 rd, bool withLights) {
   Hit h;
-  h.t = 1e30; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0);
+  h.t = 1e30; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n;
+#ifdef MESH
+  for (int i = 0; i < 3; i++) {
+    vec4 s = uBall[i];
+    float t = intersectBall(ro, rd, s, h.t);
+    if (t > 0.0) { h.t = t; h.n = normalize(ro + rd * t - s.xyz); h.ng = h.n; h.mat = i; }
+  }
+  int tri;
+  vec2 bc;
+  float tm = traceMesh(ro, rd, h.t, false, tri, bc);
+  if (tm > 0.0) {
+    h.t = tm;
+    uvec4 nn = texelFetch(uTriNrm, texAt(tri), 0);
+    vec3 e1 = texelFetch(uTriPos, texAt(3 * tri + 1), 0).xyz;
+    vec3 e2 = texelFetch(uTriPos, texAt(3 * tri + 2), 0).xyz;
+    vec3 ng = normalize(uModelRot * cross(e1, e2));
+    vec3 ns = normalize(uModelRot * ((1.0 - bc.x - bc.y) * octDecode(nn.x) + bc.x * octDecode(nn.y) + bc.y * octDecode(nn.z)));
+    // Two-sided: both normals face the ray. An interpolated normal that would put the viewer below the surface
+    // falls back to the facet's own.
+    if (dot(ng, rd) > 0.0) ng = -ng;
+    if (dot(ns, ng) < 0.0) ns = -ns;
+    if (dot(ns, -rd) <= 1e-4) ns = ng;
+    h.n = ns;
+    h.ng = ng;
+    h.mat = int(nn.w);
+  }
+#else
   for (int i = 0; i < 3; i++) {
     vec3 c = vec3(ballX(i), 1.0, 0.0);
     float t = intersectSphere(ro, rd, c, h.t);
-    if (t > 0.0) { h.t = t; h.n = normalize(ro + rd * t - c); h.mat = i; }
+    if (t > 0.0) { h.t = t; h.n = normalize(ro + rd * t - c); h.ng = h.n; h.mat = i; }
   }
+#endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
-    if (t > 0.0 && t < h.t) { h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.mat = 3; }
+    if (t > 0.0 && t < h.t) { h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3; }
   }
   if (withLights) {
     for (int k = 0; k < uNumLights; k++) {
@@ -918,9 +1085,18 @@ Hit intersect(vec3 ro, vec3 rd, bool withLights) {
 }
 
 bool occluded(vec3 ro, vec3 rd, float tMax) {
+#ifdef MESH
+  for (int i = 0; i < 3; i++) {
+    if (intersectBall(ro, rd, uBall[i], tMax) > 0.0) return true;
+  }
+  int tri;
+  vec2 bc;
+  if (traceMesh(ro, rd, tMax, true, tri, bc) > 0.0) return true;
+#else
   for (int i = 0; i < 3; i++) {
     if (intersectSphere(ro, rd, vec3(ballX(i), 1.0, 0.0), tMax) > 0.0) return true;
   }
+#endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
     if (t > 0.0 && t < tMax) return true;
@@ -933,7 +1109,17 @@ Mat getMat(int i) {
   if (i == 0) m = uMat[0];
   else if (i == 1) m = uMat[1];
   else if (i == 2) m = uMat[2];
+#ifdef MESH
+  else if (i == 3) m = uMat[3];
+  else if (i == 4) m = uMat[4];
+  else if (i == 5) m = uMat[5];
+  else if (i == 6) m = uMat[6];
+  else if (i == 7) m = uMat[7];
+  else if (i == 8) m = uMat[8];
+  else m = uMat[9];
+#else
   else m = uMat[3];
+#endif
   if (uFurnace == 1) {
     // White furnace: every albedo at 1. An energy-conserving material must vanish.
     m.base_weight = 1.0;
@@ -995,7 +1181,7 @@ void main() {
       Mat m = getMat(h.mat);
 
       if (depth == 0) {
-        mask = h.mat < 3 ? 1.0 : 0.0;
+        mask = h.mat != 3 ? 1.0 : 0.0; // everything but the floor
         if (uPass == 3) { L = albedoAOV(m); break; }
         if (uPass == 4) { L = n * 0.5 + 0.5; break; }
       }
@@ -1006,7 +1192,7 @@ void main() {
       vec3 wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
       if (wo.z <= 1e-6) break;
       Surf s = setupSurf(m, wo);
-      vec3 po = offsetRay(p, n);
+      vec3 po = offsetRay(p, h.ng); // off the true surface, on the side the ray came from
 
       // One pass over the vertex's sampled directions: k < uNumLights is next-event estimation toward softbox k
       // (solid-angle sampling); k == uNumLights is the BSDF sample that continues the path. Sharing the loop
@@ -1071,6 +1257,11 @@ void main() {
   }
 }
 `
+}
+
+export const TRACE_FRAG = traceFrag(false)
+// Compiled only when a visitor first picks a model, so the reference-ball scene never pays for it.
+export const TRACE_FRAG_MESH = traceFrag(true)
 
 // ------------------------------------------------------------------------------------------------------------
 // Display: exposure in EV, then a view transform. ACES 2.0 is the real Output Transform baked from OpenColorIO

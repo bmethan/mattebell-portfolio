@@ -1,10 +1,11 @@
-﻿import { VERT, E_TABLE_FRAG, TRACE_FRAG, DISPLAY_FRAG } from './shaders'
+import { VERT, E_TABLE_FRAG, TRACE_FRAG, TRACE_FRAG_MESH, DISPLAY_FRAG } from './shaders'
 import { kelvinToACEScg } from './color'
 import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, type OpenPBR, type Hero } from './materials'
+import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
-export type { Hero }
+export type { Hero, Model }
 
 export interface LabState {
   keyAz: number
@@ -14,6 +15,8 @@ export interface LabState {
   rim: boolean
   keyKelvin: number
   exposure: number
+  model: Model
+  modelYaw: number // turntable angle of a model, radians
   hero: Hero
   heroRoughness: number | null
   pass: Pass
@@ -30,6 +33,8 @@ export const DEFAULT_STATE: LabState = {
   rim: true,
   keyKelvin: 4300,
   exposure: 0.5,
+  model: 'spheres',
+  modelYaw: 0.6,
   hero: 'carpaint',
   heroRoughness: null,
   pass: 'beauty',
@@ -40,12 +45,13 @@ export const DEFAULT_STATE: LabState = {
 
 // poster.jpg is this renderer's converged (2048 spp) image of DEFAULT_STATE, so that state never needs a live
 // render. Angles and roughness compare with a tolerance (arrow keys step in floats; a roughness equal to the
-// preset's own value is the same material).
+// preset's own value is the same material). The turntable angle only matters with a model on the plate.
 export function isPosterState(s: LabState) {
   const d = DEFAULT_STATE
   const rough = (st: LabState) => st.heroRoughness ?? HERO_PRESETS[st.hero].params[HERO_PRESETS[st.hero].roughnessParam]
   return (Object.keys(d) as (keyof LabState)[]).every(k => {
     if (k === 'keyAz' || k === 'keyEl') return Math.abs(s[k] - d[k]) < 1e-6
+    if (k === 'modelYaw') return s.model === 'spheres' || Math.abs(s.modelYaw - d.modelYaw) < 1e-6
     if (k === 'heroRoughness') return s.hero === d.hero && Math.abs(rough(s) - rough(d)) < 1e-6
     return s[k] === d[k]
   })
@@ -57,6 +63,14 @@ export interface LabStatus {
   converged: boolean
   preview: boolean // a proxy-resolution preview is on screen while the scene changes
   ms: number // render time of the current image: time spent rendering since the last change, pauses excluded
+  model: 'ready' | 'loading' | 'failed' // the picked model's file and the mesh renderer
+}
+
+interface MeshGPU {
+  bvh: WebGLTexture
+  pos: WebGLTexture
+  nrm: WebGLTexture
+  size: [number, number, number]
 }
 
 type Vec3 = [number, number, number]
@@ -76,8 +90,15 @@ const PASS_ID: Record<Pass, number> = { beauty: 0, diffuse: 1, specular: 2, albe
 const VIEW_ID: Record<View, number> = { aces: 0, agx: 1, neutral: 2, standard: 3 }
 
 export const TARGET_SPP = 1024
+const MESH_TARGET_SPP = 512
 const HALF_FLOAT_MAX_SPP = 256
 const MAX_BOUNCES = 8
+// A model scene costs far more per bounce; past the fifth bounce its paths add little a turntable shows.
+const MESH_MAX_BOUNCES = 5
+// The furnace test is a measurement, and light trapped in a model's cavities needs many bounces to escape: at 5
+// the car reads 0.924, at 32 it reads 0.974 (the balls, with nothing to trap light, read 1.000 at 8).
+export const MESH_FURNACE_BOUNCES = 32
+const MAX_NODE_VISITS = 4096 // per mesh ray; a typical one visits well under a hundred BVH nodes
 
 // Frame pacing. The GPU is shared with the browser's compositor, and a single draw cannot be interrupted, so
 // every frame submits at most one slice sized to the frame's GPU budget, and at most MAX_IN_FLIGHT frames of
@@ -88,12 +109,17 @@ const MAX_BOUNCES = 8
 const FRAME_BUDGET_MS = 10
 const MAX_IN_FLIGHT = 2
 const MAX_SAMPLES_PER_PASS = 8 // on fast GPUs, several samples per pass when they fit the budget twice over
-const MAX_SLICES = 64 // enough to keep a four-sample half-float pass on a slow GPU near the budget
+// Enough to keep a four-sample half-float pass on a slow GPU near the budget, and a model scene (several times
+// the balls' cost per sample) too: past height / SLICE_ROWS slices, the slices get thinner.
+const MAX_SLICES = 128
 const SLICE_ROWS = 8
 const SCROLL_QUIET_MS = 200 // tracing pauses while the page scrolls
 const SETTLE_MS = 120 // full-resolution refinement starts once the scene has stopped changing for this long
 const PREVIEW_BUDGET_MS = 8
-const PREVIEW_MAX_DIV = 4
+const PREVIEW_MAX_DIV = 6
+// Before the first timing of a model scene arrives, plan as if a sample costs this much (a slow integrated GPU),
+// so the first passes cannot stall the page while the estimate is still unknown.
+const MESH_GUESS_MS = 400
 const PREVIEW_HOLD_SPP = 4 // the preview stays up until the full-resolution image is at least this clean
 
 // Sobol' direction numbers for dimensions 1-3, verbatim from Burley 2020 ("Practical Hash-based Owen
@@ -127,10 +153,13 @@ const INDIRECT_CLAMP = 12
 export const BALL_X = [-2.4, 0, 2.4]
 const CENTROID: Vec3 = [0, 1, 0]
 
-// Camera rig. The horizontal extent is fixed so the three balls always fit.
+// Camera rig. The horizontal extent is fixed so the three balls always fit. A model is lower and wider than the
+// balls, so its plate is framed tighter and aimed lower.
 const CAM_POS: Vec3 = [0, 1.45, 10.5]
 const CAM_TARGET: Vec3 = [0, 0.95, 0]
 const H_HALF_EXTENT = 4.0
+const MODEL_CAM_TARGET: Vec3 = [0, 0.62, 0]
+const MODEL_H_HALF_EXTENT = 3.55
 
 function direction(az: number, el: number): Vec3 {
   return [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)]
@@ -207,6 +236,15 @@ export class LookdevEngine {
   private progTrace: WebGLProgram
   private progDisplay: WebGLProgram
   private progTable: WebGLProgram
+  // The mesh variant of the tracer, compiled the first time a model is picked, and each model's textures.
+  private progMesh: WebGLProgram | null = null
+  private meshCompiled = false
+  private meshFailed = false
+  private meshes = new Map<Model, MeshGPU>()
+  private meshLoading = new Set<Model>()
+  private meshLoadFailed = new Set<Model>()
+  private parallel = false
+  private uploadedFor: WebGLProgram | null = null // the trace program the scene uniforms were last set on
   private live = false
   private uniformCache = new Map<WebGLProgram, Map<string, WebGLUniformLocation | null>>()
   private accumTex: WebGLTexture[] = []
@@ -236,7 +274,10 @@ export class LookdevEngine {
   private slicesGuess = 4 // without timer queries: adjusted from how often the GPU is still busy
   private timer: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number } | null = null
   // frac: the share of a full frame the timed draw covered.
-  private queries: { q: WebGLQuery; n: number; frac: number; cost: string; preview: boolean }[] = []
+  private queries: { q: WebGLQuery; n: number; frac: number; cost: string; preview: boolean; pass: number; slices: number }[] = []
+  private passId = 0 // numbers trace passes, for timing a model scene pass by pass
+  private passTiming = new Map<number, { ns: number; frac: number; peakMs: number }>()
+  private meshSlices = new Map<string, number>() // slice count per model cost class, steered by slice GPU time
   private fences: WebGLSync[] = []
   private budgetCap = FRAME_BUDGET_MS
   private maxInFlight = MAX_IN_FLIGHT
@@ -295,6 +336,7 @@ export class LookdevEngine {
     this.vao = gl.createVertexArray()!
     this.timer = gl.getExtension('EXT_disjoint_timer_query_webgl2')
     const parallel = !!gl.getExtension('KHR_parallel_shader_compile')
+    this.parallel = parallel
     this.progTrace = startProgram(gl, TRACE_FRAG)
     this.progDisplay = startProgram(gl, DISPLAY_FRAG)
     this.progTable = startProgram(gl, E_TABLE_FRAG)
@@ -316,7 +358,7 @@ export class LookdevEngine {
   // ANGLE (Direct3D) may finish building a program for a particular render target at its first draw, which
   // would land on the visitor's first edit. Draw one pixel into each target now, while the page is idle.
   private prime() {
-    if (!this.width) return
+    if (!this.width || this.state.model !== 'spheres') return
     const gl = this.gl
     gl.enable(gl.SCISSOR_TEST)
     gl.scissor(0, 0, 1, 1)
@@ -348,8 +390,114 @@ export class LookdevEngine {
     this.live = true
     this.prime()
     this.sceneDirty = true
+    this.ensureModel()
     this.kick()
     return true
+  }
+
+  // ------------------------------------------------------------------------------------------------------------
+  // Models: the mesh tracer compiles in the background the first time one is picked (polled, like the main one),
+  // and each model's file is fetched once and kept on the GPU.
+  // ------------------------------------------------------------------------------------------------------------
+  private ensureModel() {
+    const model = this.state.model
+    if (model === 'spheres' || this.disposed || !this.live) return
+    if (!this.progMesh) {
+      this.progMesh = startProgram(this.gl, TRACE_FRAG_MESH)
+      this.compileMesh(this.progMesh)
+    }
+    if (!this.meshes.has(model) && !this.meshLoading.has(model) && !this.meshLoadFailed.has(model)) this.loadMesh(model)
+  }
+
+  private async compileMesh(p: WebGLProgram) {
+    const gl = this.gl
+    for (;;) {
+      await sleep(this.parallel ? 50 : 0)
+      if (this.disposed || gl.isContextLost()) return
+      if (!this.parallel || gl.getProgramParameter(p, COMPLETION_STATUS_KHR)) break
+    }
+    try {
+      finishProgram(gl, p)
+      this.meshCompiled = true
+    } catch (err) {
+      console.error(err)
+      this.meshFailed = true
+    }
+    this.kick()
+    this.reportModel()
+  }
+
+  private async loadMesh(model: Exclude<Model, 'spheres'>) {
+    this.meshLoading.add(model)
+    try {
+      const m = await loadModel(model)
+      if (this.disposed) return
+      const gl = this.gl
+      const tex = (w: number, h: number, internal: number, format: number, type: number, data: ArrayBufferView) => {
+        const t = gl.createTexture()!
+        gl.bindTexture(gl.TEXTURE_2D, t)
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+        gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, data)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+        return t
+      }
+      this.meshes.set(model, {
+        bvh: tex(m.bvh.w, m.bvh.h, gl.RGBA32F, gl.RGBA, gl.FLOAT, m.bvh.data),
+        pos: tex(m.pos.w, m.pos.h, gl.RGBA32F, gl.RGBA, gl.FLOAT, m.pos.data),
+        nrm: tex(m.nrm.w, m.nrm.h, gl.RGBA32UI, gl.RGBA_INTEGER, gl.UNSIGNED_INT, m.nrm.data),
+        size: m.size,
+      })
+      this.sceneDirty = true
+    } catch (err) {
+      console.error(err)
+      this.meshLoadFailed.add(model)
+    } finally {
+      this.meshLoading.delete(model)
+    }
+    this.kick()
+    this.reportModel()
+  }
+
+  private modelStatus(): LabStatus['model'] {
+    const model = this.state.model
+    if (model === 'spheres') return 'ready'
+    if (this.meshFailed || this.meshLoadFailed.has(model)) return 'failed'
+    return this.meshCompiled && this.meshes.has(model) ? 'ready' : 'loading'
+  }
+
+  // While a model loads, say so (the frame keeps the previous image until the first preview lands), and say when
+  // it is ready even if no frame has run since (the lab may be scrolled away).
+  private reportModel() {
+    if (!this.active) return
+    const model = this.modelStatus()
+    if (model !== 'ready') {
+      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model })
+      return
+    }
+    const converged = this.spp >= this.goal
+    this.onStatus({ spp: this.spp, target: this.goal, converged, preview: this.showingPreview(), ms: this.renderMs, model })
+  }
+
+  private traceProg() {
+    return this.state.model === 'spheres' ? this.progTrace : this.progMesh!
+  }
+
+  // World points under each labelled object: the two reference balls and the hero (ball or model).
+  labelPoints(): Vec3[] {
+    if (this.state.model === 'spheres') return BALL_X.map((x): Vec3 => [x, 0, 0])
+    const mesh = this.meshes.get(this.state.model)
+    const scaleW = MODELS[this.state.model].scale
+    // The model's footprint, turned: label it at the point of the footprint nearest the camera.
+    let front = 1.2
+    if (mesh) {
+      const [sx, , sz] = mesh.size
+      const c = Math.cos(this.state.modelYaw), s = Math.sin(this.state.modelYaw)
+      front = Math.max(...[[-1, -1], [-1, 1], [1, -1], [1, 1]].map(([i, j]) => (-i * sx * s + j * sz * c) * 0.5 * scaleW))
+    }
+    return [[MODEL_BALLS[0][0], 0, MODEL_BALLS[0][2]], [MODEL_BALLS[1][0], 0, MODEL_BALLS[1][2]], [0, 0, front]]
   }
 
   private handleLost = (e: Event) => {
@@ -503,7 +651,9 @@ export class LookdevEngine {
     this.previewDirty = true
     this.gen++
     this.lastChange = performance.now()
+    if (patch.model) this.ensureModel()
     this.reset()
+    if (patch.model) this.reportModel()
   }
 
   setInteracting(on: boolean) {
@@ -527,9 +677,10 @@ export class LookdevEngine {
     // An exposure or view edit keeps the accumulated image, which may already be converged, so no pass would
     // run to report it. Report the image already on the canvas so the still uncovers it.
     if (this.live && (this.spp > 0 || (this.previewK > 0 && this.previewGen === this.gen))) {
-      const converged = this.spp >= this.target
-      this.onStatus({ spp: this.spp, target: this.target, converged, preview: this.showingPreview(), ms: this.renderMs })
+      const converged = this.spp >= this.goal
+      this.onStatus({ spp: this.spp, target: this.goal, converged, preview: this.showingPreview(), ms: this.renderMs, model: 'ready' })
     }
+    this.reportModel()
     this.kick()
   }
 
@@ -538,6 +689,11 @@ export class LookdevEngine {
     const cap = this.accumFmt.type === this.gl.HALF_FLOAT ? HALF_FLOAT_MAX_SPP : Infinity
     this.target = Math.max(1, Math.min(cap, Math.floor(n)))
     this.kick()
+  }
+
+  // Where this scene's render stops: a model costs several times the balls per sample, so it finishes sooner.
+  private get goal() {
+    return this.state.model === 'spheres' ? this.target : Math.min(this.target, MESH_TARGET_SPP)
   }
 
   // Normalized screen position (0..1, y down) of a world point, used for HTML labels.
@@ -551,10 +707,12 @@ export class LookdevEngine {
   }
 
   private camera() {
-    const fwd = normalize(sub(CAM_TARGET, CAM_POS))
+    const plate = this.state.model !== 'spheres'
+    const target = plate ? MODEL_CAM_TARGET : CAM_TARGET
+    const fwd = normalize(sub(target, CAM_POS))
     const right = normalize(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
-    const tanH = H_HALF_EXTENT / length(sub(CAM_TARGET, CAM_POS))
+    const tanH = (plate ? MODEL_H_HALF_EXTENT : H_HALF_EXTENT) / length(sub(target, CAM_POS))
     const aspect = this.width && this.height ? this.width / this.height : 2.39
     const tanV = tanH / aspect
     return { fwd, right, up, tanH, tanV }
@@ -583,7 +741,8 @@ export class LookdevEngine {
   private uploadScene() {
     const gl = this.gl
     const s = this.state
-    const L = (n: string) => this.loc(this.progTrace, n)
+    const prog = this.traceProg()
+    const L = (n: string) => this.loc(prog, n)
 
     const cam = this.camera()
     gl.uniform3fv(L('uCamPos'), CAM_POS)
@@ -612,20 +771,35 @@ export class LookdevEngine {
     })
 
     gl.uniform4uiv(L('uSobol'), SOBOL_UNIFORM)
-    gl.uniform1i(L('uMaxBounces'), MAX_BOUNCES)
+    gl.uniform1i(L('uMaxBounces'), s.model === 'spheres' ? MAX_BOUNCES : s.furnace ? MESH_FURNACE_BOUNCES : MESH_MAX_BOUNCES)
     gl.uniform1i(L('uNumLights'), rigs.length)
     gl.uniform3fv(L('uEnv'), s.furnace ? [1, 1, 1] : [0.0012, 0.0013, 0.0016])
     gl.uniform1i(L('uFurnace'), s.furnace ? 1 : 0)
     gl.uniform1f(L('uIndirectClamp'), s.furnace ? 0 : INDIRECT_CLAMP)
     gl.uniform1i(L('uMultiScatter'), s.multiscatter ? 1 : 0)
     gl.uniform1i(L('uPass'), PASS_ID[s.pass])
-    gl.uniform3fv(L('uBallX'), BALL_X)
 
-    // Materials: 0 gray card, 1 chromium, 2 hero, 3 floor.
+    // Materials: 0 gray card, 1 chromium, 2 hero, 3 floor; with a model, 4-9 dress its other parts.
     const hero = HERO_PRESETS[s.hero]
     const heroMat: OpenPBR = { ...hero.params }
     if (s.heroRoughness !== null) heroMat[hero.roughnessParam] = s.heroRoughness
     const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, heroMat, SCENE_MATERIALS.floor]
+
+    if (s.model === 'spheres') {
+      gl.uniform3fv(L('uBallX'), BALL_X)
+    } else {
+      mats.push(...MESH_MATERIALS)
+      MODEL_BALLS.forEach((b, i) => gl.uniform4fv(L(`uBall[${i}]`), b))
+      const c = Math.cos(s.modelYaw), sn = Math.sin(s.modelYaw)
+      // Turntable: rotation about y, column major.
+      gl.uniformMatrix3fv(L('uModelRot'), false, [c, 0, -sn, 0, 1, 0, sn, 0, c])
+      gl.uniform3fv(L('uModelPos'), [0, 0, 0])
+      gl.uniform1f(L('uModelScale'), MODELS[s.model].scale)
+      gl.uniform1i(L('uMaxNodeVisits'), MAX_NODE_VISITS)
+      gl.uniform1i(L('uBvh'), 2)
+      gl.uniform1i(L('uTriPos'), 3)
+      gl.uniform1i(L('uTriNrm'), 4)
+    }
     mats.forEach((m, i) => {
       for (const f of MATERIAL_FIELDS) {
         const v = m[f]
@@ -635,11 +809,35 @@ export class LookdevEngine {
       }
     })
     this.sceneDirty = false
+    this.uploadedFor = prog
+  }
+
+  // Binds the trace program with its scene uniforms current, and the model's textures when it has one.
+  private useTrace() {
+    const gl = this.gl
+    const prog = this.traceProg()
+    gl.useProgram(prog)
+    if (this.sceneDirty || this.uploadedFor !== prog) this.uploadScene()
+    const mesh = this.state.model === 'spheres' ? null : this.meshes.get(this.state.model)
+    if (mesh) {
+      gl.activeTexture(gl.TEXTURE2)
+      gl.bindTexture(gl.TEXTURE_2D, mesh.bvh)
+      gl.activeTexture(gl.TEXTURE3)
+      gl.bindTexture(gl.TEXTURE_2D, mesh.pos)
+      gl.activeTexture(gl.TEXTURE4)
+      gl.bindTexture(gl.TEXTURE_2D, mesh.nrm)
+    }
+    return (name: string) => this.loc(prog, name)
   }
 
   private step = (t: number) => {
     this.rafId = 0
-    if (this.disposed || !this.active || !this.visible || this.spp >= this.target) return
+    if (this.disposed || !this.active || !this.visible || this.spp >= this.goal) return
+    // A model still loading (or its renderer still compiling): nothing to trace yet. Loading kicks this again.
+    if (this.modelStatus() !== 'ready') {
+      this.ensureModel()
+      return
+    }
     this.rafId = requestAnimationFrame(this.step)
     const gl = this.gl
     const dt = this.lastFrameT ? t - this.lastFrameT : 0
@@ -668,7 +866,7 @@ export class LookdevEngine {
       this.tracePreview(k)
       this.submitted()
       this.display()
-      this.onStatus({ spp: 0, target: this.target, converged: false, preview: true, ms: this.renderMs })
+      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: true, ms: this.renderMs, model: 'ready' })
       return
     }
 
@@ -677,21 +875,21 @@ export class LookdevEngine {
     this.submitted()
     if (passDone) {
       this.display()
-      const converged = this.spp >= this.target
-      this.onStatus({ spp: this.spp, target: this.target, converged, preview: this.showingPreview(), ms: this.renderMs })
+      const converged = this.spp >= this.goal
+      this.onStatus({ spp: this.spp, target: this.goal, converged, preview: this.showingPreview(), ms: this.renderMs, model: 'ready' })
       if (converged) this.stop()
     }
   }
 
-  // Cost class of the current settings, for the GPU time estimates.
+  // Cost class of the current settings, for the GPU time estimates (a model costs far more than the balls).
   private costKey() {
-    return `${this.state.pass}:${this.state.furnace ? 1 : 0}`
+    return `${this.state.model}:${this.state.pass}:${this.state.furnace ? 1 : 0}`
   }
 
   // The preview stands in until the full-resolution image of the same state has PREVIEW_HOLD_SPP samples, so
   // the handoff never makes the image noisier.
   private showingPreview() {
-    return this.previewK > 0 && this.previewGen === this.gen && this.spp < Math.min(PREVIEW_HOLD_SPP, this.target)
+    return this.previewK > 0 && this.previewGen === this.gen && this.spp < Math.min(PREVIEW_HOLD_SPP, this.goal)
   }
 
   // The display interval (a low percentile of recent frames, so frames this renderer slowed down do not
@@ -724,7 +922,7 @@ export class LookdevEngine {
     // The larger of the two estimates: the full-resolution one keeps updating even while no preview is drawn
     // (so a GPU that slows down is noticed); unmeasured, assume a mid-range GPU.
     const known = [this.previewMsPerSpp.get(key), this.msPerSpp.get(key)].filter((v): v is number => v !== undefined)
-    const ms = known.length ? Math.max(...known) : 40
+    const ms = known.length ? Math.max(...known) : this.state.model === 'spheres' ? 40 : MESH_GUESS_MS
     const budget = Math.min(PREVIEW_BUDGET_MS, 0.5 * this.frameMs)
     return Math.max(1, Math.min(PREVIEW_MAX_DIV, Math.ceil(Math.sqrt(ms / budget))))
   }
@@ -739,9 +937,7 @@ export class LookdevEngine {
     gl.bindVertexArray(this.vao)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.previewFbo)
     gl.viewport(0, 0, Math.ceil(this.width / k), Math.ceil(this.height / k))
-    gl.useProgram(this.progTrace)
-    if (this.sceneDirty) this.uploadScene()
-    const L = (name: string) => this.loc(this.progTrace, name)
+    const L = this.useTrace()
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.accumTex[this.ping]) // not read when uSppDone is 0
     gl.activeTexture(gl.TEXTURE1)
@@ -755,7 +951,7 @@ export class LookdevEngine {
     gl.drawArrays(gl.TRIANGLES, 0, 3)
     if (q) {
       gl.endQuery(this.timer!.TIME_ELAPSED_EXT)
-      this.queries.push({ q, n: 1, frac: 1 / (k * k), cost, preview: true })
+      this.queries.push({ q, n: 1, frac: 1 / (k * k), cost, preview: true, pass: -1, slices: 1 })
     }
     this.previewK = k
     this.previewGen = this.gen
@@ -765,25 +961,28 @@ export class LookdevEngine {
   // Size the next pass: new samples per pixel, and how many slices (frames) to spread them over.
   private planPass() {
     const halfFloat = this.accumFmt.type === this.gl.HALF_FLOAT
-    const ms = this.msPerSpp.get(this.costKey())
+    const ms = this.msPerSpp.get(this.costKey()) ?? (this.state.model === 'spheres' ? undefined : MESH_GUESS_MS)
     // Half-float running means need increments of at least four samples to stay precise (HALF_FLOAT_MAX_SPP).
     let n = halfFloat ? 4 : 1
     if (ms !== undefined && !this.interacting && 2 * ms * n <= this.budgetMs()) {
       n = Math.max(n, Math.min(MAX_SAMPLES_PER_PASS, Math.floor(this.budgetMs() / (2 * ms))))
     }
-    n = Math.min(n, this.target - this.spp)
+    n = Math.min(n, this.goal - this.spp)
     let slices = this.slicesGuess
     this.passAdaptive = false
     if (this.interacting) {
       slices = 1 // no preview on this GPU (it is fast enough): keep up with the pointer
+    } else if (this.meshSlices.has(this.costKey())) {
+      slices = this.meshSlices.get(this.costKey())! * n // steered by measured slice times (collectTimings)
     } else if (ms !== undefined) {
       slices = Math.ceil((ms * n) / this.budgetMs())
     } else {
       this.passAdaptive = true
     }
     this.passN = n
-    this.passSlices = Math.max(1, Math.min(MAX_SLICES, Math.ceil(this.height / SLICE_ROWS), slices))
+    this.passSlices = Math.max(1, Math.min(MAX_SLICES, this.height, slices))
     this.passSlice = 0
+    this.passId++
   }
 
   // Draws the next slice of the current pass; returns true when that completes the pass.
@@ -794,7 +993,7 @@ export class LookdevEngine {
     const rows = this.drawTrace(this.passN, this.passSlices, this.passSlice)
     if (q) {
       gl.endQuery(this.timer!.TIME_ELAPSED_EXT)
-      this.queries.push({ q, n: this.passN, frac: rows / this.height, cost: this.costKey(), preview: false })
+      this.queries.push({ q, n: this.passN, frac: rows / this.height, cost: this.costKey(), preview: false, pass: this.passId, slices: this.passSlices })
     }
     if (++this.passSlice < this.passSlices) return false
 
@@ -829,12 +1028,34 @@ export class LookdevEngine {
       return
     }
     while (this.queries.length) {
-      const { q, n, frac, cost, preview } = this.queries[0]
+      const { q, n, frac, cost, preview, pass, slices } = this.queries[0]
       if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) break
       const ns = gl.getQueryParameter(q, gl.QUERY_RESULT) as number
       gl.deleteQuery(q)
       this.queries.shift()
-      const ms = ns / 1e6 / frac / n
+      let ms = ns / 1e6 / frac / n
+      if (!preview && !cost.startsWith('spheres:')) {
+        // A model's cost sits in the rows it covers, so one slice says little about a whole frame, and a thin
+        // slice costs more per pixel than a full frame (too few pixels to keep the GPU busy). So: average whole
+        // passes for the cost estimate, and steer the slice count by the slowest slice's actual GPU time, so the
+        // slices through the model also fit the frame budget (passes abandoned by a reset are dropped).
+        const acc = this.passTiming.get(pass) ?? { ns: 0, frac: 0, peakMs: 0 }
+        acc.ns += ns
+        acc.frac += frac
+        acc.peakMs = Math.max(acc.peakMs, ns / 1e6)
+        for (const k of this.passTiming.keys()) if (k < pass - 2) this.passTiming.delete(k)
+        if (acc.frac < 0.999) {
+          this.passTiming.set(pass, acc)
+          continue
+        }
+        this.passTiming.delete(pass)
+        ms = acc.ns / 1e6 / acc.frac / n
+        const ratio = acc.peakMs / this.budgetMs()
+        if (ratio > 1.15 || ratio < 0.6) {
+          const now = this.meshSlices.get(cost) ?? slices
+          this.meshSlices.set(cost, Math.max(1, Math.min(MAX_SLICES, Math.round(now * Math.min(1.6, Math.max(0.7, ratio))))))
+        }
+      }
       const model = preview ? this.previewMsPerSpp : this.msPerSpp
       const prev = model.get(cost)
       model.set(cost, prev === undefined ? ms : 0.7 * prev + 0.3 * ms)
@@ -845,7 +1066,7 @@ export class LookdevEngine {
   // Chrome's gl.finish() does not wait for the GPU, so a one-pixel read drains the queue after each batch,
   // keeping every submission far below the OS watchdog (TDR) limit.
   renderNow(total: number) {
-    if (!this.live) return
+    if (!this.live || this.modelStatus() !== 'ready') return
     const gl = this.gl
     const px = new Float32Array(4)
     this.passN = 0
@@ -858,7 +1079,7 @@ export class LookdevEngine {
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     this.display()
-    this.onStatus({ spp: this.spp, target: this.target, converged: this.spp >= this.target, preview: false, ms: this.renderMs })
+    this.onStatus({ spp: this.spp, target: this.goal, converged: this.spp >= this.goal, preview: false, ms: this.renderMs, model: 'ready' })
   }
 
   // One slice of a trace pass: n new samples per pixel blended into the running mean, read from the current
@@ -870,9 +1091,7 @@ export class LookdevEngine {
     gl.bindVertexArray(this.vao)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFbo[1 - this.ping])
     gl.viewport(0, 0, this.width, this.height)
-    gl.useProgram(this.progTrace)
-    if (this.sceneDirty) this.uploadScene()
-    const L = (name: string) => this.loc(this.progTrace, name)
+    const L = this.useTrace()
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.accumTex[this.ping])
     gl.activeTexture(gl.TEXTURE1)
@@ -886,12 +1105,16 @@ export class LookdevEngine {
       gl.drawArrays(gl.TRIANGLES, 0, 3)
       return this.height
     }
+    // Blocks of up to SLICE_ROWS rows; thinner when there are more slices than SLICE_ROWS blocks fill, so every
+    // slice still draws something. (Much thinner slices are slower overall: a few thousand pixels cannot keep
+    // the GPU busy while each path waits on its texture fetches.)
+    const blockRows = Math.max(1, Math.min(SLICE_ROWS, Math.floor(this.height / sliceCount)))
     let rows = 0
     gl.enable(gl.SCISSOR_TEST)
-    for (let y = slice * SLICE_ROWS; y < this.height; y += sliceCount * SLICE_ROWS) {
-      gl.scissor(0, y, this.width, SLICE_ROWS)
+    for (let y = slice * blockRows; y < this.height; y += sliceCount * blockRows) {
+      gl.scissor(0, y, this.width, blockRows)
       gl.drawArrays(gl.TRIANGLES, 0, 3)
-      rows += Math.min(SLICE_ROWS, this.height - y)
+      rows += Math.min(blockRows, this.height - y)
     }
     gl.disable(gl.SCISSOR_TEST)
     return rows
@@ -970,6 +1193,9 @@ export class LookdevEngine {
     gl.deleteTexture(this.eTable)
     gl.deleteTexture(this.acesLut)
     gl.deleteProgram(this.progTrace)
+    if (this.progMesh) gl.deleteProgram(this.progMesh)
+    this.meshes.forEach(m => [m.bvh, m.pos, m.nrm].forEach(t => gl.deleteTexture(t)))
+    this.meshes.clear()
     gl.deleteProgram(this.progDisplay)
     gl.deleteProgram(this.progTable)
     if (this.previewTex) gl.deleteTexture(this.previewTex)

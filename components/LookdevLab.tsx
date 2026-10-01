@@ -4,14 +4,15 @@ import {
   LookdevEngine,
   DEFAULT_STATE,
   isPosterState,
-  BALL_X,
   TARGET_SPP,
+  MESH_FURNACE_BOUNCES,
   type LabState,
   type LabStatus,
   type Pass,
   type View,
 } from './lookdev/engine'
 import { HERO_PRESETS, HERO_ORDER } from './lookdev/materials'
+import { MODELS, MODEL_ORDER } from './lookdev/models'
 import { CITATIONS } from './lookdev/citations'
 import WorkIndicator from './WorkIndicator'
 
@@ -117,7 +118,7 @@ export default function LookdevLab() {
   const touchStart = useRef<{ id: number; x: number; y: number } | null>(null)
 
   const [lab, setLab] = useState<LabState>(DEFAULT_STATE)
-  const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false, preview: false, ms: 0 })
+  const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false, preview: false, ms: 0, model: 'ready' })
   const [mode, setMode] = useState<'idle' | 'live' | 'fallback'>('idle')
   const [labels, setLabels] = useState<{ x: number; y: number }[]>([])
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
@@ -160,7 +161,7 @@ export default function LookdevLab() {
       const r = frame.getBoundingClientRect()
       engine.resize(r.width, r.height, window.devicePixelRatio || 1)
       const e = engine
-      setLabels(BALL_X.map(x => e.project([x, 0, 0])))
+      setLabels(e.labelPoints().map(p => e.project(p)))
     }
 
     // When the white furnace test converges, measure the mean radiance over the spheres.
@@ -271,6 +272,12 @@ export default function LookdevLab() {
     }
   }, [])
 
+  // Labels follow the plate: a model moves the reference balls aside, and its own label tracks the turntable.
+  useEffect(() => {
+    const e = engineRef.current
+    if (e) setLabels(e.labelPoints().map(p => e.project(p)))
+  }, [lab.model, lab.modelYaw, status.model, ready])
+
   const setFromPointer = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const r = e.currentTarget.getBoundingClientRect()
     const u = clamp((e.clientX - r.left) / r.width, 0, 1)
@@ -332,7 +339,8 @@ export default function LookdevLab() {
   const heroRough = lab.heroRoughness ?? hero.params[hero.roughnessParam]
   const markerX = (lab.keyAz / AZ_RANGE + 0.5) * 100
   const markerY = ((EL_MAX - lab.keyEl) / ((EL_MAX - EL_MIN) * 1.1)) * 100
-  const ballNames = ['18% gray', 'Chrome', hero.label]
+  const model = lab.model === 'spheres' ? null : MODELS[lab.model]
+  const ballNames = ['18% gray', 'Chrome', model ? `${model.label}, ${hero.label.toLowerCase()}` : hero.label]
 
   return (
     <section ref={sectionRef} id="lab" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
@@ -404,14 +412,25 @@ export default function LookdevLab() {
               {lab.furnace ? 'White furnace' : `Key ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el  ${lab.keyKelvin}K`}
             </div>
             <div className="lab-hud lab-hud-right">
-              {!pristine && !status.converged && <WorkIndicator className="lab-work" />}
-              {PASSES.find(p => p.id === lab.pass)?.label}
-              {'  '}
-              {pristine
-                ? `${POSTER_SPP} spp`
-                : status.preview
-                  ? 'Preview'
-                  : `${clock(status.ms)}  ${status.converged ? `${status.spp} spp` : `${status.spp} / ${status.target} spp`}`}
+              {status.model === 'failed' ? (
+                `The ${model?.label.toLowerCase() ?? 'model'} could not load`
+              ) : status.model === 'loading' ? (
+                <>
+                  <WorkIndicator className="lab-work" />
+                  Loading the {model?.label.toLowerCase()}
+                </>
+              ) : (
+                <>
+                  {!pristine && !status.converged && <WorkIndicator className="lab-work" />}
+                  {PASSES.find(p => p.id === lab.pass)?.label}
+                  {'  '}
+                  {pristine
+                    ? `${POSTER_SPP} spp`
+                    : status.preview
+                      ? 'Preview'
+                      : `${clock(status.ms)}  ${status.converged ? `${status.spp} spp` : `${status.spp} / ${status.target} spp`}`}
+                </>
+              )}
             </div>
             <div
               className="lab-progress"
@@ -429,6 +448,29 @@ export default function LookdevLab() {
 
       {mode !== 'fallback' && (
         <fieldset className="lab-controls" disabled={!ready}>
+          <div className="lab-row">
+            <Group label="Model">
+              {MODEL_ORDER.map(m => (
+                <Pill key={m} on={lab.model === m} onClick={() => update({ model: m })}>
+                  {m === 'spheres' ? 'Reference balls' : MODELS[m].label}
+                </Pill>
+              ))}
+            </Group>
+            {model && (
+              <Group label="Turntable">
+                <Range
+                  min={-180}
+                  max={180}
+                  step={1}
+                  value={deg(lab.modelYaw)}
+                  label="Turntable angle, degrees"
+                  onChange={v => update({ modelYaw: (v * Math.PI) / 180 })}
+                />
+                <span className="lab-readout">{deg(lab.modelYaw)}°</span>
+              </Group>
+            )}
+          </div>
+
           <div className="lab-row">
             <Group label="Lights">
               <Pill on={lab.key} onClick={() => update({ key: !lab.key })}>Key</Pill>
@@ -513,7 +555,10 @@ export default function LookdevLab() {
               <span className="lab-note">
                 Uniform white light, no floor, every albedo at 1. An energy conserving material disappears into the
                 background.
-                {furnaceMean !== null && ` Measured mean over the spheres: ${furnaceMean.toFixed(3)} (ideal 1.000).`}
+                {furnaceMean !== null &&
+                  ` Measured mean over the ${model ? 'balls and model' : 'spheres'}: ${furnaceMean.toFixed(3)} (ideal 1.000).`}
+                {model &&
+                  ` A model reads a little under 1: light caught in its cavities needs dozens of bounces to escape, and the renderer stops at ${MESH_FURNACE_BOUNCES}.`}
               </span>
             )}
           </div>
@@ -521,6 +566,19 @@ export default function LookdevLab() {
       )}
 
       <div className="lab-methods">
+        {model && (
+          <p className="lab-note" style={{ width: '100%', margin: '0 0 8px' }}>
+            {model.credit.text}{' '}
+            <a href={model.credit.source} target="_blank" rel="noopener noreferrer">
+              Source
+            </a>
+            {', '}
+            <a href={model.credit.licenseUrl} target="_blank" rel="noopener noreferrer">
+              {model.credit.license}
+            </a>
+            .
+          </p>
+        )}
         <p className="lab-note" style={{ width: '100%', margin: '0 0 4px' }}>
           Rendered in ACEScg. With multiple-scattering compensation on, every preset averages within 0.02% of 1.0 in a
           white furnace test.

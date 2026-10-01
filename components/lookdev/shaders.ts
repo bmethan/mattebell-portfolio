@@ -509,6 +509,9 @@ struct Mat {
   float coat_weight; vec3 coat_color; float coat_roughness; float coat_ior; float coat_darkening;
   float fuzz_weight; vec3 fuzz_color; float fuzz_roughness;
   float thin_film_weight; float thin_film_thickness; float thin_film_ior;
+  float transmission_weight; vec3 transmission_color; float transmission_depth;
+  float transmission_dispersion_scale; float transmission_dispersion_abbe_number;
+  float geometry_thin_walled; // 0 or 1
   float lab_flake_coverage; float lab_flake_size; float lab_flake_tilt; // lab extension (see materials.ts)
 };
 
@@ -525,6 +528,10 @@ struct Surf {
   vec3 tBase;   // everything multiplying f_base below fuzz and coat
   vec4 p;       // lobe selection weights: diffuse, base specular, coat, fuzz
   vec3 nf;      // flake normal in the shading frame, (0, 0, 1) off the flakes; tilts the base specular only
+  // Transmission (spec, Transmission): the dielectric base's substrate is transmissive by transW instead of
+  // diffuse. etaT is the IOR ratio the refraction uses (the path's channel when the glass disperses).
+  float transW; float etaT; bool thin; vec3 transTint;
+  float pT;     // lobe selection weight of the transmission lobe
 };
 
 uniform sampler3D uETable;
@@ -554,7 +561,23 @@ vec3 openpbrCoatBaseFactor(vec3 baseColor, float specWeight, float M, float C, v
   return mix(vec3(1.0), Delta, C * coatDarkening) * mix(vec3(1.0), coatColor, C);
 }
 
-Surf setupSurf(Mat m, vec3 wo) {
+// Dispersion (spec, Transmission > Dispersion): Cauchy's n(lambda) = A + B / lambda^2 through n_d at the
+// Fraunhofer d line, with B set by the Abbe number V_d = abbe / scale (F and C lines). This RGB renderer gives
+// each channel one representative wavelength (an approximation of the spectral spec).
+const vec3 CHANNEL_NM = vec3(610.0, 550.0, 465.0);
+float cauchyIor(float nd, float vd, float nm) {
+  const float LF = 486.13, LC = 656.27, LD = 587.56;
+  float B = (nd - 1.0) / (vd * (1.0 / (LF * LF) - 1.0 / (LC * LC)));
+  float A = nd - B / (LD * LD);
+  return A + B / (nm * nm);
+}
+bool disperses(Mat m) {
+  return m.transmission_weight > 0.0 && m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0;
+}
+
+// back: the ray reached the surface from inside the object. chan: the path's color channel for dispersion;
+// colored: the path has already refracted through dispersive glass, so it now carries that channel alone.
+Surf setupSurf(Mat m, vec3 wo, bool back, int chan, bool colored) {
   Surf s;
   s.baseColor = max(m.base_color, vec3(0.0));
   s.baseWeight = max(m.base_weight, 0.0);
@@ -581,14 +604,46 @@ Surf setupSurf(Mat m, vec3 wo) {
   float rTable = aniso > 0.0 ? sqrt(sqrt(s.aS.x * s.aS.y)) : s.specRough;
   s.nf = vec3(0.0, 0.0, 1.0);
   s.aC = vec2(max(s.coatRough * s.coatRough, 1e-4));
-  s.eta = openpbrSpecularEta(max(m.specular_ior, 1.0), s.coatIor, s.coatW, s.specW);
+  float nd = max(m.specular_ior, 1.0);
+#ifndef GLASS
+  // Opaque variant: no transmission. Thin variant: thin-walled transmission only (no medium, no dispersion).
+  s.eta = openpbrSpecularEta(nd, s.coatIor, s.coatW, s.specW);
+  s.etaT = s.eta;
+#ifdef THIN
+  s.thin = m.geometry_thin_walled > 0.5;
+  s.transW = s.thin ? sat(m.transmission_weight) : 0.0;
+  s.transTint = max(m.transmission_color, vec3(0.0));
+#else
+  s.transW = 0.0;
+  s.thin = false;
+  s.transTint = vec3(1.0);
+#endif
+#else
+  float nChan = disperses(m)
+    ? cauchyIor(nd, m.transmission_dispersion_abbe_number / m.transmission_dispersion_scale, chan == 0 ? CHANNEL_NM.r : (chan == 1 ? CHANNEL_NM.g : CHANNEL_NM.b))
+    : nd;
+  s.eta = openpbrSpecularEta(colored ? nChan : nd, s.coatIor, s.coatW, s.specW);
+  s.etaT = openpbrSpecularEta(nChan, s.coatIor, s.coatW, s.specW);
+  s.transW = sat(m.transmission_weight);
+  s.thin = m.geometry_thin_walled > 0.5;
+  // With no depth there is no medium, and the color tints the refraction instead (spec).
+  s.transTint = m.transmission_depth > 0.0 ? vec3(1.0) : max(m.transmission_color, vec3(0.0));
+  if (back && !s.thin) {
+    // Leaving a solid: the IOR ratio inverts (total internal reflection follows from the Fresnel terms).
+    s.eta = 1.0 / s.eta;
+    s.etaT = 1.0 / s.etaT;
+  }
+#endif
+  // The albedo tables cover eta >= 1 (from outside); inside a solid they are looked up at the reciprocal, an
+  // approximation that only matters for rough interior reflections.
+  float etaTable = s.eta >= 1.0 ? s.eta : 1.0 / s.eta;
 
   float mu = clamp(wo.z, 1e-4, 1.0);
   bool ms = uMultiScatter == 1;
   vec3 F0m = s.baseWeight * s.baseColor;
 
   // textureLod: implicit-derivative fetches inside loops force Direct3D to unroll them.
-  vec3 tS = textureLod(uETable, eTableCoord(mu, rTable, s.eta), 0.0).rgb;
+  vec3 tS = textureLod(uETable, eTableCoord(mu, rTable, etaTable), 0.0).rgb;
   float Ess = max(tS.r, 1e-4);
   s.compD = ms ? 1.0 + tS.b * (1.0 - Ess) / Ess : 1.0;
   s.compM = ms ? 1.0 + favgF82Tint(F0m, s.specColor) * (1.0 - Ess) / Ess : vec3(1.0);
@@ -597,8 +652,12 @@ Surf setupSurf(Mat m, vec3 wo) {
   // base receives the complement. Scale the tabulated albedo by the film-to-plain Fresnel ratio at the view angle.
   s.EspecR3 = vec3(s.EspecR);
   if (s.tfW > 0.0) {
-    vec3 ratio = thinFilmF(mu, s.tfIor, s.tfThick, vec3(f0FromEta(s.eta))) / max(fresnelDielectric(mu, s.eta), 1e-4);
-    s.EspecR3 = sat3(s.EspecR * mix(vec3(1.0), ratio, s.tfW));
+    // Where the bare surface barely reflects (an IOR near 1, like a soap film's), the ratio is undefined and the
+    // film's reflectance is used with the lobe's F = 1 albedo instead; otherwise this lobe would never be sampled.
+    vec3 film = thinFilmF(mu, s.tfIor, s.tfThick, vec3(f0FromEta(s.eta)));
+    float Fp = fresnelDielectric(mu, s.eta);
+    vec3 withFilm = Fp > 1e-3 ? s.EspecR * film / Fp : Ess * s.compD * film;
+    s.EspecR3 = sat3(mix(vec3(s.EspecR), withFilm, s.tfW));
   }
 
   vec3 tC = textureLod(uETable, eTableCoord(mu, s.coatRough, s.coatIor), 0.0).rgb;
@@ -614,19 +673,23 @@ Surf setupSurf(Mat m, vec3 wo) {
   float tb = lum(s.tBase);
   vec3 diffAlb = s.baseWeight * E_EON(sat3(s.baseColor), s.diffRough, mu);
   s.p = vec4(
-    tb * (1.0 - s.metal) * max(lum((1.0 - s.EspecR3) * diffAlb), 0.0),
+    tb * (1.0 - s.metal) * (1.0 - s.transW) * max(lum((1.0 - s.EspecR3) * diffAlb), 0.0),
     tb * ((1.0 - s.metal) * lum(s.EspecR3) * max(lum(s.specColor), 0.05) + s.metal * s.specW * max(lum(F0m), 0.05)),
     tFuzz * s.coatW * s.Ecoat,
     s.fuzzW * s.Efuzz * max(lum(s.fuzzColor), 0.05));
+  s.pT = tb * (1.0 - s.metal) * s.transW * max(lum((1.0 - s.EspecR3) * s.transTint), 0.05);
   return s;
 }
 
 // filt: 0 all lobes, 1 diffuse only, 2 everything but diffuse (first-hit light path expressions for AOVs).
-vec4 lobeProbs(Surf s, int filt) {
+// Returns the selection probabilities of diffuse, base specular, coat and fuzz; pt receives transmission's.
+vec4 lobeProbs(Surf s, int filt, out float pt) {
   vec4 p = s.p;
-  if (filt == 1) p = vec4(p.x, 0.0, 0.0, 0.0);
+  float t = s.pT;
+  if (filt == 1) { p = vec4(p.x, 0.0, 0.0, 0.0); t = 0.0; }
   if (filt == 2) p.x = 0.0;
-  float sum = p.x + p.y + p.z + p.w;
+  float sum = p.x + p.y + p.z + p.w + t;
+  pt = sum > 0.0 ? t / sum : 0.0;
   return sum > 0.0 ? p / sum : vec4(0.0);
 }
 
@@ -634,15 +697,58 @@ vec4 lobeProbs(Surf s, int filt) {
 float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
   fD = vec3(0.0);
   fS = vec3(0.0);
-  if (wi.z <= 0.0 || wo.z <= 0.0) return 0.0;
-  vec4 p = lobeProbs(s, filt);
+  if (wo.z <= 0.0) return 0.0;
+  float pt;
+  vec4 p = lobeProbs(s, filt, pt);
+
+#ifndef THIN
+  if (wi.z <= 0.0) return 0.0;
+#else
+  if (wi.z <= 0.0) {
+    // Transmission, the only lobe below the surface. Its Fresnel complements the reflection lobe's at the same
+    // microfacet, and like it ignores multiple scattering between microfacets: smooth glass is exact, rough
+    // glass loses some energy (the furnace test shows how much).
+    if (pt <= 0.0) return 0.0;
+    float ft, cosM, pdfT;
+    if (s.thin) {
+      // Thin-walled: the reflection lobe mirrored through the surface, so light passes straight through.
+      vec3 wr = vec3(wi.xy, -wi.z);
+      vec3 hr = normalize(wo + wr);
+      cosM = sat(dot(wo, hr));
+      ft = G2_GGX(wo, wr, s.aS) * D_GGX(hr, s.aS) / (4.0 * wo.z);
+      pdfT = pdfGGXReflection_Bounded(wo, wr, s.aS);
+    } else {
+#ifndef GLASS
+      return 0.0;
+#else
+      // Rough dielectric refraction: Walter, Marschner, Li, Torrance 2007 (eq. 21), radiance transport (1/eta^2),
+      // as in pbrt-v4's DielectricBxDF; pdf through the generalized half vector's Jacobian.
+      float eta = s.etaT;
+      vec3 wm = normalize(wo + wi * eta);
+      if (wm.z < 0.0) wm = -wm;
+      float dI = dot(wi, wm), dO = dot(wo, wm);
+      if (dI >= 0.0 || dO <= 0.0) return 0.0;
+      float denom = dI + dO / eta;
+      float D = D_GGX(wm, s.aS);
+      ft = D * G2_GGX(wo, wi, s.aS) * abs(dI * dO / (wo.z * denom * denom)) / (eta * eta);
+      cosM = dO;
+      pdfT = G1_GGX(wo, s.aS) * dO * D / wo.z * abs(dI) / (denom * denom);
+#endif
+    }
+    vec3 T3 = vec3(1.0 - fresnelDielectric(cosM, s.etaT));
+    if (s.tfW > 0.0) T3 = mix(T3, vec3(1.0) - thinFilmF(cosM, s.tfIor, s.tfThick, vec3(f0FromEta(s.etaT))), s.tfW);
+    fS = s.tBase * (1.0 - s.metal) * s.transW * s.transTint * T3 * ft;
+    return pt * pdfT;
+  }
+#endif
+
   vec3 h = normalize(wo + wi);
   float voh = sat(dot(wo, h));
   float pdf = 0.0;
 
   if (filt != 2 && s.metal < 1.0) {
     vec3 d = s.baseWeight * f_EON(sat3(s.baseColor), s.diffRough, wi, wo) * wi.z;
-    fD = s.tBase * (1.0 - s.metal) * (1.0 - s.EspecR3) * d;
+    fD = s.tBase * (1.0 - s.metal) * (1.0 - s.transW) * (1.0 - s.EspecR3) * d;
     pdf += p.x * pdf_EON(wo, wi, s.diffRough);
   }
   if (filt != 1) {
@@ -696,15 +802,27 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
   return pdf;
 }
 
+// Lobes in [0, 1): diffuse, base specular, coat, fuzz, transmission. Returns false when no direction results.
 bool sampleSurf(Surf s, vec3 wo, int filt, vec3 u, out vec3 wi) {
-  vec4 p = lobeProbs(s, filt);
-  if (u.z < p.x) wi = sample_EON(wo, s.diffRough, u.x, u.y);
-  else if (u.z < p.x + p.y + p.z) {
-    // Base specular or coat, through one call site (Direct3D inlines every call). The base specular on a flake
-    // is sampled in the flake's frame (see evalSurf) and brought back; otherwise the frame is the identity.
-    bool coat = u.z >= p.x + p.y;
+  float pt;
+  vec4 p = lobeProbs(s, filt, pt);
+  float cCoat = p.x + p.y + p.z, cFuzz = cCoat + p.w;
+#ifdef THIN
+  bool trans = u.z >= cFuzz && pt > 0.0;
+#else
+  const bool trans = false;
+#endif
+  if (u.z < p.x) {
+    wi = sample_EON(wo, s.diffRough, u.x, u.y);
+    return wi.z > 0.0;
+  }
+  if (u.z < cCoat || (trans && s.thin)) {
+    // Base specular, coat, or thin-walled transmission (the reflection mirrored through the surface), through one
+    // call site (Direct3D inlines every call). The base specular on a flake is sampled in the flake's frame (see
+    // evalSurf) and brought back; otherwise the frame is the identity.
+    bool coat = !trans && u.z >= p.x + p.y;
     vec3 b1 = vec3(1.0, 0.0, 0.0), b2 = vec3(0.0, 1.0, 0.0), b3 = vec3(0.0, 0.0, 1.0);
-    if (!coat && s.nf.z < 0.99999) {
+    if (!coat && !trans && s.nf.z < 0.99999) {
       onb(s.nf, b1, b2);
       b3 = s.nf;
     }
@@ -712,14 +830,28 @@ bool sampleSurf(Surf s, vec3 wo, int filt, vec3 u, out vec3 wi) {
     if (woS.z <= 0.0) return false;
     vec3 wiS = sampleGGXReflection_Bounded(u.xy, woS, coat ? s.aC : s.aS);
     wi = wiS.x * b1 + wiS.y * b2 + wiS.z * b3;
+    if (trans) wi.z = -wi.z;
+    return trans ? wi.z < 0.0 : wi.z > 0.0;
   }
-  else if (p.w > 0.0) wi = sampleFuzz(wo, s.fuzzRough, u.xy);
-  else return false;
-  return wi.z > 0.0;
+  if (u.z < cFuzz && p.w > 0.0) {
+    wi = sampleFuzz(wo, s.fuzzRough, u.xy);
+    return wi.z > 0.0;
+  }
+#ifdef GLASS
+  if (!trans) return false;
+  // Solid: refract through a visible microfacet normal (spherical caps). Total internal reflection yields no
+  // direction here; the reflection lobe carries that light.
+  vec3 m = sampleVNDF_SphericalCap(u.xy, wo, s.aS);
+  wi = refract(-wo, m, 1.0 / s.etaT);
+  return dot(wi, wi) > 0.0 && wi.z < 0.0;
+#else
+  return false;
+#endif
 }
 
 vec3 albedoAOV(Mat m) {
   vec3 a = mix(m.base_color * m.base_weight, m.base_color, m.base_metalness);
+  a = mix(a, m.transmission_color, m.transmission_weight * (1.0 - m.base_metalness));
   a *= mix(vec3(1.0), m.coat_color, m.coat_weight);
   return mix(a, m.fuzz_color, m.fuzz_weight);
 }
@@ -883,6 +1015,16 @@ uniform mat3 uModelRot;      // object to world rotation
 uniform vec3 uModelPos;
 uniform float uModelScale;
 uniform int uMaxNodeVisits;  // from a uniform so the traversal loop is never unrolled
+uniform int uThinSlot;       // the model's smooth thin-glass material slot, or -1
+
+// Transmittance of the model's thin glass (slot uThinSlot) at a crossing with cosine c: no film on it, so this
+// stays a few lines (shadow rays evaluate it inside the traversal).
+vec3 thinGlassT(float c) {
+  Mat g = uMat[4];
+  float T = 1.0 - fresnelDielectric(c, max(g.specular_ior, 1.0));
+  vec3 tint = g.transmission_depth > 0.0 ? vec3(1.0) : max(g.transmission_color, vec3(0.0));
+  return T * tint * sat(g.transmission_weight) * (1.0 - sat(g.base_metalness));
+}
 
 const int TEX_W_SHIFT = 11;  // textures are 2048 texels wide
 ivec2 texAt(int i) { return ivec2(i & 2047, i >> TEX_W_SHIFT); }
@@ -913,7 +1055,9 @@ const int BVH_STACK = 32;
 // node holds both children's boxes, so only entered children are visited, nearer first; the farther one waits on
 // the stack with its entry distance and is skipped if a closer hit has been found by then. One loop body handles
 // leaves and inner nodes, so the triangle test is compiled once.
-float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out vec2 bary) {
+// With anyHit (shadow rays), triangles in the thin-glass slot (uThinSlot) do not stop the ray: their
+// transmittance multiplies Tthin instead, in any order (it does not depend on the order of crossings).
+float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out vec2 bary, inout vec3 Tthin) {
   triHit = -1;
   bary = vec2(0.0);
   mat3 toObj = transpose(uModelRot);
@@ -969,6 +1113,13 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
         if (v < 0.0 || u + v > 1.0) continue;
         float t = dot(e2, qv) * inv;
         if (t > 0.0 && t < tBest) {
+#ifdef THIN
+          if (anyHit && uThinSlot >= 0 && int(texelFetch(uTriNrm, texAt(tri), 0).w) == uThinSlot) {
+            Tthin *= thinGlassT(abs(dot(normalize(cross(e1, e2)), normalize(d))));
+            if (maxc(Tthin) <= 0.0) return t;
+            continue;
+          }
+#endif
           tBest = t;
           triHit = tri;
           bary = vec2(u, v);
@@ -992,8 +1143,14 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
 }
 `
 
-function traceFrag(mesh: boolean) {
-  return /* glsl */ `${HEADER}${mesh ? '#define MESH 1\n' : ''}
+// Variants: MESH adds triangle meshes; GLASS adds transmission (refraction, absorption, dispersion, thin-walled
+// glass and shadows through it). Each costs seconds of compile time on Direct3D, so the lab compiles the plain
+// variant first and the others only when a scene needs them.
+// THIN is the cheaper subset for thin-walled glass only (car windows, a soap film): straight-through transmission
+// and shadows through it, without solid refraction, absorption or dispersion. GLASS includes it.
+export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' = 'none') {
+  const defs = `${mesh ? '#define MESH 1\n' : ''}${glass === 'full' ? '#define GLASS 1\n' : ''}${glass !== 'none' ? '#define THIN 1\n' : ''}`
+  return /* glsl */ `${HEADER}${defs}
 ${COMMON}
 ${MICROFACET}
 ${TABLE_CONSTS}
@@ -1021,6 +1178,8 @@ uniform float uIndirectClamp;
 uniform int uCyc;
 uniform float uCycZ;
 uniform float uCycR;
+// The scene has smooth thin-walled glass (a soap bubble, car windows): shadow rays pass through it, dimmed.
+uniform int uThinGlass;
 #ifdef MESH
 // Material slots: 0 gray ball, 1 chrome, 2 hero, 3 floor, 4-9 the model's other parts.
 uniform vec4 uBall[3]; // center, radius (0 = absent)
@@ -1074,7 +1233,8 @@ vec3 offsetRay(vec3 p, vec3 n) {
 }
 
 // n: shading normal; ng: geometric normal on the side the ray arrived from (they differ only on meshes).
-struct Hit { float t; vec3 n; vec3 ng; int mat; int light; };
+// back: the ray arrived from inside the object (only a transmissive material lets a path get there).
+struct Hit { float t; vec3 n; vec3 ng; int mat; int light; bool back; };
 
 // The cyc's back wall and sweep (the floor is the plane test in intersect()): nearest hit before tMax, with the
 // normal facing into the room, or -1. Also a shadow occluder: a key light dragged low and behind can end up
@@ -1118,16 +1278,20 @@ float intersectBall(vec3 ro, vec3 rd, vec4 s, float tMax) {
 
 Hit intersect(vec3 ro, vec3 rd, bool withLights) {
   Hit h;
-  h.t = 1e30; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n;
+  h.t = 1e30; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
 #ifdef MESH
   for (int i = 0; i < 3; i++) {
     vec4 s = uBall[i];
     float t = intersectBall(ro, rd, s, h.t);
-    if (t > 0.0) { h.t = t; h.n = normalize(ro + rd * t - s.xyz); h.ng = h.n; h.mat = i; }
+    if (t > 0.0) {
+      vec3 nOut = normalize(ro + rd * t - s.xyz);
+      h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = h.back ? -nOut : nOut; h.ng = h.n; h.mat = i;
+    }
   }
   int tri;
   vec2 bc;
-  float tm = traceMesh(ro, rd, h.t, false, tri, bc);
+  vec3 unusedT = vec3(1.0);
+  float tm = traceMesh(ro, rd, h.t, false, tri, bc, unusedT);
   if (tm > 0.0) {
     h.t = tm;
     uvec4 nn = texelFetch(uTriNrm, texAt(tri), 0);
@@ -1135,6 +1299,8 @@ Hit intersect(vec3 ro, vec3 rd, bool withLights) {
     vec3 e2 = texelFetch(uTriPos, texAt(3 * tri + 2), 0).xyz;
     vec3 ng = normalize(uModelRot * cross(e1, e2));
     vec3 ns = normalize(uModelRot * ((1.0 - bc.x - bc.y) * octDecode(nn.x) + bc.x * octDecode(nn.y) + bc.y * octDecode(nn.z)));
+    // Outside is where the authored vertex normals point (winding may vary between parts).
+    h.back = dot(rd, dot(ng, ns) < 0.0 ? -ng : ng) > 0.0;
     // Two-sided: both normals face the ray. An interpolated normal that would put the viewer below the surface
     // falls back to the facet's own.
     if (dot(ng, rd) > 0.0) ng = -ng;
@@ -1148,19 +1314,22 @@ Hit intersect(vec3 ro, vec3 rd, bool withLights) {
   for (int i = 0; i < 3; i++) {
     vec3 c = vec3(ballX(i), 1.0, 0.0);
     float t = intersectSphere(ro, rd, c, h.t);
-    if (t > 0.0) { h.t = t; h.n = normalize(ro + rd * t - c); h.ng = h.n; h.mat = i; }
+    if (t > 0.0) {
+      vec3 nOut = normalize(ro + rd * t - c);
+      h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = h.back ? -nOut : nOut; h.ng = h.n; h.mat = i;
+    }
   }
 #endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
     if (t > 0.0 && t < h.t && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) {
-      h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3;
+      h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3; h.back = false;
     }
   }
   if (uFurnace == 0 && uCyc == 1) {
     vec3 nc;
     float t = cycHit(ro, rd, h.t, nc);
-    if (t > 0.0) { h.t = t; h.n = nc; h.ng = nc; h.mat = 3; }
+    if (t > 0.0) { h.t = t; h.n = nc; h.ng = nc; h.mat = 3; h.back = false; }
   }
   if (withLights) {
     for (int k = 0; k < uNumLights; k++) {
@@ -1172,28 +1341,65 @@ Hit intersect(vec3 ro, vec3 rd, bool withLights) {
   return h;
 }
 
-bool occluded(vec3 ro, vec3 rd, float tMax) {
+// Smooth thin-walled transmission does not change a ray's direction, so light can be sampled straight through
+// it exactly: a shadow ray crossing such a surface is dimmed by its transmittance instead of blocked. (Paths that
+// cross one by BSDF sampling keep the previous vertex's MIS state; see the main loop.)
+bool smoothThin(Mat m) {
+  return m.geometry_thin_walled > 0.5 && m.transmission_weight > 0.0 && m.specular_roughness <= 0.01 && m.coat_weight <= 0.0;
+}
+#if !defined(MESH) && defined(THIN)
+// The hero ball as thin glass (the soap bubble): its transmittance at a crossing with cosine c, film included.
+vec3 thinPassT(Mat m, float c) {
+  float nd = max(m.specular_ior, 1.0);
+  vec3 T = vec3(1.0 - fresnelDielectric(c, nd));
+  if (m.thin_film_weight > 0.0 && m.thin_film_thickness > 0.0)
+    T = mix(T, vec3(1.0) - thinFilmF(c, m.thin_film_ior, m.thin_film_thickness, vec3(f0FromEta(nd))), sat(m.thin_film_weight));
+  vec3 tint = m.transmission_depth > 0.0 ? vec3(1.0) : max(m.transmission_color, vec3(0.0));
+  return T * tint * sat(m.transmission_weight) * (1.0 - sat(m.base_metalness));
+}
+#endif
+
+// Fraction of a light's radiance that reaches ro from tMax along rd: zero past anything opaque; through smooth
+// thin glass (uThinGlass: the hero ball, or the model's glass slot), dimmed at each crossing.
+vec3 shadowT(vec3 ro, vec3 rd, float tMax) {
+  vec3 T = vec3(1.0);
 #ifdef MESH
   for (int i = 0; i < 3; i++) {
-    if (intersectBall(ro, rd, uBall[i], tMax) > 0.0) return true;
+    if (intersectBall(ro, rd, uBall[i], tMax) > 0.0) return vec3(0.0);
   }
   int tri;
   vec2 bc;
-  if (traceMesh(ro, rd, tMax, true, tri, bc) > 0.0) return true;
+  if (traceMesh(ro, rd, tMax, true, tri, bc, T) > 0.0) return vec3(0.0);
 #else
   for (int i = 0; i < 3; i++) {
-    if (intersectSphere(ro, rd, vec3(ballX(i), 1.0, 0.0), tMax) > 0.0) return true;
+    vec3 c = vec3(ballX(i), 1.0, 0.0);
+#ifdef THIN
+    if (i == 2 && uThinGlass == 1) {
+      // Both crossings of the bubble within the segment.
+      vec3 f = ro - c;
+      float b = dot(f, rd), disc = b * b - (dot(f, f) - 1.0);
+      if (disc > 0.0) {
+        float sq = sqrt(disc);
+        for (int j = 0; j < 2; j++) {
+          float t = -b + (j == 0 ? -sq : sq);
+          if (t > 1e-4 && t < tMax) T *= thinPassT(uMat[2], abs(dot(rd, normalize(ro + rd * t - c))));
+        }
+      }
+      continue;
+    }
+#endif
+    if (intersectSphere(ro, rd, c, tMax) > 0.0) return vec3(0.0);
   }
 #endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
-    if (t > 0.0 && t < tMax && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) return true;
+    if (t > 0.0 && t < tMax && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) return vec3(0.0);
   }
   if (uFurnace == 0 && uCyc == 1) {
     vec3 nc;
-    if (cycHit(ro, rd, tMax, nc) > 0.0) return true;
+    if (cycHit(ro, rd, tMax, nc) > 0.0) return vec3(0.0);
   }
-  return false;
+  return T;
 }
 
 Mat getMat(int i) {
@@ -1220,6 +1426,7 @@ Mat getMat(int i) {
     m.specular_color = vec3(1.0);
     m.coat_color = vec3(1.0);
     m.fuzz_color = vec3(1.0);
+    m.transmission_color = vec3(1.0);
   }
   return m;
 }
@@ -1261,14 +1468,21 @@ void main() {
     float mask = 0.0;
     float prevPdf = 0.0;
     vec3 prevP = ro;
+    // Next-event estimation only samples lights on the incident side, so a light reached through a refraction had
+    // no light-sampling counterpart: it takes the full weight.
+    bool prevTrans = false;
+    // Dispersion: each path carries one color channel through dispersive glass, picked here and committed (with
+    // weight 3 on that channel) at its first refraction through such glass.
+    int chan = int(pcg(hashCombine(pixSeed, sampleIndex * 3u + 1u)) % 3u);
+    bool colored = false;
 
     for (int depth = 0; depth < uMaxBounces; depth++) {
       Hit h = intersect(ro, rd, depth > 0);
 
       if (h.light >= 0) {
         // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling.
-        float pl = lightPdf(h.light, prevP, rd, h.t);
-        vec3 c = beta * uLightRadiance[h.light] * powerHeuristic(prevPdf, pl);
+        float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.t));
+        vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
         L += depth >= 2 ? clampIndirect(c) : c;
         break;
       }
@@ -1283,6 +1497,15 @@ void main() {
       vec3 p = ro + rd * h.t;
       vec3 n = h.n;
       Mat m = getMat(h.mat);
+#ifdef GLASS
+      bool solidInside = h.back && m.transmission_weight > 0.0 && m.geometry_thin_walled < 0.5;
+      if (solidInside && m.transmission_depth > 0.0) {
+        // The segment just traced ran through the medium: Beer-Lambert with mu_t = -ln(color) / depth (spec).
+        beta *= exp(log(clamp(m.transmission_color, 1e-4, 1.0)) / m.transmission_depth * h.t);
+      }
+#else
+      const bool solidInside = false;
+#endif
 
       if (depth == 0) {
         mask = h.mat != 3 ? 1.0 : 0.0; // everything but the floor
@@ -1305,7 +1528,7 @@ void main() {
       }
       vec3 wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
       if (wo.z <= 1e-6) break;
-      Surf s = setupSurf(m, wo);
+      Surf s = setupSurf(m, wo, h.back, chan, colored);
 #ifdef MESH
       s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
 #else
@@ -1321,7 +1544,7 @@ void main() {
       for (int k = 0; k <= uNumLights; k++) {
         bool isLight = k < uNumLights;
         if (!isLight && last) break; // the continuation ray from the last vertex is never traced
-        if (isLight && !lightOn(k)) continue;
+        if (isLight && (!lightOn(k) || solidInside)) continue; // from inside a solid, every light is behind its wall
         vec4 u = sample4(sampleIndex, pixSeed, depth, k);
         vec3 dirW, wi;
         float ldist = 0.0, lpdf = 0.0;
@@ -1338,10 +1561,11 @@ void main() {
         vec3 f = fD + fS;
         if (isLight) {
           if (maxc(f) <= 0.0) continue;
-          if (occluded(po, dirW, ldist * (1.0 - 1e-4))) continue;
+          vec3 Tsh = shadowT(po, dirW, ldist * (1.0 - 1e-4));
+          if (maxc(Tsh) <= 0.0) continue;
           // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
           float wl = last ? 1.0 : powerHeuristic(lpdf, bpdf);
-          vec3 c = beta * f * uLightRadiance[k] * (wl / lpdf);
+          vec3 c = beta * Tsh * f * uLightRadiance[k] * (wl / lpdf);
           L += depth >= 1 ? clampIndirect(c) : c;
         } else {
           if (bpdf <= 0.0) break;
@@ -1352,10 +1576,28 @@ void main() {
             if (u.w >= q) break;
             beta /= q;
           }
-          prevPdf = bpdf;
-          prevP = po;
+          // A refracted path leaves from the far side of the surface.
+          bool through = wi.z < 0.0;
+#ifdef GLASS
+          if (through && !colored && disperses(m)) {
+            colored = true;
+            beta *= 3.0 * vec3(chan == 0 ? 1.0 : 0.0, chan == 1 ? 1.0 : 0.0, chan == 2 ? 1.0 : 0.0);
+          }
+#endif
+          ro = through ? offsetRay(p, -h.ng) : po;
+#ifdef THIN
+          // Straight through smooth thin glass, the path keeps the previous vertex's MIS state: shadow rays from
+          // that vertex already sample lights through the glass (shadowT).
+          bool passed = through && s.thin && uThinGlass == 1 && smoothThin(m);
+#else
+          const bool passed = false;
+#endif
+          if (!passed) {
+            prevPdf = bpdf;
+            prevTrans = through;
+            prevP = ro;
+          }
           rd = dirW;
-          ro = po;
           continued = true;
         }
       }

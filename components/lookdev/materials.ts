@@ -24,6 +24,12 @@ export interface OpenPBR {
   thin_film_weight: number
   thin_film_thickness: number // micrometers
   thin_film_ior: number
+  transmission_weight: number
+  transmission_color: RGB
+  transmission_depth: number // scene units; 0 = no medium, the color tints the refraction instead
+  transmission_dispersion_scale: number
+  transmission_dispersion_abbe_number: number
+  geometry_thin_walled: number // 0 or 1 (a boolean in OpenPBR)
   // Lab extension, not part of OpenPBR 1.1: metallic flakes in the base layer, under the coat. A flake is a cell
   // of a 3D grid (lab_flake_size world units) present with probability lab_flake_coverage, whose normal is tilted
   // by up to lab_flake_tilt (the tangent of the cone angle); it tilts the base specular lobe only.
@@ -53,6 +59,12 @@ export const MATERIAL_FIELDS = [
   'thin_film_weight',
   'thin_film_thickness',
   'thin_film_ior',
+  'transmission_weight',
+  'transmission_color',
+  'transmission_depth',
+  'transmission_dispersion_scale',
+  'transmission_dispersion_abbe_number',
+  'geometry_thin_walled',
   'lab_flake_coverage',
   'lab_flake_size',
   'lab_flake_tilt',
@@ -80,6 +92,12 @@ export const OPENPBR_DEFAULTS: OpenPBR = {
   thin_film_weight: 0,
   thin_film_thickness: 0.5,
   thin_film_ior: 1.4,
+  transmission_weight: 0,
+  transmission_color: [1, 1, 1],
+  transmission_depth: 0,
+  transmission_dispersion_scale: 0,
+  transmission_dispersion_abbe_number: 20,
+  geometry_thin_walled: 0,
   lab_flake_coverage: 0,
   lab_flake_size: 0.012,
   lab_flake_tilt: 0.3,
@@ -113,10 +131,13 @@ export const STAGES: Record<Stage, { label: string; cyc: boolean; material: Open
   gray: { label: 'Gray cyc', cyc: true, material: SCENE_MATERIALS.grayCyc },
 }
 
-export type Hero = 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium'
+export type Hero =
+  | 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium' | 'glass' | 'diamond' | 'soapbubble'
 type RoughnessParam = 'specular_roughness' | 'fuzz_roughness' | 'coat_roughness'
 
-export const HERO_ORDER: Hero[] = ['carpaint', 'gold', 'brushed', 'titanium', 'velvet', 'thinfilm', 'plastic']
+export const HERO_ORDER: Hero[] = [
+  'carpaint', 'gold', 'brushed', 'titanium', 'glass', 'diamond', 'soapbubble', 'velvet', 'thinfilm', 'plastic',
+]
 
 export interface HeroPreset {
   label: string
@@ -217,6 +238,48 @@ export const HERO_PRESETS: Record<Hero, HeroPreset> = {
       thin_film_weight: 1,
       thin_film_thickness: 0.06,
       thin_film_ior: 2.4,
+    }),
+  },
+  // Official: examples/open_pbr_glass.mtlx (crown glass: IOR 1.52, Abbe number 64). Raise the roughness slider
+  // for frosted glass.
+  glass: {
+    label: 'Glass',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      specular_ior: 1.52,
+      transmission_weight: 1,
+      transmission_dispersion_scale: 1,
+      transmission_dispersion_abbe_number: 64,
+    }),
+  },
+  // Official: examples/open_pbr_diamond.mtlx (IOR 2.42, Abbe number 55.3): its fire is the dispersion.
+  diamond: {
+    label: 'Diamond',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      specular_ior: 2.42,
+      transmission_weight: 1,
+      transmission_dispersion_scale: 1,
+      transmission_dispersion_abbe_number: 55.3,
+    }),
+  },
+  // Official: examples/open_pbr_soapbubble.mtlx. Thin-walled, IOR 1, so every color comes from the film.
+  soapbubble: {
+    label: 'Soap bubble',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      specular_ior: 1,
+      transmission_weight: 1,
+      thin_film_weight: 1,
+      thin_film_thickness: 0.5,
+      thin_film_ior: 1.4,
+      geometry_thin_walled: 1,
     }),
   },
 }

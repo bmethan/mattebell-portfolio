@@ -421,11 +421,11 @@ export default function LookdevLab() {
             </div>
             <div className="lab-hud lab-hud-right">
               {status.model === 'failed' ? (
-                `The ${model?.label.toLowerCase() ?? 'model'} could not load`
+                model ? `The ${model.label.toLowerCase()} could not load` : 'The shaders for this scene failed to compile'
               ) : status.model === 'loading' ? (
                 <>
                   <WorkIndicator className="lab-work" />
-                  Loading the {model?.label.toLowerCase()}
+                  {status.waitingFor === 'model' && model ? `Loading the ${model.label.toLowerCase()}` : 'Compiling shaders'}
                 </>
               ) : (
                 <>
@@ -628,7 +628,9 @@ export default function LookdevLab() {
         )}
         <p className="lab-note" style={{ width: '100%', margin: '0 0 4px' }}>
           Rendered in ACEScg. With multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of
-          1.0 in a white furnace test. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%.
+          1.0 in a white furnace test. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%. Rough
+          glass is not yet compensated for multiple scattering and loses energy (5% at roughness 0.2, 17% at 0.4
+          through a solid ball). Dispersion uses one wavelength per color channel.
         </p>
         <span className="lab-label">Methods</span>
         <ul>

@@ -1,4 +1,4 @@
-import { VERT, E_TABLE_FRAG, TRACE_FRAG, TRACE_FRAG_MESH, DISPLAY_FRAG } from './shaders'
+import { VERT, E_TABLE_FRAG, TRACE_FRAG, DISPLAY_FRAG, traceFrag } from './shaders'
 import { kelvinToACEScg } from './color'
 import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, heroParams, type OpenPBR, type Hero, type PaintFinish, type Stage } from './materials'
 import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
@@ -82,7 +82,28 @@ export interface LabStatus {
   converged: boolean
   preview: boolean // a proxy-resolution preview is on screen while the scene changes
   ms: number // render time of the current image: time spent rendering since the last change, pauses excluded
-  model: 'ready' | 'loading' | 'failed' // the picked model's file and the mesh renderer
+  model: 'ready' | 'loading' | 'failed' // the picked model's file and the shader variant the scene needs
+  waitingFor?: 'model' | 'shaders' // while loading: the model's file, or only the variant's compile
+}
+
+// The tracer variant a scene needs: meshes for a model; full glass for a solid transmissive hero; the cheaper thin
+// glass for thin-walled transmission (a model's windows). On the balls any glass hero takes the full variant,
+// which is compiled ahead while the lab is in view.
+type VariantKey = 'base' | 'base+glass' | 'mesh' | 'mesh+thin' | 'mesh+glass'
+function variantOf(s: LabState): VariantKey {
+  const hero = heroMaterial(s)
+  const heroGlass = hero.transmission_weight > 0
+  const heroSolid = heroGlass && hero.geometry_thin_walled < 0.5
+  if (s.model === 'spheres') return heroGlass ? 'base+glass' : 'base'
+  if (heroSolid) return 'mesh+glass'
+  return heroGlass || MODELS[s.model].thinGlass ? 'mesh+thin' : 'mesh'
+}
+const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full'> = {
+  base: 'none',
+  'base+glass': 'full',
+  mesh: 'none',
+  'mesh+thin': 'thin',
+  'mesh+glass': 'full',
 }
 
 interface MeshGPU {
@@ -260,10 +281,9 @@ export class LookdevEngine {
   private progTrace: WebGLProgram
   private progDisplay: WebGLProgram
   private progTable: WebGLProgram
-  // The mesh variant of the tracer, compiled the first time a model is picked, and each model's textures.
-  private progMesh: WebGLProgram | null = null
-  private meshCompiled = false
-  private meshFailed = false
+  // Tracer variants beyond the plain one (progTrace), compiled the first time a scene needs them, and each
+  // model's textures.
+  private variants = new Map<VariantKey, { prog: WebGLProgram; ready: boolean; failed: boolean }>()
   private meshes = new Map<Model, MeshGPU>()
   private meshLoading = new Set<Model>()
   private meshLoadFailed = new Set<Model>()
@@ -420,32 +440,37 @@ export class LookdevEngine {
   }
 
   // ------------------------------------------------------------------------------------------------------------
-  // Models: the mesh tracer compiles in the background the first time one is picked (polled, like the main one),
-  // and each model's file is fetched once and kept on the GPU.
+  // Variants and models: a tracer variant compiles in the background the first time a scene needs it (polled,
+  // like the main one), and each model's file is fetched once and kept on the GPU.
   // ------------------------------------------------------------------------------------------------------------
   private ensureModel() {
+    if (this.disposed || !this.live) return
+    this.ensureVariant(variantOf(this.state))
     const model = this.state.model
-    if (model === 'spheres' || this.disposed || !this.live) return
-    if (!this.progMesh) {
-      this.progMesh = startProgram(this.gl, TRACE_FRAG_MESH)
-      this.compileMesh(this.progMesh)
-    }
+    if (model === 'spheres') return
     if (!this.meshes.has(model) && !this.meshLoading.has(model) && !this.meshLoadFailed.has(model)) this.loadMesh(model)
   }
 
-  private async compileMesh(p: WebGLProgram) {
+  private ensureVariant(key: VariantKey) {
+    if (key === 'base' || this.variants.has(key) || this.disposed || !this.live) return
+    const v = { prog: startProgram(this.gl, traceFrag(key.startsWith('mesh'), VARIANT_GLASS[key])), ready: false, failed: false }
+    this.variants.set(key, v)
+    this.compileVariant(v)
+  }
+
+  private async compileVariant(v: { prog: WebGLProgram; ready: boolean; failed: boolean }) {
     const gl = this.gl
     for (;;) {
       await sleep(this.parallel ? 50 : 0)
       if (this.disposed || gl.isContextLost()) return
-      if (!this.parallel || gl.getProgramParameter(p, COMPLETION_STATUS_KHR)) break
+      if (!this.parallel || gl.getProgramParameter(v.prog, COMPLETION_STATUS_KHR)) break
     }
     try {
-      finishProgram(gl, p)
-      this.meshCompiled = true
+      finishProgram(gl, v.prog)
+      v.ready = true
     } catch (err) {
       console.error(err)
-      this.meshFailed = true
+      v.failed = true
     }
     this.kick()
     this.reportModel()
@@ -485,20 +510,29 @@ export class LookdevEngine {
     this.reportModel()
   }
 
-  private modelStatus(): LabStatus['model'] {
+  // What the scene still waits for: its model's file (which also covers a compile running alongside), or only
+  // its tracer variant's compile.
+  private waitingFor(): LabStatus['waitingFor'] {
     const model = this.state.model
-    if (model === 'spheres') return 'ready'
-    if (this.meshFailed || this.meshLoadFailed.has(model)) return 'failed'
-    return this.meshCompiled && this.meshes.has(model) ? 'ready' : 'loading'
+    if (model !== 'spheres' && !this.meshes.has(model)) return 'model'
+    const key = variantOf(this.state)
+    return key === 'base' || this.variants.get(key)?.ready ? undefined : 'shaders'
   }
 
-  // While a model loads, say so (the frame keeps the previous image until the first preview lands), and say when
-  // it is ready even if no frame has run since (the lab may be scrolled away).
+  private modelStatus(): LabStatus['model'] {
+    const model = this.state.model
+    const v = this.variants.get(variantOf(this.state))
+    if (v?.failed || (model !== 'spheres' && this.meshLoadFailed.has(model))) return 'failed'
+    return this.waitingFor() ? 'loading' : 'ready'
+  }
+
+  // While a model loads or a variant compiles, say so (the frame keeps the previous image until the first preview
+  // lands), and say when it is ready even if no frame has run since (the lab may be scrolled away).
   private reportModel() {
     if (!this.active) return
     const model = this.modelStatus()
     if (model !== 'ready') {
-      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model })
+      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model, waitingFor: this.waitingFor() })
       return
     }
     const converged = this.spp >= this.goal
@@ -506,7 +540,8 @@ export class LookdevEngine {
   }
 
   private traceProg() {
-    return this.state.model === 'spheres' ? this.progTrace : this.progMesh!
+    const key = variantOf(this.state)
+    return key === 'base' ? this.progTrace : this.variants.get(key)!.prog
   }
 
   // World points under each labelled object: the two reference balls and the hero (ball or model).
@@ -675,9 +710,10 @@ export class LookdevEngine {
     this.previewDirty = true
     this.gen++
     this.lastChange = performance.now()
-    if (patch.model) this.ensureModel()
+    // Any change may need another variant (a glass hero) or a model.
+    this.ensureModel()
     this.reset()
-    if (patch.model) this.reportModel()
+    if (this.modelStatus() !== 'ready' || patch.model) this.reportModel()
   }
 
   setInteracting(on: boolean) {
@@ -686,6 +722,9 @@ export class LookdevEngine {
 
   setVisible(v: boolean) {
     this.visible = v
+    // Someone is looking at the lab: compile the glass variant in the background (off the page's thread), so a
+    // click on a glass hero usually finds it ready.
+    if (v) this.ensureVariant('base+glass')
     if (v) this.kick()
     else this.stop()
   }
@@ -805,10 +844,16 @@ export class LookdevEngine {
 
     // Materials: 0 gray card, 1 chromium, 2 hero, 3 floor; with a model, 4-9 dress its other parts.
     const stage = STAGES[s.stage]
+    // Smooth thin-walled glass in the scene (the hero, or the car's windows): shadow rays then pass through it
+    // (shadowT in the tracer); otherwise they keep the cheaper any-hit test.
+    const hero = heroMaterial(s)
+    const smoothThin = (m: OpenPBR) => m.geometry_thin_walled > 0.5 && m.transmission_weight > 0 && m.specular_roughness <= 0.01 && m.coat_weight <= 0
+    const thinGlass = smoothThin(hero) || (s.model !== 'spheres' && MODELS[s.model].thinGlass && MESH_MATERIALS.some(smoothThin))
+    gl.uniform1i(L('uThinGlass'), thinGlass ? 1 : 0)
     gl.uniform1i(L('uCyc'), stage.cyc ? 1 : 0)
     gl.uniform1f(L('uCycZ'), CYC_Z)
     gl.uniform1f(L('uCycR'), CYC_R)
-    const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, heroMaterial(s), stage.material]
+    const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, hero, stage.material]
 
     if (s.model === 'spheres') {
       gl.uniform3fv(L('uBallX'), BALL_X)
@@ -821,6 +866,8 @@ export class LookdevEngine {
       gl.uniform3fv(L('uModelPos'), [0, 0, 0])
       gl.uniform1f(L('uModelScale'), MODELS[s.model].scale)
       gl.uniform1i(L('uMaxNodeVisits'), MAX_NODE_VISITS)
+      // Slot 4 (MESH_MATERIALS[0]) is the glass; shadow rays pass through it when the model uses it.
+      gl.uniform1i(L('uThinSlot'), MODELS[s.model].thinGlass && smoothThin(MESH_MATERIALS[0]) ? 4 : -1)
       gl.uniform1i(L('uBvh'), 2)
       gl.uniform1i(L('uTriPos'), 3)
       gl.uniform1i(L('uTriNrm'), 4)
@@ -1218,7 +1265,8 @@ export class LookdevEngine {
     gl.deleteTexture(this.eTable)
     gl.deleteTexture(this.acesLut)
     gl.deleteProgram(this.progTrace)
-    if (this.progMesh) gl.deleteProgram(this.progMesh)
+    this.variants.forEach(v => gl.deleteProgram(v.prog))
+    this.variants.clear()
     this.meshes.forEach(m => [m.bvh, m.pos, m.nrm].forEach(t => gl.deleteTexture(t)))
     this.meshes.clear()
     gl.deleteProgram(this.progDisplay)

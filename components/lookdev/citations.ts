@@ -103,6 +103,15 @@ export const CITATIONS: Citation[] = [
     url: 'https://jcgt.org/published/0003/02/03/',
   },
   {
+    id: 'walter',
+    short: 'Rough refraction',
+    authors: 'Bruce Walter, Stephen R. Marschner, Hongsong Li, Kenneth E. Torrance',
+    title: 'Microfacet Models for Refraction through Rough Surfaces',
+    venue: 'Eurographics Symposium on Rendering',
+    year: '2007',
+    url: 'https://www.graphics.cornell.edu/~bjw/microfacetbsdf.pdf',
+  },
+  {
     id: 'sah',
     short: 'Binned SAH BVH',
     authors: 'Ingo Wald',

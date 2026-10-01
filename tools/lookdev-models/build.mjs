@@ -91,8 +91,8 @@ function readPly(file) {
 // ---------------------------------------------------------------------------------------------------------------
 // Sports Car (Yasutoshi Mori, CC BY 4.0), from github.com/mmp/pbrt-v4-scenes/sportscar.
 // ---------------------------------------------------------------------------------------------------------------
-// Each pbrt material onto a lab slot, or null to leave the part out: the cabin sits behind opaque, reflection-only
-// glass and never shows, and the small lamp covers are dropped so the reflectors behind them read.
+// Each pbrt material onto a lab slot, or null to leave the part out: the small lamp covers are dropped so the
+// reflectors behind them read. The windows are thin-walled glass, so the cabin shows through them.
 const CAR_MATERIALS = {
   BodyMat_phong_SG: SLOT.hero,
   WindowGlassMat_phong_SG: SLOT.glass,
@@ -130,17 +130,17 @@ const CAR_MATERIALS = {
   HeadLightBK_Mat_phong_SG: SLOT.plastic,
   HeadLight_LED_phong_SG: SLOT.plastic,
   // Cabin
-  Interior_White_phong_SG: null,
-  Interior_Silver_phong_SG: null,
-  Interior_Black_phong_SG: null,
-  Interior_Red_phong_SG: null,
-  Interior_GlossBlack_phong_SG: null,
-  Interior_Monitor_phong_SG: null,
-  Interior_LineColor_phong_SG: null,
-  Interior_GomBlackq_phong_SG: null,
-  Seat_Black_phong_SG: null,
-  SeatColor_phong_SG: null,
-  PedalsSilver_mat_SG: null,
+  Interior_White_phong_SG: SLOT.plastic,
+  Interior_Silver_phong_SG: SLOT.chrome,
+  Interior_Black_phong_SG: SLOT.trim,
+  Interior_Red_phong_SG: SLOT.lamp,
+  Interior_GlossBlack_phong_SG: SLOT.trim,
+  Interior_Monitor_phong_SG: SLOT.trim,
+  Interior_LineColor_phong_SG: SLOT.plastic,
+  Interior_GomBlackq_phong_SG: SLOT.rubber,
+  Seat_Black_phong_SG: SLOT.rubber,
+  SeatColor_phong_SG: SLOT.plastic,
+  PedalsSilver_mat_SG: SLOT.aluminum,
 }
 
 function loadSportsCar(dir) {

@@ -9,6 +9,8 @@ export interface ModelInfo {
   url: string
   // World size of the model's longest horizontal side (the files are normalized to 1).
   scale: number
+  // Has parts in the glass slot (thin-walled), so shadow rays must pass through them.
+  thinGlass: boolean
   credit: { text: string; source: string; license: string; licenseUrl: string }
 }
 
@@ -17,10 +19,11 @@ export const MODEL_ORDER: Model[] = ['spheres', 'sportscar', 'teapot']
 export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
   sportscar: {
     label: 'Sports car',
-    url: '/lookdev/models/sportscar.bin.gz?v=2', // bump with each rebuild so caches fetch the new file
+    url: '/lookdev/models/sportscar.bin.gz?v=3', // bump with each rebuild so caches fetch the new file
     scale: 4.5,
+    thinGlass: true,
     credit: {
-      text: 'Sports Car by Yasutoshi Mori, from the pbrt-v4 scenes. Reduced to 161k triangles and rematerialed in OpenPBR for the lab.',
+      text: 'Sports Car by Yasutoshi Mori, from the pbrt-v4 scenes. Reduced to 184k triangles and rematerialed in OpenPBR for the lab.',
       source: 'https://github.com/mmp/pbrt-v4-scenes',
       license: 'CC BY 4.0',
       licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
@@ -30,6 +33,7 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
     label: 'Utah teapot',
     url: '/lookdev/models/teapot.bin.gz?v=2',
     scale: 3.6,
+    thinGlass: false,
     credit: {
       // The model's terms ask that it be identified as the Utah Teapot and its origin at the University of Utah
       // acknowledged.
@@ -53,8 +57,15 @@ const mat = (p: Partial<OpenPBR>): OpenPBR => ({ ...OPENPBR_DEFAULTS, ...p })
 
 // Slots 4-9 (slots 1 and 2 are the scene's chrome and hero). All authored for the lab, in ACEScg.
 export const MESH_MATERIALS: OpenPBR[] = [
-  // 4 Glass: reflection only, so the cabin behind it stays dark, the way tinted glass reads on a turntable.
-  mat({ base_weight: 0, specular_roughness: 0, specular_ior: 1.5 }),
+  // 4 Glass: thin-walled (windows are sheets; light passes straight through), with the faint green of
+  // automotive glass as a tint at each pass.
+  mat({
+    specular_roughness: 0,
+    specular_ior: 1.5,
+    transmission_weight: 1,
+    transmission_color: [0.86, 0.92, 0.89],
+    geometry_thin_walled: 1,
+  }),
   // 5 Rubber: tires and seals.
   mat({ base_color: [0.025, 0.025, 0.026], base_diffuse_roughness: 0.6, specular_weight: 0.6, specular_roughness: 0.6 }),
   // 6 Gloss black trim.

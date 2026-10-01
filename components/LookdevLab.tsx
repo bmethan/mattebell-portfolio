@@ -11,7 +11,7 @@ import {
   type Pass,
   type View,
 } from './lookdev/engine'
-import { HERO_PRESETS, HERO_ORDER } from './lookdev/materials'
+import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
 import { MODELS, MODEL_ORDER } from './lookdev/models'
 import { CITATIONS } from './lookdev/citations'
 import WorkIndicator from './WorkIndicator'
@@ -336,11 +336,19 @@ export default function LookdevLab() {
   }
 
   const hero = HERO_PRESETS[lab.hero]
-  const heroRough = lab.heroRoughness ?? hero.params[hero.roughnessParam]
+  const heroBase = heroParams(lab.hero, lab.paint, lab.flakes)
+  const heroRough = lab.heroRoughness ?? heroBase[hero.roughnessParam]
+  const brushed = heroBase.specular_roughness_anisotropy > 0
+  const heroAniso = lab.heroAniso ?? heroBase.specular_roughness_anisotropy
+  const flaked = lab.hero === 'carpaint' && paintHasFlakes(lab.paint, lab.flakes)
+  const heroName =
+    lab.hero === 'carpaint' && lab.paint !== 'solid'
+      ? `${PAINT_FINISHES[lab.paint].label}${flaked ? ' flake' : ''} car paint`
+      : hero.label
   const markerX = (lab.keyAz / AZ_RANGE + 0.5) * 100
   const markerY = ((EL_MAX - lab.keyEl) / ((EL_MAX - EL_MIN) * 1.1)) * 100
   const model = lab.model === 'spheres' ? null : MODELS[lab.model]
-  const ballNames = ['18% gray', 'Chrome', model ? `${model.label}, ${hero.label.toLowerCase()}` : hero.label]
+  const ballNames = ['18% gray', 'Chrome', model ? `${model.label}, ${heroName.toLowerCase()}` : heroName]
 
   return (
     <section ref={sectionRef} id="lab" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
@@ -479,12 +487,31 @@ export default function LookdevLab() {
             </Group>
             <Group label="Hero">
               {HERO_ORDER.map(h => (
-                <Pill key={h} on={lab.hero === h} onClick={() => update({ hero: h, heroRoughness: null })}>
+                <Pill key={h} on={lab.hero === h} onClick={() => update({ hero: h, heroRoughness: null, heroAniso: null })}>
                   {HERO_PRESETS[h].label}
                 </Pill>
               ))}
             </Group>
           </div>
+
+          {lab.hero === 'carpaint' && (
+            <div className="lab-row">
+              <Group label="Finish">
+                {PAINT_ORDER.map(f => (
+                  <Pill key={f} on={lab.paint === f} onClick={() => update({ paint: f, heroRoughness: null })}>
+                    {PAINT_FINISHES[f].label}
+                  </Pill>
+                ))}
+              </Group>
+              {lab.paint !== 'solid' && (
+                <Group label="Flakes">
+                  <Pill on={lab.flakes} onClick={() => update({ flakes: !lab.flakes, heroRoughness: null })}>
+                    Flakes {lab.flakes ? 'on' : 'off'}
+                  </Pill>
+                </Group>
+              )}
+            </div>
+          )}
 
           <div className="lab-row">
             <Group label="Key temp">
@@ -523,6 +550,19 @@ export default function LookdevLab() {
               />
               <span className="lab-readout">{heroRough.toFixed(2)}</span>
             </Group>
+            {brushed && (
+              <Group label="Brushing">
+                <Range
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={heroAniso}
+                  label="Brushing, specular roughness anisotropy"
+                  onChange={v => update({ heroAniso: v })}
+                />
+                <span className="lab-readout">{heroAniso.toFixed(2)}</span>
+              </Group>
+            )}
           </div>
 
           <div className="lab-row">
@@ -580,8 +620,8 @@ export default function LookdevLab() {
           </p>
         )}
         <p className="lab-note" style={{ width: '100%', margin: '0 0 4px' }}>
-          Rendered in ACEScg. With multiple-scattering compensation on, every preset averages within 0.02% of 1.0 in a
-          white furnace test.
+          Rendered in ACEScg. With multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of
+          1.0 in a white furnace test. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%.
         </p>
         <span className="lab-label">Methods</span>
         <ul>

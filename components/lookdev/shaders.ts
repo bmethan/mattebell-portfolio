@@ -504,10 +504,12 @@ vec3 thinFilmF(float cosTheta, float filmIor, float thicknessUm, vec3 baseF0) {
 const OPENPBR = /* glsl */ `
 struct Mat {
   float base_weight; vec3 base_color; float base_metalness; float base_diffuse_roughness;
-  float specular_weight; vec3 specular_color; float specular_roughness; float specular_ior;
+  float specular_weight; vec3 specular_color; float specular_roughness; float specular_roughness_anisotropy;
+  float specular_ior;
   float coat_weight; vec3 coat_color; float coat_roughness; float coat_ior; float coat_darkening;
   float fuzz_weight; vec3 fuzz_color; float fuzz_roughness;
   float thin_film_weight; float thin_film_thickness; float thin_film_ior;
+  float lab_flake_coverage; float lab_flake_size; float lab_flake_tilt; // lab extension (see materials.ts)
 };
 
 struct Surf {
@@ -522,6 +524,7 @@ struct Surf {
   vec3 EspecR3; // per-channel specular albedo that attenuates the diffuse (colored when a thin film is present)
   vec3 tBase;   // everything multiplying f_base below fuzz and coat
   vec4 p;       // lobe selection weights: diffuse, base specular, coat, fuzz
+  vec3 nf;      // flake normal in the shading frame, (0, 0, 1) off the flakes; tilts the base specular only
 };
 
 uniform sampler3D uETable;
@@ -569,7 +572,14 @@ Surf setupSurf(Mat m, vec3 wo) {
   s.tfThick = m.thin_film_thickness;
   s.tfIor = m.thin_film_ior;
   s.specRough = openpbrCoatedSpecRoughness(sat(m.specular_roughness), s.coatRough, s.coatW);
-  s.aS = vec2(max(s.specRough * s.specRough, 1e-4));
+  // Anisotropy (spec, Specular > Roughness anisotropy): alpha_t = r^2 sqrt(2 / (1 + (1 - a)^2)), alpha_b =
+  // (1 - a) alpha_t, along the tangent (x) and bitangent (y) of the shading frame. At a = 0 both are r^2.
+  float aniso = sat(m.specular_roughness_anisotropy);
+  float alphaT = s.specRough * s.specRough * sqrt(2.0 / (1.0 + sq(1.0 - aniso)));
+  s.aS = max(vec2(alphaT, (1.0 - aniso) * alphaT), vec2(1e-4));
+  // The albedo tables are isotropic: an anisotropic lobe looks them up at the roughness of its mean alpha.
+  float rTable = aniso > 0.0 ? sqrt(sqrt(s.aS.x * s.aS.y)) : s.specRough;
+  s.nf = vec3(0.0, 0.0, 1.0);
   s.aC = vec2(max(s.coatRough * s.coatRough, 1e-4));
   s.eta = openpbrSpecularEta(max(m.specular_ior, 1.0), s.coatIor, s.coatW, s.specW);
 
@@ -578,7 +588,7 @@ Surf setupSurf(Mat m, vec3 wo) {
   vec3 F0m = s.baseWeight * s.baseColor;
 
   // textureLod: implicit-derivative fetches inside loops force Direct3D to unroll them.
-  vec3 tS = textureLod(uETable, eTableCoord(mu, s.specRough, s.eta), 0.0).rgb;
+  vec3 tS = textureLod(uETable, eTableCoord(mu, rTable, s.eta), 0.0).rgb;
   float Ess = max(tS.r, 1e-4);
   s.compD = ms ? 1.0 + tS.b * (1.0 - Ess) / Ess : 1.0;
   s.compM = ms ? 1.0 + favgF82Tint(F0m, s.specColor) * (1.0 - Ess) / Ess : vec3(1.0);
@@ -636,18 +646,41 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
     pdf += p.x * pdf_EON(wo, wi, s.diffRough);
   }
   if (filt != 1) {
-    float g = G2_GGX(wo, wi, s.aS) * D_GGX(h, s.aS) / (4.0 * wo.z);
-    vec3 Fd = s.specColor * fresnelDielectric(voh, s.eta) * s.compD;
-    vec3 Fm = s.specW * fresnelF82Tint(voh, s.baseWeight * s.baseColor, s.specColor) * s.compM;
-    if (s.tfW > 0.0) {
-      // One interference evaluation, with the base reflectance blended by metalness (exact for the pure
-      // dielectric and pure metal cases, and it keeps a single inlined copy of the film code).
-      vec3 Ftf = thinFilmF(voh, s.tfIor, s.tfThick, mix(vec3(f0FromEta(s.eta)), s.baseWeight * s.baseColor, s.metal));
-      Fd = mix(Fd, s.specColor * Ftf * s.compD, s.tfW);
-      Fm = mix(Fm, s.specW * Ftf * s.compM, s.tfW);
+    // On a flake, the base specular lobe sits on the flake's tilted normal: evaluate it in the flake's frame (the
+    // half vector's angle to the view, and so the Fresnel, does not change), with the macro cosine for the
+    // rendering equation. Off the flakes, the frames coincide.
+    vec3 woS = wo, wiS = wi, hS = h;
+    bool flaked = s.nf.z < 0.99999;
+    if (flaked) {
+      vec3 b1, b2;
+      onb(s.nf, b1, b2);
+      woS = vec3(dot(wo, b1), dot(wo, b2), dot(wo, s.nf));
+      wiS = vec3(dot(wi, b1), dot(wi, b2), dot(wi, s.nf));
+      hS = normalize(woS + wiS);
     }
-    fS += s.tBase * mix(Fd, Fm, s.metal) * g;
-    pdf += p.y * pdfGGXReflection_Bounded(wo, wi, s.aS);
+    if (woS.z > 0.0 && wiS.z > 0.0) {
+      float g = G2_GGX(woS, wiS, s.aS) * D_GGX(hS, s.aS) / (4.0 * woS.z);
+      if (flaked) g *= wi.z / wiS.z;
+      vec3 Fd = s.specColor * fresnelDielectric(voh, s.eta) * s.compD;
+      vec3 Fm = s.specW * fresnelF82Tint(voh, s.baseWeight * s.baseColor, s.specColor) * s.compM;
+      if (s.tfW > 0.0) {
+        // The film over each substrate it can sit on: the dielectric, the metal, or both when metalness is
+        // partial (then exact too, where one evaluation over a metalness-blended substrate lost energy: 0.89 in
+        // the furnace for a 30% metal pearl). A loop keeps a single inlined copy of the film code.
+        vec3 FtfD = vec3(0.0), FtfM = vec3(0.0);
+        int subs = s.metal > 0.0 && s.metal < 1.0 ? 2 : 1;
+        for (int k = 0; k < subs; k++) {
+          bool overMetal = subs == 2 ? k == 1 : s.metal >= 1.0;
+          vec3 f = thinFilmF(voh, s.tfIor, s.tfThick, overMetal ? s.baseWeight * s.baseColor : vec3(f0FromEta(s.eta)));
+          if (overMetal) FtfM = f;
+          else FtfD = f;
+        }
+        Fd = mix(Fd, s.specColor * FtfD * s.compD, s.tfW);
+        Fm = mix(Fm, s.specW * FtfM * s.compM, s.tfW);
+      }
+      fS += s.tBase * mix(Fd, Fm, s.metal) * g;
+      pdf += p.y * pdfGGXReflection_Bounded(woS, wiS, s.aS);
+    }
 
     if (s.coatW > 0.0) {
       float gc = G2_GGX(wo, wi, s.aC) * D_GGX(h, s.aC) / (4.0 * wo.z);
@@ -666,8 +699,20 @@ float evalSurf(Surf s, vec3 wo, vec3 wi, int filt, out vec3 fD, out vec3 fS) {
 bool sampleSurf(Surf s, vec3 wo, int filt, vec3 u, out vec3 wi) {
   vec4 p = lobeProbs(s, filt);
   if (u.z < p.x) wi = sample_EON(wo, s.diffRough, u.x, u.y);
-  else if (u.z < p.x + p.y) wi = sampleGGXReflection_Bounded(u.xy, wo, s.aS);
-  else if (u.z < p.x + p.y + p.z) wi = sampleGGXReflection_Bounded(u.xy, wo, s.aC);
+  else if (u.z < p.x + p.y + p.z) {
+    // Base specular or coat, through one call site (Direct3D inlines every call). The base specular on a flake
+    // is sampled in the flake's frame (see evalSurf) and brought back; otherwise the frame is the identity.
+    bool coat = u.z >= p.x + p.y;
+    vec3 b1 = vec3(1.0, 0.0, 0.0), b2 = vec3(0.0, 1.0, 0.0), b3 = vec3(0.0, 0.0, 1.0);
+    if (!coat && s.nf.z < 0.99999) {
+      onb(s.nf, b1, b2);
+      b3 = s.nf;
+    }
+    vec3 woS = vec3(dot(wo, b1), dot(wo, b2), dot(wo, b3));
+    if (woS.z <= 0.0) return false;
+    vec3 wiS = sampleGGXReflection_Bounded(u.xy, woS, coat ? s.aC : s.aS);
+    wi = wiS.x * b1 + wiS.y * b2 + wiS.z * b3;
+  }
   else if (p.w > 0.0) wi = sampleFuzz(wo, s.fuzzRough, u.xy);
   else return false;
   return wi.z > 0.0;
@@ -1132,6 +1177,18 @@ Mat getMat(int i) {
   return m;
 }
 
+// Lab extension: the flake under a point, in the shading frame. P is the point in the hero's own space, so the
+// flakes stay put on the surface as a model turns. Cells of the flake size; each holds a flake with probability
+// lab_flake_coverage, its normal tilted in a random direction by up to lab_flake_tilt (tangent of the angle).
+vec3 flakeNormal(Mat m, vec3 P) {
+  if (m.lab_flake_coverage <= 0.0) return vec3(0.0, 0.0, 1.0);
+  uvec3 h = pcg3d(uvec3(ivec3(floor(P / m.lab_flake_size)) + 1048576));
+  if (u01(h.x) >= m.lab_flake_coverage) return vec3(0.0, 0.0, 1.0);
+  float r = m.lab_flake_tilt * sqrt(u01(h.y));
+  float phi = TWO_PI * u01(h.z);
+  return normalize(vec3(r * cos(phi), r * sin(phi), 1.0));
+}
+
 // Firefly control on indirect light only (Cycles-style split), hue preserving. Direct light stays unbiased.
 vec3 clampIndirect(vec3 c) {
   float m = maxc(c);
@@ -1189,9 +1246,24 @@ void main() {
 
       vec3 t1, t2;
       onb(n, t1, t2);
+      if (m.specular_roughness_anisotropy > 0.0) {
+        // Anisotropic lobes need a tangent field: the surface is brushed around the vertical axis, as on a lathe,
+        // so the tangent (the rougher direction) runs pole to pole and highlights stretch that way.
+        vec3 T = vec3(0.0, 1.0, 0.0) - n * n.y;
+        float lT = length(T);
+        if (lT > 1e-4) {
+          t1 = T / lT;
+          t2 = cross(n, t1);
+        }
+      }
       vec3 wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
       if (wo.z <= 1e-6) break;
       Surf s = setupSurf(m, wo);
+#ifdef MESH
+      s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
+#else
+      s.nf = flakeNormal(m, p - vec3(ballX(2), 1.0, 0.0));
+#endif
       vec3 po = offsetRay(p, h.ng); // off the true surface, on the side the ray came from
 
       // One pass over the vertex's sampled directions: k < uNumLights is next-event estimation toward softbox k

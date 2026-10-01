@@ -161,6 +161,54 @@ function loadSportsCar(dir) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Utah Teapot, 2026 version (Cem Yuksel), from the University of Utah's generator (graphics.cs.utah.edu/teapot):
+// teapot_generator.js and teapot_generator.wasm, run here in a sandbox. The options are the page's defaults: all
+// parts, Blinn's 3/4 scale, circular, trimmed, chamfered, curvature continuous, round bottom, Yuksel interior,
+// both sides, welded vertices. Every triangle takes the hero material.
+// ---------------------------------------------------------------------------------------------------------------
+async function loadTeapot(dir, resolution) {
+  const { default: vm } = await import('node:vm')
+  const { createRequire } = await import('node:module')
+  const src = fs.readFileSync(path.join(dir, 'teapot_generator.js'), 'utf8')
+  const ready = new Promise(resolve => {
+    const sandbox = {
+      require: createRequire(path.join(dir, 'teapot_generator.js')),
+      process, console, Buffer, URL, TextDecoder, TextEncoder, WebAssembly, setTimeout, clearTimeout,
+      __dirname: dir, __filename: path.join(dir, 'teapot_generator.js'),
+      Module: { locateFile: p => path.join(dir, p), onRuntimeInitialized: () => resolve(sandbox) },
+    }
+    sandbox.globalThis = sandbox
+    vm.createContext(sandbox)
+    vm.runInContext(src, sandbox, { filename: 'teapot_generator.js' })
+  })
+  const sb = await ready
+  const ex = sb.wasmExports
+  let options = 0
+  options |= 1 << 0 | 1 << 1 | 1 << 2 | 1 << 3 // handle, spout, lid, body
+  options += 3 << 4 // bottom: round
+  options += 3 << 6 // interior: Yuksel 2026
+  options |= 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12 // 3/4 scale, circular, trimmed, chamfer, curvature
+  options += 2 << 14 // texture layout (unused here)
+  options |= 1 << 20 | 1 << 21 | 1 << 22 // weld vertices, normals, texture coordinates
+  options |= 1 << 23 | 1 << 24 // triangle tips, symmetric triangulation
+  options |= 1 << 26 | 1 << 27 // both sides
+  ex.tmesh_generate(options, resolution, -1)
+  const nf = ex.tmesh_numfaces(), nv = ex.tmesh_numverts()
+  const buf = sb.HEAPF32.buffer
+  const faces = new Uint32Array(new Int32Array(buf, ex.tmesh_faces(), nf * 3))
+  const verts = new Float32Array(buf, ex.tmesh_verts(), nv * 8) // position, normal, texture coordinate
+  // The generator's mesh is z up; the lab is y up: (x, y, z) -> (x, z, -y).
+  const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3)
+  for (let i = 0; i < nv; i++) {
+    const v = verts.subarray(i * 8, i * 8 + 8)
+    pos.set([v[0], v[2], -v[1]], i * 3)
+    nrm.set([v[3], v[5], -v[4]], i * 3)
+  }
+  ex.tmesh_clear()
+  return [{ file: 'teapot', material: 'hero', slot: SLOT.hero, pos, nrm, idx: faces }]
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Reduction: one triangle budget for the model, shared by the parts in proportion to their triangle counts, with
 // part borders locked so neighbouring parts still meet.
 // ---------------------------------------------------------------------------------------------------------------
@@ -436,18 +484,22 @@ function write(name, mesh, bvh, extra) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-const [, , which, src, budgetArg] = process.argv
-if (which !== 'sportscar') {
+const [, , which, src, arg] = process.argv
+const SOURCES = {
+  sportscar: { load: () => loadSportsCar(src), budget: arg ? +arg : 100_000, credit: 'Sports Car by Yasutoshi Mori (CC BY 4.0)' },
+  teapot: { load: () => loadTeapot(src, arg ? +arg : 24), budget: Infinity, credit: 'Utah Teapot, University of Utah (2026 version, Cem Yuksel)' },
+}
+if (!SOURCES[which] || !src) {
   console.error('usage: node tools/lookdev-models/build.mjs sportscar <pbrt-v4-scenes/sportscar dir> [triangle budget]')
+  console.error('       node tools/lookdev-models/build.mjs teapot <dir with teapot_generator.js and .wasm> [resolution]')
   process.exit(1)
 }
-const budget = budgetArg ? +budgetArg : 100_000
-const parts = loadSportsCar(src)
+const parts = await SOURCES[which].load()
 const before = parts.reduce((n, p) => n + p.idx.length / 3, 0)
-const reduced = reduce(parts, budget)
+const reduced = reduce(parts, SOURCES[which].budget)
 const mesh = merge(reduced)
 fillMissingNormals(mesh)
 const frame = normalizeFrame(mesh)
 const bvh = buildBvh(mesh)
-const res = write(which, mesh, bvh, { size: frame.size, credit: 'Sports Car by Yasutoshi Mori (CC BY 4.0)' })
+const res = write(which, mesh, bvh, { size: frame.size, credit: SOURCES[which].credit })
 console.log(JSON.stringify({ parts: parts.length, trianglesIn: before, trianglesOut: bvh.idx.length / 3, verts: mesh.pos.length / 3, nodes: bvh.nodeCount, maxDepth: bvh.maxDepth, size: frame.size, rawMB: +(res.raw / 1e6).toFixed(2), gzMB: +(res.gz / 1e6).toFixed(2), out: res.out }, null, 1))

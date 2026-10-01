@@ -2,7 +2,7 @@
 // built offline by tools/lookdev-models/build.mjs (reduced, BVH built, gzipped) and fetched only when picked.
 import { OPENPBR_DEFAULTS, type OpenPBR } from './materials'
 
-export type Model = 'spheres' | 'sportscar'
+export type Model = 'spheres' | 'sportscar' | 'teapot'
 
 export interface ModelInfo {
   label: string
@@ -12,7 +12,7 @@ export interface ModelInfo {
   credit: { text: string; source: string; license: string; licenseUrl: string }
 }
 
-export const MODEL_ORDER: Model[] = ['spheres', 'sportscar']
+export const MODEL_ORDER: Model[] = ['spheres', 'sportscar', 'teapot']
 
 export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
   sportscar: {
@@ -24,6 +24,19 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
       source: 'https://github.com/mmp/pbrt-v4-scenes',
       license: 'CC BY 4.0',
       licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
+    },
+  },
+  teapot: {
+    label: 'Utah teapot',
+    url: '/lookdev/models/teapot.bin.gz?v=2',
+    scale: 3.6,
+    credit: {
+      // The model's terms ask that it be identified as the Utah Teapot and its origin at the University of Utah
+      // acknowledged.
+      text: 'The Utah Teapot, developed at the University of Utah (Martin Newell, 1975); the 2026 version by Cem Yuksel, with curvature continuity and chamfers. 80k triangles.',
+      source: 'https://graphics.cs.utah.edu/teapot/',
+      license: 'Free for any use',
+      licenseUrl: 'https://graphics.cs.utah.edu/teapot/',
     },
   },
 }

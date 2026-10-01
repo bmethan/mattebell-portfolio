@@ -1,11 +1,11 @@
 import { VERT, E_TABLE_FRAG, TRACE_FRAG, TRACE_FRAG_MESH, DISPLAY_FRAG } from './shaders'
 import { kelvinToACEScg } from './color'
-import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, type OpenPBR, type Hero } from './materials'
+import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, heroParams, type OpenPBR, type Hero, type PaintFinish } from './materials'
 import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
-export type { Hero, Model }
+export type { Hero, Model, PaintFinish }
 
 export interface LabState {
   keyAz: number
@@ -18,7 +18,10 @@ export interface LabState {
   model: Model
   modelYaw: number // turntable angle of a model, radians
   hero: Hero
+  paint: PaintFinish // car paint's finish
+  flakes: boolean // car paint flakes (metallic, pearl and iridescent finishes)
   heroRoughness: number | null
+  heroAniso: number | null // anisotropy override for brushed heroes
   pass: Pass
   view: View
   multiscatter: boolean
@@ -36,7 +39,10 @@ export const DEFAULT_STATE: LabState = {
   model: 'spheres',
   modelYaw: 0.6,
   hero: 'carpaint',
+  paint: 'solid',
+  flakes: false,
   heroRoughness: null,
+  heroAniso: null,
   pass: 'beauty',
   view: 'aces',
   multiscatter: true,
@@ -48,13 +54,24 @@ export const DEFAULT_STATE: LabState = {
 // preset's own value is the same material). The turntable angle only matters with a model on the plate.
 export function isPosterState(s: LabState) {
   const d = DEFAULT_STATE
-  const rough = (st: LabState) => st.heroRoughness ?? HERO_PRESETS[st.hero].params[HERO_PRESETS[st.hero].roughnessParam]
+  const base = (st: LabState) => heroParams(st.hero, st.paint, st.flakes)
+  const rough = (st: LabState) => st.heroRoughness ?? base(st)[HERO_PRESETS[st.hero].roughnessParam]
+  const aniso = (st: LabState) => st.heroAniso ?? base(st).specular_roughness_anisotropy
   return (Object.keys(d) as (keyof LabState)[]).every(k => {
     if (k === 'keyAz' || k === 'keyEl') return Math.abs(s[k] - d[k]) < 1e-6
     if (k === 'modelYaw') return s.model === 'spheres' || Math.abs(s.modelYaw - d.modelYaw) < 1e-6
     if (k === 'heroRoughness') return s.hero === d.hero && Math.abs(rough(s) - rough(d)) < 1e-6
+    if (k === 'heroAniso') return s.hero === d.hero && Math.abs(aniso(s) - aniso(d)) < 1e-6
     return s[k] === d[k]
   })
+}
+
+// The hero material as rendered: its preset (car paint by finish and flakes), then the slider edits.
+export function heroMaterial(s: LabState): OpenPBR {
+  const m: OpenPBR = { ...heroParams(s.hero, s.paint, s.flakes) }
+  if (s.heroRoughness !== null) m[HERO_PRESETS[s.hero].roughnessParam] = s.heroRoughness
+  if (s.heroAniso !== null) m.specular_roughness_anisotropy = s.heroAniso
+  return m
 }
 
 export interface LabStatus {
@@ -780,10 +797,7 @@ export class LookdevEngine {
     gl.uniform1i(L('uPass'), PASS_ID[s.pass])
 
     // Materials: 0 gray card, 1 chromium, 2 hero, 3 floor; with a model, 4-9 dress its other parts.
-    const hero = HERO_PRESETS[s.hero]
-    const heroMat: OpenPBR = { ...hero.params }
-    if (s.heroRoughness !== null) heroMat[hero.roughnessParam] = s.heroRoughness
-    const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, heroMat, SCENE_MATERIALS.floor]
+    const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, heroMaterial(s), SCENE_MATERIALS.floor]
 
     if (s.model === 'spheres') {
       gl.uniform3fv(L('uBallX'), BALL_X)

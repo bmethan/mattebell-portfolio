@@ -67,7 +67,7 @@ export default function About({ settings, years }: { settings: Settings; years: 
             src="/images/matthew-bell.webp"
             alt="Matthew Bell"
             width={800}
-            height={1144}
+            height={1085}
             loading="lazy"
             decoding="async"
             style={{ display: 'block', width: '100%', maxWidth: 280, height: 'auto', marginBottom: 28, border: '0.5px solid var(--border)' }}

@@ -1359,7 +1359,7 @@ vec3 offsetRay(vec3 p, vec3 n) {
 // back: the ray arrived from inside the object (only a transmissive material lets a path get there).
 struct Hit { float t; vec3 n; vec3 ng; int mat; int light; bool back; };
 
-// The cyc's back wall and sweep (the floor is the plane test in intersect()): nearest hit before tMax, with the
+// The cyc's back wall and sweep (the floor is the plane test in trace()): nearest hit before tMax, with the
 // normal facing into the room, or -1. Also a shadow occluder: a key light dragged low and behind can end up
 // partly behind the wall.
 float cycHit(vec3 ro, vec3 rd, float tMax, out vec3 n) {
@@ -1399,71 +1399,6 @@ float intersectBall(vec3 ro, vec3 rd, vec4 s, float tMax) {
 }
 #endif
 
-Hit intersect(vec3 ro, vec3 rd, bool withLights) {
-  Hit h;
-  h.t = 1e30; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
-#ifdef MESH
-  for (int i = 0; i < 3; i++) {
-    vec4 s = uBall[i];
-    float t = intersectBall(ro, rd, s, h.t);
-    if (t > 0.0) {
-      vec3 nOut = normalize(ro + rd * t - s.xyz);
-      h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = h.back ? -nOut : nOut; h.ng = h.n; h.mat = i;
-    }
-  }
-  int tri;
-  vec2 bc;
-  vec3 unusedT = vec3(1.0);
-  float tm = traceMesh(ro, rd, h.t, false, tri, bc, unusedT);
-  if (tm > 0.0) {
-    h.t = tm;
-    uvec4 nn = texelFetch(uTriNrm, texAt(tri), 0);
-    vec3 e1 = texelFetch(uTriPos, texAt(3 * tri + 1), 0).xyz;
-    vec3 e2 = texelFetch(uTriPos, texAt(3 * tri + 2), 0).xyz;
-    vec3 ng = normalize(uModelRot * cross(e1, e2));
-    vec3 ns = normalize(uModelRot * ((1.0 - bc.x - bc.y) * octDecode(nn.x) + bc.x * octDecode(nn.y) + bc.y * octDecode(nn.z)));
-    // Outside is where the authored vertex normals point (winding may vary between parts).
-    h.back = dot(rd, dot(ng, ns) < 0.0 ? -ng : ng) > 0.0;
-    // Two-sided: both normals face the ray. An interpolated normal that would put the viewer below the surface
-    // falls back to the facet's own.
-    if (dot(ng, rd) > 0.0) ng = -ng;
-    if (dot(ns, ng) < 0.0) ns = -ns;
-    if (dot(ns, -rd) <= 1e-4) ns = ng;
-    h.n = ns;
-    h.ng = ng;
-    h.mat = int(nn.w);
-  }
-#else
-  for (int i = 0; i < 3; i++) {
-    vec3 c = vec3(ballX(i), 1.0, 0.0);
-    float t = intersectSphere(ro, rd, c, h.t);
-    if (t > 0.0) {
-      vec3 nOut = normalize(ro + rd * t - c);
-      h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = h.back ? -nOut : nOut; h.ng = h.n; h.mat = i;
-    }
-  }
-#endif
-  if (uFurnace == 0 && rd.y < 0.0) {
-    float t = -ro.y / rd.y;
-    if (t > 0.0 && t < h.t && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) {
-      h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3; h.back = false;
-    }
-  }
-  if (uFurnace == 0 && uCyc == 1) {
-    vec3 nc;
-    float t = cycHit(ro, rd, h.t, nc);
-    if (t > 0.0) { h.t = t; h.n = nc; h.ng = nc; h.mat = 3; h.back = false; }
-  }
-  if (withLights) {
-    for (int k = 0; k < uNumLights; k++) {
-      if (!lightOn(k)) continue;
-      float t = intersectRect(ro, rd, k, h.t);
-      if (t > 0.0) { h.t = t; h.light = k; h.mat = -1; }
-    }
-  }
-  return h;
-}
-
 // Smooth thin-walled transmission does not change a ray's direction, so light can be sampled straight through
 // it exactly: a shadow ray crossing such a surface is dimmed by its transmittance instead of blocked. (Paths that
 // cross one by BSDF sampling keep the previous vertex's MIS state; see the main loop.)
@@ -1482,22 +1417,50 @@ vec3 thinPassT(Mat m, float c) {
 }
 #endif
 
-// Fraction of a light's radiance that reaches ro from tMax along rd: zero past anything opaque; through smooth
-// thin glass (uThinGlass: the hero ball, or the model's glass slot), dimmed at each crossing.
-vec3 shadowT(vec3 ro, vec3 rd, float tMax) {
-  vec3 T = vec3(1.0);
+// The one scene query, for both kinds of ray (it is called from a single place: see main).
+// A path ray (shadow false) finds the closest hit before tMax, softboxes included when withLights.
+// A shadow ray returns at the first blocker (h.mat >= 0) and otherwise reports the light that gets through:
+// smooth thin glass (uThinGlass: the hero ball, or the model's glass slot) dims T at each crossing instead.
+Hit trace(vec3 ro, vec3 rd, float tMax, bool shadow, bool withLights, inout vec3 T) {
+  Hit h;
+  h.t = tMax; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
 #ifdef MESH
   for (int i = 0; i < 3; i++) {
-    if (intersectBall(ro, rd, uBall[i], tMax) > 0.0) return vec3(0.0);
+    vec4 s = uBall[i];
+    float t = intersectBall(ro, rd, s, h.t);
+    if (t > 0.0) {
+      vec3 nOut = normalize(ro + rd * t - s.xyz);
+      h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = h.back ? -nOut : nOut; h.ng = h.n; h.mat = i;
+      if (shadow) return h;
+    }
   }
   int tri;
   vec2 bc;
-  if (traceMesh(ro, rd, tMax, true, tri, bc, T) > 0.0) return vec3(0.0);
+  float tm = traceMesh(ro, rd, h.t, shadow, tri, bc, T);
+  if (tm > 0.0) {
+    h.t = tm;
+    if (shadow) { h.mat = 4; return h; } // blocked (the model's part does not matter)
+    uvec4 nn = texelFetch(uTriNrm, texAt(tri), 0);
+    h.mat = int(nn.w);
+    vec3 e1 = texelFetch(uTriPos, texAt(3 * tri + 1), 0).xyz;
+    vec3 e2 = texelFetch(uTriPos, texAt(3 * tri + 2), 0).xyz;
+    vec3 ng = normalize(uModelRot * cross(e1, e2));
+    vec3 ns = normalize(uModelRot * ((1.0 - bc.x - bc.y) * octDecode(nn.x) + bc.x * octDecode(nn.y) + bc.y * octDecode(nn.z)));
+    // Outside is where the authored vertex normals point (winding may vary between parts).
+    h.back = dot(rd, dot(ng, ns) < 0.0 ? -ng : ng) > 0.0;
+    // Two-sided: both normals face the ray. An interpolated normal that would put the viewer below the surface
+    // falls back to the facet's own.
+    if (dot(ng, rd) > 0.0) ng = -ng;
+    if (dot(ns, ng) < 0.0) ns = -ns;
+    if (dot(ns, -rd) <= 1e-4) ns = ng;
+    h.n = ns;
+    h.ng = ng;
+  }
 #else
   for (int i = 0; i < 3; i++) {
     vec3 c = vec3(ballX(i), 1.0, 0.0);
 #ifdef THIN
-    if (i == 2 && uThinGlass == 1) {
+    if (shadow && i == 2 && uThinGlass == 1) {
       // Both crossings of the bubble within the segment.
       vec3 f = ro - c;
       float b = dot(f, rd), disc = b * b - (dot(f, f) - 1.0);
@@ -1511,18 +1474,34 @@ vec3 shadowT(vec3 ro, vec3 rd, float tMax) {
       continue;
     }
 #endif
-    if (intersectSphere(ro, rd, c, tMax) > 0.0) return vec3(0.0);
+    float t = intersectSphere(ro, rd, c, h.t);
+    if (t > 0.0) {
+      vec3 nOut = normalize(ro + rd * t - c);
+      h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = h.back ? -nOut : nOut; h.ng = h.n; h.mat = i;
+      if (shadow) return h;
+    }
   }
 #endif
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
-    if (t > 0.0 && t < tMax && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) return vec3(0.0);
+    if (t > 0.0 && t < h.t && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) {
+      h.t = t; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.mat = 3; h.back = false;
+      if (shadow) return h;
+    }
   }
   if (uFurnace == 0 && uCyc == 1) {
     vec3 nc;
-    if (cycHit(ro, rd, tMax, nc) > 0.0) return vec3(0.0);
+    float t = cycHit(ro, rd, h.t, nc);
+    if (t > 0.0) { h.t = t; h.n = nc; h.ng = nc; h.mat = 3; h.back = false; }
   }
-  return T;
+  if (withLights) {
+    for (int k = 0; k < uNumLights; k++) {
+      if (!lightOn(k)) continue;
+      float t = intersectRect(ro, rd, k, h.t);
+      if (t > 0.0) { h.t = t; h.light = k; h.mat = -1; }
+    }
+  }
+  return h;
 }
 
 Mat getMat(int i) {
@@ -1601,82 +1580,38 @@ void main() {
     float lambda = 380.0 + 400.0 * sample4(sampleIndex, pixSeed, 0, 6).x;
     bool colored = false;
 
-    for (int depth = 0; depth < uMaxBounces; depth++) {
-      Hit h = intersect(ro, rd, depth > 0);
+    // The path runs as a sequence of steps that each cast exactly one ray: the camera ray, then at every vertex
+    // one shadow ray per softbox (next-event estimation, solid-angle sampling) and the BSDF sample that continues
+    // the path. So the scene is traced, and evalSurf evaluated, from one place each: the Direct3D compiler inlines
+    // every call, and these two are most of the shader's compile time.
+    int depth = 0;
+    bool atVertex = false; // a surface vertex is set up and its directions are being sampled
+    int k = 0;             // at a vertex, the next direction: k < uNumLights is softbox k, k == uNumLights the BSDF
+    // The current vertex.
+    vec3 p = ro, po = ro, ng = vec3(0.0, 1.0, 0.0), t1 = vec3(1.0, 0.0, 0.0), t2 = vec3(0.0, 0.0, 1.0);
+    vec3 n = ng, wo = vec3(0.0, 0.0, 1.0);
+    Mat m = uMat[0];
+    Surf s;
+    int filt = 0;
+    bool solidInside = false, last = false;
+    vec3 pending = vec3(0.0); // what the shadow ray in flight delivers if it gets through
+    int maxSteps = uMaxBounces * (uNumLights + 1) + 1;
 
-      if (h.light >= 0) {
-        // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling.
-        float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.t));
-        vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
-        addLight(h.light, depth >= 2 ? clampIndirect(c) : c, L, L1, L2);
-        break;
-      }
-      if (h.mat < 0) {
-        if (!(depth == 0 && uPass >= 3)) {
-          vec3 c = beta * uEnv;
-          L += depth >= 2 ? clampIndirect(c) : c;
-        }
-        break;
-      }
-
-      vec3 p = ro + rd * h.t;
-      vec3 n = h.n;
-      Mat m = getMat(h.mat);
-#ifdef GLASS
-      bool solidInside = h.back && m.transmission_weight > 0.0 && m.geometry_thin_walled < 0.5;
-      if (solidInside && m.transmission_depth > 0.0) {
-        // The segment just traced ran through the medium: Beer-Lambert with mu_t = -ln(color) / depth (spec).
-        beta *= exp(log(clamp(m.transmission_color, 1e-4, 1.0)) / m.transmission_depth * h.t);
-      }
-#else
-      const bool solidInside = false;
-#endif
-
-      if (depth == 0) {
-        mask = h.mat != 3 ? 1.0 : 0.0; // everything but the floor
-        if (uPass == 3) { L = albedoAOV(m); break; }
-        if (uPass == 4) { L = n * 0.5 + 0.5; break; }
-      }
-      int filt = depth == 0 ? (uPass == 1 ? 1 : (uPass == 2 ? 2 : 0)) : 0;
-
-      vec3 t1, t2;
-      onb(n, t1, t2);
-      if (m.specular_roughness_anisotropy > 0.0) {
-        // Anisotropic lobes need a tangent field: the surface is brushed around the vertical axis, as on a lathe,
-        // so the tangent (the rougher direction) runs pole to pole and highlights stretch that way.
-        vec3 T = vec3(0.0, 1.0, 0.0) - n * n.y;
-        float lT = length(T);
-        if (lT > 1e-4) {
-          t1 = T / lT;
-          t2 = cross(n, t1);
-        }
-      }
-      vec3 wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
-      if (wo.z <= 1e-6) break;
-      Surf s = setupSurf(m, wo, h.back, lambda, colored);
-#ifdef MESH
-      s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
-#else
-      s.nf = flakeNormal(m, p - vec3(ballX(2), 1.0, 0.0));
-#endif
-      vec3 po = offsetRay(p, h.ng); // off the true surface, on the side the ray came from
-
-      // One pass over the vertex's sampled directions: k < uNumLights is next-event estimation toward softbox k
-      // (solid-angle sampling); k == uNumLights is the BSDF sample that continues the path. Sharing the loop
-      // keeps a single inlined copy of evalSurf, which is most of the shader's compile cost on Direct3D.
-      bool last = depth == uMaxBounces - 1;
-      bool continued = false;
-      for (int k = 0; k <= uNumLights; k++) {
+    for (int step = 0; step < maxSteps; step++) {
+      vec3 tro = ro, trd = rd;
+      float tMax = 1e30;
+      bool shadow = false;
+      if (atVertex) {
         bool isLight = k < uNumLights;
         if (!isLight && last) break; // the continuation ray from the last vertex is never traced
-        if (isLight && (!lightOn(k) || solidInside)) continue; // from inside a solid, every light is behind its wall
+        if (isLight && (!lightOn(k) || solidInside)) { k++; continue; } // from inside a solid, every light is behind its wall
         vec4 u = sample4(sampleIndex, pixSeed, depth, k);
         vec3 dirW, wi;
         float ldist = 0.0, lpdf = 0.0;
         if (isLight) {
-          if (!sampleLight(k, po, u.xy, dirW, ldist, lpdf)) continue;
+          if (!sampleLight(k, po, u.xy, dirW, ldist, lpdf)) { k++; continue; }
           wi = vec3(dot(dirW, t1), dot(dirW, t2), dot(dirW, n));
-          if (wi.z <= 0.0) continue;
+          if (wi.z <= 0.0) { k++; continue; }
         } else {
           if (!sampleSurf(s, wo, filt, u.xyz, wi)) break;
           dirW = normalize(t1 * wi.x + t2 * wi.y + n * wi.z);
@@ -1685,13 +1620,14 @@ void main() {
         float bpdf = evalSurf(s, wo, wi, filt, fD, fS);
         vec3 f = fD + fS;
         if (isLight) {
-          if (maxc(f) <= 0.0) continue;
-          vec3 Tsh = shadowT(po, dirW, ldist * (1.0 - 1e-4));
-          if (maxc(Tsh) <= 0.0) continue;
+          if (maxc(f) <= 0.0) { k++; continue; }
           // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
           float wl = last ? 1.0 : powerHeuristic(lpdf, bpdf);
-          vec3 c = beta * Tsh * f * uLightRadiance[k] * (wl / lpdf);
-          addLight(k, depth >= 1 ? clampIndirect(c) : c, L, L1, L2);
+          pending = beta * f * uLightRadiance[k] * (wl / lpdf);
+          tro = po;
+          trd = dirW;
+          tMax = ldist * (1.0 - 1e-4);
+          shadow = true;
         } else {
           if (bpdf <= 0.0) break;
           beta *= f / bpdf;
@@ -1709,10 +1645,10 @@ void main() {
             beta *= spectralWeight(lambda);
           }
 #endif
-          ro = through ? offsetRay(p, -h.ng) : po;
+          ro = through ? offsetRay(p, -ng) : po;
 #ifdef THIN
           // Straight through smooth thin glass, the path keeps the previous vertex's MIS state: shadow rays from
-          // that vertex already sample lights through the glass (shadowT).
+          // that vertex already sample lights through the glass (see trace).
           bool passed = through && s.thin && uThinGlass == 1 && smoothThin(m);
 #else
           const bool passed = false;
@@ -1723,10 +1659,82 @@ void main() {
             prevP = ro;
           }
           rd = dirW;
-          continued = true;
+          tro = ro;
+          trd = rd;
+          atVertex = false;
+          depth++;
         }
       }
-      if (!continued) break;
+
+      vec3 T = vec3(1.0);
+      Hit h = trace(tro, trd, tMax, shadow, !shadow && depth > 0, T);
+
+      if (shadow) {
+        if (h.mat < 0 && maxc(T) > 0.0) {
+          vec3 c = pending * T;
+          addLight(k, depth >= 1 ? clampIndirect(c) : c, L, L1, L2);
+        }
+        k++;
+        continue;
+      }
+
+      if (h.light >= 0) {
+        // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling.
+        float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.t));
+        vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
+        addLight(h.light, depth >= 2 ? clampIndirect(c) : c, L, L1, L2);
+        break;
+      }
+      if (h.mat < 0) {
+        if (!(depth == 0 && uPass >= 3)) {
+          vec3 c = beta * uEnv;
+          L += depth >= 2 ? clampIndirect(c) : c;
+        }
+        break;
+      }
+
+      p = ro + rd * h.t;
+      n = h.n;
+      ng = h.ng;
+      m = getMat(h.mat);
+#ifdef GLASS
+      solidInside = h.back && m.transmission_weight > 0.0 && m.geometry_thin_walled < 0.5;
+      if (solidInside && m.transmission_depth > 0.0) {
+        // The segment just traced ran through the medium: Beer-Lambert with mu_t = -ln(color) / depth (spec).
+        beta *= exp(log(clamp(m.transmission_color, 1e-4, 1.0)) / m.transmission_depth * h.t);
+      }
+#endif
+
+      if (depth == 0) {
+        mask = h.mat != 3 ? 1.0 : 0.0; // everything but the floor
+        if (uPass == 3) { L = albedoAOV(m); break; }
+        if (uPass == 4) { L = n * 0.5 + 0.5; break; }
+      }
+      filt = depth == 0 ? (uPass == 1 ? 1 : (uPass == 2 ? 2 : 0)) : 0;
+
+      onb(n, t1, t2);
+      if (m.specular_roughness_anisotropy > 0.0) {
+        // Anisotropic lobes need a tangent field: the surface is brushed around the vertical axis, as on a lathe,
+        // so the tangent (the rougher direction) runs pole to pole and highlights stretch that way.
+        vec3 Tg = vec3(0.0, 1.0, 0.0) - n * n.y;
+        float lT = length(Tg);
+        if (lT > 1e-4) {
+          t1 = Tg / lT;
+          t2 = cross(n, t1);
+        }
+      }
+      wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
+      if (wo.z <= 1e-6) break;
+      s = setupSurf(m, wo, h.back, lambda, colored);
+#ifdef MESH
+      s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
+#else
+      s.nf = flakeNormal(m, p - vec3(ballX(2), 1.0, 0.0));
+#endif
+      po = offsetRay(p, ng); // off the true surface, on the side the ray came from
+      last = depth == uMaxBounces - 1;
+      atVertex = true;
+      k = 0;
     }
     // A sample with any non-finite light is dropped whole, so the three images stay consistent.
     vec3 all = L + L1 + L2;

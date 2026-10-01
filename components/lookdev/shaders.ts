@@ -1118,7 +1118,7 @@ float powerHeuristic(float f, float g) {
 // tracer includes it; the reference-ball scene compiles without it.
 const MESH_GLSL = /* glsl */ `
 precision highp usampler2D;
-uniform sampler2D uBvh;      // 4 texels per inner node: each child's bmin.xyz + ref, bmax.xyz (see the builder)
+uniform usampler2D uBvh;     // 4 texels per four-wide node, child boxes compressed (see collapseBvh4 in models.ts)
 uniform sampler2D uTriPos;   // 3 texels per triangle: v0, v1 - v0, v2 - v0
 uniform usampler2D uTriNrm;  // 1 texel per triangle: three octahedral vertex normals (snorm16 x2), material slot
 uniform mat3 uModelRot;      // object to world rotation
@@ -1158,13 +1158,13 @@ float boxEnter(vec3 bmin, vec3 bmax, vec3 o, vec3 invD, float tBest) {
   return tEnter <= tExit && tEnter < tBest ? tEnter : 1e30;
 }
 
-const int BVH_STACK = 32;
+const int BVH_STACK = 48; // BVH4_STACK in models.ts: three deferred children per level at most
 // Closest hit before tMax (or, with anyHit, the first hit found). Ray/triangle: Moller and Trumbore 1997.
 // Returns the distance (the object-space ray is scaled so it equals the world distance) or -1.
-// cur packs (index << 5) | count: a leaf of count triangles, or with count 0 the inner node at index. Each inner
-// node holds both children's boxes, so only entered children are visited, nearer first; the farther one waits on
-// the stack with its entry distance and is skipped if a closer hit has been found by then. One loop body handles
-// leaves and inner nodes, so the triangle test is compiled once.
+// cur packs (index << 5) | count: a leaf of count triangles, or with count 0 the four-wide node at index. A node
+// holds its four children's boxes, so only entered children are visited, nearest first; the others wait on the
+// stack with their entry distances and are skipped if a closer hit has been found by then. One loop body
+// handles leaves and nodes, so the triangle test is compiled once.
 // With anyHit (shadow rays), triangles in the thin-glass slot (uThinSlot) do not stop the ray: their
 // transmittance multiplies Tthin instead, in any order (it does not depend on the order of crossings).
 float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out vec2 bary, inout vec3 Tthin) {
@@ -1179,30 +1179,38 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
   int stackRef[BVH_STACK];
   float stackT[BVH_STACK];
   int sp = 0;
-  int cur = 0; // the root, an inner node
+  int cur = 0; // the root, a four-wide node
   for (int visit = 0; visit < uMaxNodeVisits; visit++) {
     int count = cur & 31;
     int index = cur >> 5;
     if (count == 0) {
-      vec4 la = texelFetch(uBvh, texAt(4 * index), 0);
-      vec4 lb = texelFetch(uBvh, texAt(4 * index + 1), 0);
-      vec4 ra = texelFetch(uBvh, texAt(4 * index + 2), 0);
-      vec4 rb = texelFetch(uBvh, texAt(4 * index + 3), 0);
-      float tl = boxEnter(la.xyz, lb.xyz, o, invD, tBest);
-      float tr = boxEnter(ra.xyz, rb.xyz, o, invD, tBest);
-      bool hitL = tl < 1e30, hitR = tr < 1e30;
-      if (hitL && hitR) {
-        bool leftFirst = tl <= tr;
-        if (sp < BVH_STACK) {
-          stackRef[sp] = int(leftFirst ? ra.w : la.w);
-          stackT[sp] = leftFirst ? tr : tl;
-          sp++;
-        }
-        cur = int(leftFirst ? la.w : ra.w);
-        continue;
+      uvec4 h = texelFetch(uBvh, texAt(4 * index), 0);
+      uvec4 q0 = texelFetch(uBvh, texAt(4 * index + 1), 0);
+      uvec4 q1 = texelFetch(uBvh, texAt(4 * index + 2), 0);
+      uvec4 refs = texelFetch(uBvh, texAt(4 * index + 3), 0);
+      vec3 corner = uintBitsToFloat(h.xyz);
+      // The step per axis is a power of two: its biased exponent goes straight into a float's exponent field.
+      vec3 stepSize = uintBitsToFloat(uvec3(h.w & 255u, (h.w >> 8) & 255u, (h.w >> 16) & 255u) << 23);
+      ivec4 rc = ivec4(refs);
+      vec4 tc;
+      for (int i = 0; i < 4; i++) {
+        uint sh = uint(8 * i);
+        vec3 lo = corner + vec3((q0.xyz >> sh) & 255u) * stepSize;
+        vec3 hi = corner + vec3(uvec3(q0.w >> sh, q1.x >> sh, q1.y >> sh) & 255u) * stepSize;
+        tc[i] = refs[i] == 0xffffffffu ? 1e30 : boxEnter(lo, hi, o, invD, tBest); // an empty slot
       }
-      if (hitL || hitR) {
-        cur = int(hitL ? la.w : ra.w);
+      // Nearest first: sort the four (distance, ref) pairs, misses (1e30) last.
+      if (tc.y < tc.x) { tc.xy = tc.yx; rc.xy = rc.yx; }
+      if (tc.w < tc.z) { tc.zw = tc.wz; rc.zw = rc.wz; }
+      if (tc.z < tc.x) { tc.xz = tc.zx; rc.xz = rc.zx; }
+      if (tc.w < tc.y) { tc.yw = tc.wy; rc.yw = rc.wy; }
+      if (tc.z < tc.y) { tc.yz = tc.zy; rc.yz = rc.zy; }
+      if (tc.x < 1e30) {
+        // Defer the farther hits, farthest deepest.
+        if (tc.w < 1e30 && sp < BVH_STACK) { stackRef[sp] = rc.w; stackT[sp] = tc.w; sp++; }
+        if (tc.z < 1e30 && sp < BVH_STACK) { stackRef[sp] = rc.z; stackT[sp] = tc.z; sp++; }
+        if (tc.y < 1e30 && sp < BVH_STACK) { stackRef[sp] = rc.y; stackT[sp] = tc.y; sp++; }
+        cur = rc.x;
         continue;
       }
     } else {

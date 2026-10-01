@@ -547,7 +547,7 @@ export class LookdevEngine {
         return t
       }
       this.meshes.set(model, {
-        bvh: tex(m.bvh.w, m.bvh.h, gl.RGBA32F, gl.RGBA, gl.FLOAT, m.bvh.data),
+        bvh: tex(m.bvh.w, m.bvh.h, gl.RGBA32UI, gl.RGBA_INTEGER, gl.UNSIGNED_INT, m.bvh.data),
         pos: tex(m.pos.w, m.pos.h, gl.RGBA32F, gl.RGBA, gl.FLOAT, m.pos.data),
         nrm: tex(m.nrm.w, m.nrm.h, gl.RGBA32UI, gl.RGBA_INTEGER, gl.UNSIGNED_INT, m.nrm.data),
         size: m.size,

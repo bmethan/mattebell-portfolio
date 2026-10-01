@@ -82,13 +82,122 @@ export const TEX_W = 2048 // matches TEX_W_SHIFT in the shader
 
 export interface MeshTextures {
   triCount: number
-  bvh: { w: number; h: number; data: Float32Array }
+  bvh: { w: number; h: number; data: Uint32Array }
   pos: { w: number; h: number; data: Float32Array }
   nrm: { w: number; h: number; data: Uint32Array }
   size: [number, number, number] // normalized bounds: x, y (height), z
 }
 
 const rows = (texels: number) => Math.max(1, Math.ceil(texels / TEX_W))
+
+// ---------------------------------------------------------------------------------------------------------------
+// Four-wide BVH with compressed child boxes, built at load time from the file's binary one. Each binary node is
+// collapsed by opening its largest-area inner child until it has four children (Wald, Benthin and Boulos 2008,
+// "Getting rid of packets"); each child's box is stored as 8-bit offsets from the node's corner in power-of-two
+// steps, rounded outward (as in Ylitie, Karras and Laine 2017, "Efficient Incoherent Ray Traversal on GPUs
+// Through Compressed Wide BVHs"). A node is four RGBA32UI texels, the size of one binary node, for twice the
+// children: a ray reads half the bytes per box and visits about half the nodes.
+//   0: corner x, y, z (float bits); w: the three biased exponents of the step (x, y, z bytes)
+//   1: lo.x, lo.y, lo.z, hi.x of the four children, one byte each (child i in byte i)
+//   2: hi.y, hi.z of the four children; zw unused
+//   3: the four children's refs: (index << 5) | count, count > 0 a leaf of count triangles from index, count 0
+//      the four-wide node at index; EMPTY_REF for an unused slot (whose box bytes are lo 255, hi 0).
+// ---------------------------------------------------------------------------------------------------------------
+export const BVH4_STACK = 48 // must match BVH_STACK in the shader
+const EMPTY_REF = 0xffffffff // must match the shader's test
+
+interface Child { lo: number[]; hi: number[]; ref: number }
+
+function collapseBvh4(nodes: Float32Array, nodeCount: number) {
+  const f = Math.fround
+  // The binary node's two children.
+  const kids = (i: number): Child[] =>
+    [0, 8].map(o => ({
+      lo: [nodes[i * 16 + o], nodes[i * 16 + o + 1], nodes[i * 16 + o + 2]],
+      ref: nodes[i * 16 + o + 3],
+      hi: [nodes[i * 16 + o + 4], nodes[i * 16 + o + 5], nodes[i * 16 + o + 6]],
+    })).filter(c => c.lo[0] <= c.hi[0])
+  const area = (c: Child) => {
+    const d = [0, 1, 2].map(k => c.hi[k] - c.lo[k])
+    return d[0] * d[1] + d[1] * d[2] + d[2] * d[0]
+  }
+  const isInner = (c: Child) => (c.ref & 31) === 0
+  // Collapse: four-wide node n gets the children list; inner children point at binary nodes until numbered.
+  const out: { children: Child[] }[] = []
+  let maxDepth = 0
+  const build = (binary: number, depth: number): number => {
+    maxDepth = Math.max(maxDepth, depth)
+    const children = kids(binary)
+    while (children.length < 4) {
+      let best = -1
+      children.forEach((c, i) => {
+        if (isInner(c) && (best < 0 || area(c) > area(children[best]))) best = i
+      })
+      if (best < 0) break
+      const open = children.splice(best, 1)[0]
+      children.push(...kids(open.ref >> 5))
+    }
+    const index = out.length
+    out.push({ children })
+    for (const c of children) if (isInner(c)) c.ref = build(c.ref >> 5, depth + 1) * 32
+    return index
+  }
+  if (nodeCount > 0) build(0, 1)
+  if (3 * maxDepth > BVH4_STACK) console.warn(`BVH4 depth ${maxDepth} may overflow the traversal stack`)
+
+  const data = new Uint32Array(Math.max(1, out.length) * 16)
+  const fbits = new Float32Array(1)
+  const ubits = new Uint32Array(fbits.buffer)
+  const bitsOf = (x: number) => ((fbits[0] = x), ubits[0])
+  out.forEach((node, n) => {
+    const lo = [0, 1, 2].map(k => Math.min(...node.children.map(c => c.lo[k])))
+    const hi = [0, 1, 2].map(k => Math.max(...node.children.map(c => c.hi[k])))
+    const origin = lo.map(f)
+    const exps: number[] = []
+    const q = node.children.map(() => ({ lo: [0, 0, 0], hi: [0, 0, 0] }))
+    for (let k = 0; k < 3; k++) {
+      // The smallest power-of-two step that spans the node in 255 steps, every child box rounded outward and
+      // checked in float32 arithmetic as the shader dequantizes it (corner + q * step).
+      let e = Math.max(-126, Math.ceil(Math.log2(Math.max(hi[k] - origin[k], 1e-30) / 255)))
+      for (;;) {
+        const step = 2 ** e
+        let fits = true
+        node.children.forEach((c, i) => {
+          let a = Math.max(0, Math.floor((c.lo[k] - origin[k]) / step))
+          while (a > 0 && f(origin[k] + a * step) > c.lo[k]) a--
+          let b = Math.ceil((c.hi[k] - origin[k]) / step)
+          while (f(origin[k] + b * step) < c.hi[k]) b++
+          if (b > 255) fits = false
+          q[i].lo[k] = a
+          q[i].hi[k] = b
+        })
+        if (fits) break
+        e++
+      }
+      exps.push(e + 127)
+    }
+    const o = n * 16
+    data[o] = bitsOf(origin[0])
+    data[o + 1] = bitsOf(origin[1])
+    data[o + 2] = bitsOf(origin[2])
+    data[o + 3] = exps[0] | (exps[1] << 8) | (exps[2] << 16)
+    // One byte per child slot (an empty slot: lo 255, hi 0; the traversal skips it by its ref).
+    const used = node.children.length
+    const packed = (get: (i: number) => number, emptyV: number) => {
+      let v = 0
+      for (let i = 0; i < 4; i++) v |= (i < used ? get(i) : emptyV) << (8 * i)
+      return v >>> 0
+    }
+    data[o + 4] = packed(i => q[i].lo[0], 255)
+    data[o + 5] = packed(i => q[i].lo[1], 255)
+    data[o + 6] = packed(i => q[i].lo[2], 255)
+    data[o + 7] = packed(i => q[i].hi[0], 0)
+    data[o + 8] = packed(i => q[i].hi[1], 0)
+    data[o + 9] = packed(i => q[i].hi[2], 0)
+    for (let i = 0; i < 4; i++) data[o + 12 + i] = i < node.children.length ? node.children[i].ref : EMPTY_REF
+  })
+  return { data, nodeCount: Math.max(1, out.length), maxDepth }
+}
 
 async function gunzip(bytes: Uint8Array) {
   // A host may already have decoded the gzip (Content-Encoding); only decompress what is still gzip.
@@ -117,10 +226,11 @@ export async function loadModel(model: Exclude<Model, 'spheres'>, signal?: Abort
   const mat = section('mat', Uint8Array)
   const triCount: number = header.triCount
 
-  // BVH: the file's 16 floats per inner node are exactly four texels.
-  const bvhH = rows(header.nodeCount * 4)
-  const bvh = new Float32Array(TEX_W * bvhH * 4)
-  bvh.set(nodes)
+  // BVH: the file's binary tree, collapsed to four-wide nodes of four texels each.
+  const wide = collapseBvh4(nodes, header.nodeCount)
+  const bvhH = rows(wide.nodeCount * 4)
+  const bvh = new Uint32Array(TEX_W * bvhH * 4)
+  bvh.set(wide.data)
 
   // Triangles: v0, e1, e2 (three texels), and one texel of packed normals plus the material slot.
   const posH = rows(triCount * 3)

@@ -544,6 +544,7 @@ struct Mat {
   float subsurface_scatter_anisotropy;
   float geometry_thin_walled; // 0 or 1
   float lab_flake_coverage; float lab_flake_size; float lab_flake_tilt; // lab extension (see materials.ts)
+  float lab_fluor_weight; vec3 lab_fluor_color; vec3 lab_fluor_absorb; float lab_fluor_uv; float lab_uv_ratio; // lab extension
 };
 
 struct Surf {
@@ -993,6 +994,7 @@ uniform vec3 uLightCorner[3];
 uniform vec3 uLightU[3];
 uniform vec3 uLightV[3];
 uniform vec3 uLightRadiance[3];
+uniform float uLightUV[3]; // ultraviolet radiance: only a black light has any
 
 bool lightOn(int k) { return k >= 3 || maxc(uLightRadiance[k]) > 0.0; } // light 3 is the environment, when on
 bool facesLight(int k, vec3 o) { return dot(o - uLightCorner[k], cross(uLightU[k], uLightV[k])) > 0.0; }
@@ -1322,9 +1324,9 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
 // not disperse), so neither glass nor skin compiles the other's code.
 // AUX adds the denoiser's guide images and noise statistics (two more render targets), on GPUs that can draw
 // five at once.
-export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' | 'sss' = 'none', aux = false) {
+export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' | 'sss' | 'fluor' = 'none', aux = false) {
   const solid = glass === 'full' || glass === 'sss'
-  const defs = `${mesh ? '#define MESH 1\n' : ''}${solid ? '#define GLASS 1\n' : ''}${glass === 'sss' ? '#define SSS 1\n#define NO_DISPERSION 1\n' : ''}${glass !== 'none' ? '#define THIN 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
+  const defs = `${mesh ? '#define MESH 1\n' : ''}${solid ? '#define GLASS 1\n' : ''}${glass === 'sss' ? '#define SSS 1\n#define NO_DISPERSION 1\n' : ''}${glass !== 'none' && glass !== 'fluor' ? '#define THIN 1\n' : ''}${glass === 'fluor' ? '#define FLUOR 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
   return /* glsl */ `${HEADER}${defs}
 ${COMMON}
 ${MICROFACET}
@@ -1656,6 +1658,7 @@ Mat getMat(int i) {
     m.fuzz_color = vec3(1.0);
     m.transmission_color = vec3(1.0);
     m.subsurface_color = vec3(1.0);
+    m.lab_fluor_weight = 0.0; // re-emission would add light at other wavelengths: the test is of reflection alone
   }
   return m;
 }
@@ -1680,6 +1683,22 @@ vec3 clampIndirect(vec3 c) {
 bool nonFinite(float x) { return (floatBitsToUint(x) & 0x7f800000u) == 0x7f800000u; }
 
 uniform int uMaxScatter; // a path's scattering events inside subsurface media
+#ifdef FLUOR
+// Fluorescence (lab extension; see materials.ts). Light carries a fourth band, ultraviolet, beside R, G and B:
+// only a black light emits it, and every surface reflects it by its lab_uv_ratio. A fluorescent base absorbs part
+// of the R, G, B and UV light reaching it and re-emits it diffusely in its own color, a lobe of its own beside the
+// BSDF's: light sampling scores both, each weighted against its own lobe's sampling. A path that samples the
+// fluorescent lobe switches band: what the vertex re-emits toward the camera per unit of exciting light is fixed
+// (flOut), and from there the path gathers the light that excites it (R, G, B and UV, weighted by the absorption,
+// flIn), reflected on its way by each surface's R, G, B and UV reflectance. Light only loses energy in the
+// exchange, so one switch per path is all there is.
+#define FLUOR_LOBE_P 0.5
+// The base's share of the light reaching it, as the diffuse lobe has: under the specular, coat and fuzz layers.
+vec3 fluorBase(Surf s) { return s.tBase * (1.0 - s.metal) * (1.0 - s.transW) * (1.0 - s.EspecR3); }
+// Ultraviolet reflectance of a vertex in a sampled direction, from its visible lobes: the specular as it is, the
+// diffuse by the material's lab_uv_ratio.
+float uvAlbedo(vec3 fD, vec3 fS, Mat m) { return dot(fS, vec3(1.0 / 3.0)) + dot(fD, vec3(1.0 / 3.0)) * m.lab_uv_ratio; }
+#endif
 // Cosine-weighted direction about +z (the Lambertian exit of a walk).
 vec3 sampleCosine(vec2 u) {
   float r = sqrt(u.x), phi = TWO_PI * u.y;
@@ -1770,6 +1789,15 @@ void main() {
     // the hero's (walkR); light leaving is weighted by the walk's balance heuristic over the three channels, as in
     // pbrt-v4's chromatic media (weights per flight multiply up to 3 each: unbiased but heavy-tailed, the furnace
     // read 0.7-1.1). Walk events spend uMaxScatter, not the bounces.
+#ifdef FLUOR
+    bool excited = false;   // the path has switched band at a fluorescent vertex (see fluorBase)
+    vec3 flOut = vec3(0.0); // that vertex's re-emission toward the camera per unit of exciting light
+    vec4 flIn = vec4(0.0);  // its absorption of R, G, B and UV: how the light gathered from there excites it
+    float betaUV = 1.0;     // the switched path's UV throughput (beta carries its R, G and B)
+    float pF = 0.0;         // at the current vertex: the probability of sampling its fluorescent lobe
+    vec3 flEmit = vec3(0.0); // and that lobe's re-emitted color, times the cosine over pi it scatters with
+    vec4 flAbs = vec4(0.0);
+#endif
     bool vBack = false;   // the current vertex was reached from inside its object
     bool sssExit = false; // the current vertex is where a walk left its medium (shaded as Lambertian)
     int sssCross = 0;     // media entered: the light that comes out is direct light, exempt from the indirect clamp
@@ -1793,6 +1821,9 @@ void main() {
         if (isLight && (!lightOn(k) || solidInside)) { k++; continue; } // from inside a solid, every light is behind its wall
         vec4 u = sample4(sampleIndex, pixSeed, depth, k);
         vec3 dirW, wi;
+#ifdef FLUOR
+        bool flLobe = false; // the continuation samples the fluorescent lobe
+#endif
         float ldist = 0.0, lpdf = 0.0;
         if (isLight) {
           bool got;
@@ -1810,6 +1841,11 @@ void main() {
           if (sssExit) wi = sampleCosine(u.xy);
           else
 #endif
+#ifdef FLUOR
+          flLobe = pF > 0.0 && sample4(sampleIndex, pixSeed, depth, 5).x < pF;
+          if (flLobe) wi = sampleCosine(u.xy);
+          else
+#endif
           if (!sampleSurf(s, wo, filt, u.xyz, wi)) break;
           dirW = normalize(t1 * wi.x + t2 * wi.y + n * wi.z);
         }
@@ -1822,30 +1858,73 @@ void main() {
           bpdf = wi.z / PI;
         } else
 #endif
+#ifdef FLUOR
+        if (flLobe) {
+          fD = flEmit * (wi.z / PI);
+          fS = vec3(0.0);
+          bpdf = pF * wi.z / PI;
+        } else
+#endif
         {
           bpdf = evalSurf(s, wo, wi, filt, fD, fS);
+#ifdef FLUOR
+          bpdf *= 1.0 - pF; // the BSDF's lobes are sampled the rest of the time
+#endif
         }
         vec3 f = fD + fS;
         if (isLight) {
+#ifdef FLUOR
+          if (maxc(f) <= 0.0 && pF <= 0.0) { k++; continue; }
+#else
           if (maxc(f) <= 0.0) { k++; continue; }
+#endif
           // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
           float wl = last ? 1.0 : powerHeuristic(lpdf, bpdf);
           vec3 Le;
           if (k == ENV_LIGHT) Le = envLe(dirW);
           else Le = uLightRadiance[k];
           pending = beta * f * Le * (wl / lpdf);
+#ifdef FLUOR
+          float Luv = k == ENV_LIGHT ? 0.0 : uLightUV[k]; // the environment maps record no ultraviolet
+          if (excited) {
+            pending = flOut * (dot(flIn.rgb, pending) + flIn.a * betaUV * uvAlbedo(fD, fS, m) * Luv * (wl / lpdf));
+          } else if (pF > 0.0) {
+            float wf = last ? 1.0 : powerHeuristic(lpdf, pF * wi.z / PI);
+            pending += beta * flEmit * (wi.z / PI) * (dot(flAbs.rgb, Le) + flAbs.a * Luv) * (wf / lpdf);
+          }
+#endif
           tro = po;
           trd = dirW;
           tMax = ldist * (1.0 - 1e-4);
           shadow = true;
         } else {
           if (bpdf <= 0.0) break;
+#ifdef FLUOR
+          if (excited) betaUV *= uvAlbedo(fD, fS, m) / bpdf;
+#endif
           beta *= f / bpdf;
+#ifdef FLUOR
+          if (flLobe) {
+            excited = true;
+            flOut = beta;
+            flIn = flAbs;
+            beta = vec3(1.0);
+            betaUV = 1.0;
+          }
+          if (maxc(beta) <= 0.0 && !(excited && betaUV > 0.0)) break;
+#else
           if (maxc(beta) <= 0.0) break;
+#endif
           if (depth >= 3) {
             float q = min(maxc(beta), 0.95);
+#ifdef FLUOR
+            if (excited) q = min(maxc(flOut) * max(maxc(beta * flIn.rgb), betaUV * flIn.a), 0.95);
+#endif
             if (u.w >= q) break;
             beta /= q;
+#ifdef FLUOR
+            betaUV /= q;
+#endif
           }
           // A refracted path leaves from the far side of the surface.
           bool through = wi.z < 0.0;
@@ -1955,7 +2034,11 @@ void main() {
         // but does not block what lies behind it, as shadow rays never see it: so an environment light sampled
         // through a softbox's place and one reached past it agree (and a switched-off softbox leaves no hole).
         float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.lightT));
-        vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
+        float wL = prevTrans ? 1.0 : powerHeuristic(prevPdf, pl);
+        vec3 c = beta * uLightRadiance[h.light] * wL;
+#ifdef FLUOR
+        if (excited) c = flOut * (dot(flIn.rgb, c) + flIn.a * betaUV * uLightUV[h.light] * wL);
+#endif
         addLight(h.light, depth - sssCross >= 2 ? clampIndirect(c) : c, L, L1, L2, L3);
       }
       if (h.mat < 0) {
@@ -1964,9 +2047,15 @@ void main() {
             // The camera sees the softened backdrop; a bounce sees the environment as a light, weighted against
             // sampling it from the vertex before (none was made through a refraction).
             vec3 c = beta * (depth == 0 ? envBackdrop(rd) : envLe(rd)) * (depth == 0 || prevTrans ? 1.0 : powerHeuristic(prevPdf, envPdf(rd)));
+#ifdef FLUOR
+            if (excited) c = flOut * dot(flIn.rgb, c);
+#endif
             L3 += depth - sssCross >= 2 ? clampIndirect(c) : c;
           } else {
             vec3 c = beta * uEnv;
+#ifdef FLUOR
+            if (excited) c = flOut * dot(flIn.rgb, c);
+#endif
             L += depth - sssCross >= 2 ? clampIndirect(c) : c;
           }
         }
@@ -2013,6 +2102,12 @@ void main() {
       wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
       if (wo.z <= 1e-6 && !walkExit) break;
       if (!walkExit) s = setupSurf(m, wo, h.back, lambda, colored);
+#ifdef FLUOR
+      // A fluorescent vertex (not on the diffuse-free specular pass; and only once along a path).
+      flEmit = filt == 2 ? vec3(0.0) : fluorBase(s) * m.lab_fluor_weight * m.lab_fluor_color;
+      flAbs = vec4(m.lab_fluor_absorb, m.lab_fluor_uv);
+      pF = !excited && maxc(flEmit) > 0.0 && dot(flAbs, vec4(1.0)) > 0.0 ? FLUOR_LOBE_P : 0.0;
+#endif
 #ifdef MESH
       s.nf = flakeNormal(m, transpose(uModelRot) * (p - uModelPos));
 #else

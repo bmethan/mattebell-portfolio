@@ -41,6 +41,16 @@ export interface OpenPBR {
   lab_flake_coverage: number
   lab_flake_size: number
   lab_flake_tilt: number
+  // Lab extension, not part of OpenPBR 1.1: fluorescence in the base. The base absorbs lab_fluor_absorb of the
+  // red, green and blue light reaching it and lab_fluor_uv of the ultraviolet, and re-emits lab_fluor_weight of that
+  // energy (quantum yield times the Stokes loss) diffusely, spread over red, green and blue as lab_fluor_color
+  // (summing to 1). With base_color + lab_fluor_absorb at most 1 per channel, no energy is created. lab_uv_ratio:
+  // the base's diffuse reflectance of ultraviolet, relative to its mean visible reflectance.
+  lab_fluor_weight: number
+  lab_fluor_color: RGB
+  lab_fluor_absorb: RGB
+  lab_fluor_uv: number
+  lab_uv_ratio: number
 }
 
 export const MATERIAL_FIELDS = [
@@ -78,6 +88,11 @@ export const MATERIAL_FIELDS = [
   'lab_flake_coverage',
   'lab_flake_size',
   'lab_flake_tilt',
+  'lab_fluor_weight',
+  'lab_fluor_color',
+  'lab_fluor_absorb',
+  'lab_fluor_uv',
+  'lab_uv_ratio',
 ] as const satisfies readonly (keyof OpenPBR)[]
 
 // Reference nodedef defaults (open_pbr_surface.mtlx, version 1.1.1).
@@ -116,6 +131,11 @@ export const OPENPBR_DEFAULTS: OpenPBR = {
   lab_flake_coverage: 0,
   lab_flake_size: 0.012,
   lab_flake_tilt: 0.3,
+  lab_fluor_weight: 0,
+  lab_fluor_color: [1 / 3, 1 / 3, 1 / 3],
+  lab_fluor_absorb: [0, 0, 0],
+  lab_fluor_uv: 0,
+  lab_uv_ratio: 1,
 }
 
 const mat = (p: Partial<OpenPBR>): OpenPBR => ({ ...OPENPBR_DEFAULTS, ...p })
@@ -162,18 +182,19 @@ export const COLOR_CHECKER: RGB[] = [
 
 export type Hero =
   | 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium' | 'glass' | 'diamond' | 'soapbubble'
-  | 'skin' | 'marble' | 'ceramic' | 'honey' | 'copper' | 'silver'
+  | 'skin' | 'marble' | 'ceramic' | 'honey' | 'copper' | 'silver' | 'highlighter' | 'dayglo' | 'paper'
 type RoughnessParam = 'specular_roughness' | 'fuzz_roughness' | 'coat_roughness'
 
 // The hero materials by family: the Hero row picks a family, a second row its material (a family of one has no
 // second row). Car paint and skin have their own rows below (finish, tone).
-export type HeroFamily = 'metal' | 'dielectric' | 'layered' | 'transparent' | 'translucent' | 'fabric'
+export type HeroFamily = 'metal' | 'dielectric' | 'layered' | 'transparent' | 'translucent' | 'fluorescent' | 'fabric'
 export const HERO_FAMILIES: { id: HeroFamily; label: string; heroes: Hero[] }[] = [
   { id: 'layered', label: 'Layered', heroes: ['carpaint', 'thinfilm'] },
   { id: 'metal', label: 'Metal', heroes: ['gold', 'copper', 'silver', 'brushed', 'titanium'] },
   { id: 'dielectric', label: 'Dielectric', heroes: ['plastic', 'ceramic'] },
   { id: 'transparent', label: 'Transparent', heroes: ['glass', 'diamond', 'honey', 'soapbubble'] },
   { id: 'translucent', label: 'Translucent', heroes: ['skin', 'marble'] },
+  { id: 'fluorescent', label: 'Fluorescent', heroes: ['highlighter', 'dayglo', 'paper'] },
   { id: 'fabric', label: 'Fabric', heroes: ['velvet'] },
 ]
 export const HERO_ORDER: Hero[] = HERO_FAMILIES.flatMap(f => f.heroes)
@@ -211,6 +232,56 @@ export const HERO_PRESETS: Record<Hero, HeroPreset> = {
       base_metalness: 1,
       specular_color: [0.987, 1.013, 0.997],
       specular_roughness: 0.02,
+    }),
+  },
+  // Authored, lab extension (fluorescence): highlighter ink, a yellow whose dye (pyranine-like) absorbs blue and
+  // near-ultraviolet light and re-emits it green-yellow: brighter than its own reflectance in daylight, and the one
+  // thing still glowing under a black light.
+  highlighter: {
+    label: 'Highlighter',
+    official: false,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      base_color: [0.78, 0.84, 0.06],
+      specular_roughness: 0.5,
+      lab_fluor_weight: 0.7,
+      lab_fluor_color: [0.3, 0.67, 0.03],
+      lab_fluor_absorb: [0, 0.05, 0.85],
+      lab_fluor_uv: 0.9,
+      lab_uv_ratio: 0.05,
+    }),
+  },
+  // Authored, lab extension: daylight-fluorescent orange paint (Day-Glo type): the pigment absorbs green, blue and
+  // ultraviolet and re-emits orange-red, so it reads hotter than any ordinary orange.
+  dayglo: {
+    label: 'Fluorescent orange',
+    official: false,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      base_color: [0.9, 0.28, 0.04],
+      specular_roughness: 0.45,
+      lab_fluor_weight: 0.7,
+      lab_fluor_color: [0.75, 0.25, 0],
+      lab_fluor_absorb: [0, 0.6, 0.9],
+      lab_fluor_uv: 0.85,
+      lab_uv_ratio: 0.05,
+    }),
+  },
+  // Authored, lab extension: white paper with optical brighteners, which absorb near-ultraviolet (around 350 nm)
+  // and re-emit blue (around 430 nm). Studio light has no ultraviolet, so it looks plain off-white; under a black
+  // light it glows blue, as white shirts do.
+  paper: {
+    label: 'Brightened paper',
+    official: false,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      base_color: [0.8, 0.79, 0.74],
+      specular_weight: 0.5,
+      specular_roughness: 0.7,
+      lab_fluor_weight: 0.5,
+      lab_fluor_color: [0.2, 0.25, 0.55],
+      lab_fluor_uv: 0.9,
+      lab_uv_ratio: 0.1,
     }),
   },
   // Official: examples/open_pbr_copper.mtlx

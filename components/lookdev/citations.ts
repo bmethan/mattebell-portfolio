@@ -1,6 +1,6 @@
 // References for the lab's technical notes, grouped by topic. Every entry was checked against its primary source
 // (paper, journal page, official spec or repository) before it went on the page.
-export const CITATION_GROUPS = ['Shading model', 'Sampling', 'Geometry', 'Subsurface', 'Denoising', 'Color and display'] as const
+export const CITATION_GROUPS = ['Shading model', 'Sampling', 'Geometry', 'Subsurface', 'Fluorescence', 'Denoising', 'Color and display'] as const
 export type CitationGroup = (typeof CITATION_GROUPS)[number]
 
 export interface Citation {
@@ -301,6 +301,26 @@ export const CITATIONS: Citation[] = [
     venue: 'The Astrophysical Journal 93',
     year: '1941',
     url: 'https://doi.org/10.1086/144246',
+  },
+  {
+    id: 'glassner-fluor',
+    group: 'Fluorescence',
+    short: 'Fluorescence in rendering',
+    authors: 'Andrew S. Glassner',
+    title: 'A Model for Fluorescence and Phosphorescence',
+    venue: 'Photorealistic Rendering Techniques (Eurographics Workshop on Rendering)',
+    year: '1995',
+    url: 'https://doi.org/10.1007/978-3-642-87825-1_5',
+  },
+  {
+    id: 'jung-fluor',
+    group: 'Fluorescence',
+    short: 'Fluorescent reflectance',
+    authors: 'A. Jung, A. Wilkie, J. Hanika, W. Jakob, C. Dachsbacher',
+    title: 'Wide Gamut Spectral Upsampling with Fluorescence',
+    venue: 'Computer Graphics Forum 38(4)',
+    year: '2019',
+    url: 'https://doi.org/10.1111/cgf.13773',
   },
   {
     id: 'pbrt4',

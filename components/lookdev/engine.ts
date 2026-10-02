@@ -5,6 +5,7 @@ import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './mo
 import { ENVIRONMENTS, loadEnvironment, whiteEnvironment, type Env, type EnvData } from './environments'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
+export type KeyType = 'softbox' | 'blacklight'
 // Split compare: two versions of the image either side of a draggable line (see LabState.split).
 export type Compare = 'off' | 'denoise' | 'multiscatter' | 'view'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
@@ -14,6 +15,7 @@ export interface LabState {
   keyAz: number
   keyEl: number
   key: boolean
+  keyType: KeyType // the key's lamp: a white softbox, or a black light (ultraviolet)
   fill: boolean
   rim: boolean
   keyKelvin: number
@@ -50,6 +52,7 @@ export const DEFAULT_STATE: LabState = {
   keyAz: 0.62,
   keyEl: 0.52,
   key: true,
+  keyType: 'softbox',
   fill: true,
   rim: true,
   keyKelvin: 4300,
@@ -145,9 +148,11 @@ export interface LabStatus {
 // The tracer variant a scene needs: meshes for a model; full glass for a solid transmissive hero; the cheaper thin
 // glass for thin-walled transmission (a model's windows). On the balls any glass hero takes the full variant,
 // which is compiled ahead while the lab is in view.
-type VariantKey = 'base' | 'base+glass' | 'base+sss' | 'mesh' | 'mesh+thin' | 'mesh+glass' | 'mesh+sss'
+type VariantKey = 'base' | 'base+glass' | 'base+sss' | 'base+fluor' | 'mesh' | 'mesh+thin' | 'mesh+glass' | 'mesh+sss' | 'mesh+fluor'
 function variantOf(s: LabState): VariantKey {
   const hero = heroMaterial(s)
+  // Fluorescence carries a fourth (ultraviolet) band along the path: its own variant, so nothing else pays for it.
+  if (hero.lab_fluor_weight > 0) return s.model === 'spheres' ? 'base+fluor' : 'mesh+fluor'
   // Subsurface scattering is a medium under a refracting surface: its own solid variant, with the walk.
   if (hero.subsurface_weight > 0 && hero.geometry_thin_walled < 0.5) return s.model === 'spheres' ? 'base+sss' : 'mesh+sss'
   const heroGlass = hero.transmission_weight > 0
@@ -161,15 +166,19 @@ const VARIANT_LABEL: Record<VariantKey, string> = {
   base: 'the renderer',
   'base+glass': 'the glass shader',
   'base+sss': 'the subsurface shader',
+  'base+fluor': 'the fluorescence shader',
+  'mesh+fluor': 'the model shader with fluorescence',
   mesh: 'the model shader',
   'mesh+thin': 'the model shader with glass',
   'mesh+glass': 'the model shader with solid glass',
   'mesh+sss': 'the model shader with subsurface',
 }
-const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full' | 'sss'> = {
+const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full' | 'sss' | 'fluor'> = {
   base: 'none',
   'base+glass': 'full',
   'base+sss': 'sss',
+  'base+fluor': 'fluor',
+  'mesh+fluor': 'fluor',
   mesh: 'none',
   'mesh+thin': 'thin',
   'mesh+glass': 'full',
@@ -290,6 +299,10 @@ const INDIRECT_CLAMP = 12
 // Base radiance of key, fill and rim (unit luminance color): the key alone lights the 18% gray ball to about middle
 // gray (it subtends ~0.16 sr, so L ~ pi / 0.16), the fill near a 1:6 ratio, a hot rim. The mixer scales these.
 const LIGHT_POWER = [20, 1.8, 36]
+// The key as a black light (a 365 nm tube): its power as ultraviolet, with the faint deep violet such tubes leak
+// (ACEScg, about 2.5% of the softbox's luminance). The mixer leaves its color alone (no color temperature).
+const BLACKLIGHT_UV = 1
+const BLACKLIGHT_VISIBLE: Vec3 = [0.05, 0, 0.2]
 
 // Cyc: the floor ends 4 units behind the balls and sweeps up a 3-unit radius into a wall 7 units back, behind the
 // rim light (its nearest corner sits about 4.7 back) so no softbox pokes through.
@@ -1119,7 +1132,9 @@ export class LookdevEngine {
       gl.uniform3fv(L(`uLightCorner[${i}]`), r.rect.corner)
       gl.uniform3fv(L(`uLightU[${i}]`), r.rect.U)
       gl.uniform3fv(L(`uLightV[${i}]`), r.rect.V)
-      gl.uniform3fv(L(`uLightRadiance[${i}]`), s.furnace ? [0, 0, 0] : [r.power, r.power, r.power])
+      const black = i === 0 && s.keyType === 'blacklight'
+      gl.uniform3fv(L(`uLightRadiance[${i}]`), s.furnace ? [0, 0, 0] : black ? scale(BLACKLIGHT_VISIBLE, r.power) : [r.power, r.power, r.power])
+      gl.uniform1f(L(`uLightUV[${i}]`), !s.furnace && black ? r.power * BLACKLIGHT_UV : 0)
     })
 
     gl.uniform4uiv(L('uSobol'), SOBOL_UNIFORM)
@@ -1636,7 +1651,9 @@ export class LookdevEngine {
     if (s.furnace) return [[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]
     const w = (on: boolean, kelvin: number, gain: number) => (on ? scale(kelvinToACEScg(kelvin), 2 ** gain) : [0, 0, 0]) as Vec3
     const e = s.envOn ? 2 ** s.envGain : 0
-    return [w(s.key, s.keyKelvin, s.keyGain), w(s.fill, s.fillKelvin, s.fillGain), w(s.rim, s.rimKelvin, s.rimGain), [e, e, e]]
+    const g = s.key ? 2 ** s.keyGain : 0
+    const key: Vec3 = s.keyType === 'blacklight' ? [g, g, g] : w(s.key, s.keyKelvin, s.keyGain)
+    return [key, w(s.fill, s.fillKelvin, s.fillGain), w(s.rim, s.rimKelvin, s.rimGain), [e, e, e]]
   }
 
   // Encoded image of the current frame (used to produce the static fallback poster).

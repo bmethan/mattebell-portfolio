@@ -8,6 +8,7 @@ import {
   TARGET_SPP,
   MESH_FURNACE_BOUNCES,
   type Compare,
+  type KeyType,
   type LabState,
   type LabStatus,
   type Pass,
@@ -57,6 +58,7 @@ function Range({
   value,
   label,
   onChange,
+  disabled,
 }: {
   min: number
   max: number
@@ -64,11 +66,13 @@ function Range({
   value: number
   label: string
   onChange: (v: number) => void
+  disabled?: boolean
 }) {
   return (
     <input
       type="range"
       className="lab-range"
+      disabled={disabled}
       min={min}
       max={max}
       step={step}
@@ -125,6 +129,10 @@ const TECH_NOTES: [string, string][] = [
   ],
   ['Light mixer', "Each light renders into its own image, like a production renderer's light groups, so switching, dimming or recoloring a light needs no new render."],
   [
+    'Fluorescence',
+    'A lab extension, as OpenPBR has none. Light carries a fourth band, ultraviolet, which only the black light emits. A fluorescent base absorbs part of the ultraviolet and visible light reaching it and re-emits it in its own color, never more energy than it took in. The fluorescent presets are authored from how their dyes behave, not measured, and the environment maps carry no ultraviolet.',
+  ],
+  [
     'Environments',
     "Four HDR environments from Poly Haven light the scene as a light of their own in the mixer. Each is importance sampled through an alias table and weighted against the materials' own sampling, scaled so its brightest light matches the key, and turned so that light starts where the key does. The white furnace test runs through the same code.",
   ],
@@ -148,6 +156,11 @@ function useWaitSeconds(key: string | null) {
 }
 // The count reads after the first two seconds: shorter waits need no clock.
 const waitClock = (secs: number) => (secs >= 2 ? `  ${secs} s` : '')
+
+const KEY_TYPES: { id: KeyType; label: string }[] = [
+  { id: 'softbox', label: 'Softbox' },
+  { id: 'blacklight', label: 'Black light' },
+]
 
 const COMPARES: { id: Compare; label: string; sides?: [string, string] }[] = [
   { id: 'off', label: 'Off' },
@@ -299,8 +312,9 @@ function LightMixer({ lab, update }: { lab: LabState; update: (patch: Partial<La
             value={lab[l.kelvin]}
             label={`${l.label} color temperature, kelvin`}
             onChange={v => update({ [l.kelvin]: v })}
+            disabled={l.id === 'key' && lab.keyType === 'blacklight'}
           />
-          <span className="lab-readout">{lab[l.kelvin]}K</span>
+          <span className="lab-readout">{l.id === 'key' && lab.keyType === 'blacklight' ? 'UV' : `${lab[l.kelvin]}K`}</span>
         </div>
       ))}
       {lab.env !== 'none' && (
@@ -620,6 +634,13 @@ export default function LookdevLab() {
   const family = familyOf(lab.hero)
   lastInFamily.current[family.id] = lab.hero
   const pickHero = (h: Hero) => update({ hero: h, heroRoughness: null, heroAniso: null })
+  // The black light is judged alone, as in a dark room: picking it turns the fill, rim and environment off (the
+  // mixer brings them back); back to the softbox, they return.
+  const pickKeyType = (t: KeyType) => {
+    if (t === lab.keyType) return
+    const on = t === 'softbox'
+    update({ keyType: t, key: true, fill: on, rim: on, envOn: on })
+  }
   // An environment first lights the scene alone (the softboxes switch off; the mixer brings them back), as it is
   // judged in lookdev. Back to none, the softbox rig returns.
   const pickEnv = (en: Env) => {
@@ -742,7 +763,9 @@ export default function LookdevLab() {
                 ? 'White furnace'
                 : turnsEnv
                   ? `${ENVIRONMENTS[lab.env as Exclude<Env, 'none'>].label} environment  ${deg(lab.envRot)}°`
-                  : `Key ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el  ${lab.keyKelvin}K`}
+                  : lab.keyType === 'blacklight'
+                    ? `Black light ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el`
+                    : `Key ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el  ${lab.keyKelvin}K`}
             </div>
             <div className="lab-hud lab-hud-right">
               {status.model === 'failed' ? (
@@ -932,6 +955,16 @@ export default function LookdevLab() {
             )}
             {tab === 'light' && (
               <>
+                <div className="lab-row">
+                  <Group label="Key lamp">
+                    {KEY_TYPES.map(t => (
+                      <Pill key={t.id} on={lab.keyType === t.id} onClick={() => pickKeyType(t.id)}>
+                        {t.label}
+                      </Pill>
+                    ))}
+                  </Group>
+                </div>
+
                 <LightMixer lab={lab} update={update} />
 
                 <div className="lab-row">

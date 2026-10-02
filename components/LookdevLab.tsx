@@ -15,6 +15,7 @@ import {
 import { HERO_PRESETS, HERO_FAMILIES, familyOf, type Hero, type HeroFamily, PAINT_FINISHES, PAINT_ORDER, SKIN_ORDER, SKIN_TONES, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
 import { MODELS, MODEL_ORDER, type Model } from './lookdev/models'
 import { CITATIONS, CITATION_GROUPS, citeAuthors } from './lookdev/citations'
+import { ENVIRONMENTS, ENV_ORDER, type Env } from './lookdev/environments'
 import WorkIndicator from './WorkIndicator'
 
 const PASSES: { id: Pass; label: string }[] = [
@@ -123,6 +124,10 @@ const TECH_NOTES: [string, string][] = [
   ],
   ['Light mixer', "Each light renders into its own image, like a production renderer's light groups, so switching, dimming or recoloring a light needs no new render."],
   [
+    'Environments',
+    "Four HDR environments from Poly Haven light the scene as a light of their own in the mixer. Each is importance sampled through an alias table and weighted against the materials' own sampling, scaled so its brightest light matches the key, and turned so that light starts where the key does. The white furnace test runs through the same code.",
+  ],
+  [
     'Denoiser',
     "While it renders, the image is shown through an edge-avoiding wavelet filter guided by albedo, normals and each pixel's noise, labelled in the frame. It hands over to the raw render as samples build up: the finished image is never filtered.",
   ],
@@ -177,6 +182,28 @@ function LightMixer({ lab, update }: { lab: LabState; update: (patch: Partial<La
           <span className="lab-readout">{lab[l.kelvin]}K</span>
         </div>
       ))}
+      {lab.env !== 'none' && (
+        <div className="lab-mixer-row">
+          <Pill on={lab.envOn} onClick={() => update({ envOn: !lab.envOn })}>
+            HDRI
+          </Pill>
+          <Range
+            min={-3}
+            max={3}
+            step={0.1}
+            value={lab.envGain}
+            label="Environment intensity, stops"
+            onChange={v => update({ envGain: v })}
+          />
+          <span className="lab-readout">
+            {lab.envGain >= 0 ? '+' : ''}
+            {lab.envGain.toFixed(1)}
+          </span>
+          {/* An HDR environment keeps its own colors: no color temperature. */}
+          <span />
+          <span />
+        </div>
+      )}
     </div>
   )
 }
@@ -201,6 +228,7 @@ export default function LookdevLab() {
   const labRef = useRef<LabState>(DEFAULT_STATE)
   const dragging = useRef<number | null>(null) // pointerId of the drag moving the light
   const touchStart = useRef<{ id: number; x: number; y: number } | null>(null)
+  const envGrab = useRef<{ u: number; rot: number } | null>(null) // where a drag turning the environment began
 
   const [lab, setLab] = useState<LabState>(DEFAULT_STATE)
   const [status, setStatus] = useState<LabStatus>({ spp: 0, target: TARGET_SPP, converged: false, preview: false, ms: 0, model: 'ready' })
@@ -389,15 +417,23 @@ export default function LookdevLab() {
     } catch {}
   }
 
+  // With the key off and an environment lighting the scene, a drag turns the environment instead: grabbed where
+  // the drag starts, a full turn across the image's width.
+  const turnsEnv = !lab.key && lab.env !== 'none'
   const setFromPointer = (e: React.PointerEvent<HTMLCanvasElement>) => {
     noteLightMoved()
     const r = e.currentTarget.getBoundingClientRect()
     const u = clamp((e.clientX - r.left) / r.width, 0, 1)
     const v = clamp((e.clientY - r.top) / r.height, 0, 1)
-    update({ keyAz: (u - 0.5) * AZ_RANGE, keyEl: clamp(EL_MAX - v * (EL_MAX - EL_MIN) * 1.1, EL_MIN, EL_MAX) })
+    if (turnsEnv) {
+      const g = (envGrab.current ??= { u, rot: labRef.current.envRot })
+      const rot = g.rot - (u - g.u) * 2 * Math.PI // the backdrop follows the pointer
+      update({ envRot: Math.atan2(Math.sin(rot), Math.cos(rot)) })
+    } else update({ keyAz: (u - 0.5) * AZ_RANGE, keyEl: clamp(EL_MAX - v * (EL_MAX - EL_MIN) * 1.1, EL_MIN, EL_MAX) })
   }
 
   const beginDrag = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    envGrab.current = null
     dragging.current = e.pointerId
     e.currentTarget.setPointerCapture(e.pointerId)
     engineRef.current?.setInteracting(true)
@@ -438,6 +474,12 @@ export default function LookdevLab() {
     if (lab.furnace || !ready) return
     const s = 0.08
     let { keyAz, keyEl } = labRef.current // held keys repeat faster than React re-renders
+    if (turnsEnv && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault()
+      const r = labRef.current.envRot + (e.key === 'ArrowLeft' ? -s : s)
+      update({ envRot: Math.atan2(Math.sin(r), Math.cos(r)) })
+      return
+    }
     if (e.key === 'ArrowLeft') keyAz -= s
     else if (e.key === 'ArrowRight') keyAz += s
     else if (e.key === 'ArrowUp') keyEl += s
@@ -452,6 +494,13 @@ export default function LookdevLab() {
   const family = familyOf(lab.hero)
   lastInFamily.current[family.id] = lab.hero
   const pickHero = (h: Hero) => update({ hero: h, heroRoughness: null, heroAniso: null })
+  // An environment first lights the scene alone (the softboxes switch off; the mixer brings them back), as it is
+  // judged in lookdev. Back to none, the softbox rig returns.
+  const pickEnv = (en: Env) => {
+    if (en === lab.env) return
+    const rig = en === 'none' ? { key: true, fill: true, rim: true } : lab.env === 'none' ? { key: false, fill: false, rim: false } : {}
+    update({ env: en, envOn: true, ...rig })
+  }
   const heroBase = heroParams(lab.hero, lab.paint, lab.flakes, lab.skinTone)
   const heroRough = lab.heroRoughness ?? heroBase[hero.roughnessParam]
   const brushed = heroBase.specular_roughness_anisotropy > 0
@@ -485,9 +534,18 @@ export default function LookdevLab() {
 
       <p className="lab-howto">
         <span className="lab-howto-pointer">Drag anywhere on the image</span>
-        <span className="lab-howto-touch">Swipe sideways on the image</span> to move the key light (
-        <span className="lab-howto-marker" aria-hidden="true" />
-        <span className="sr-only">the small circle</span> marks it)<span aria-hidden="true"> · </span>
+        <span className="lab-howto-touch">Swipe sideways on the image</span>
+        {turnsEnv ? (
+          ' to turn the environment'
+        ) : (
+          <>
+            {' '}
+            to move the key light (
+            <span className="lab-howto-marker" aria-hidden="true" />
+            <span className="sr-only">the small circle</span> marks it)
+          </>
+        )}
+        <span aria-hidden="true"> · </span>
         <span className="sr-only">. </span>Every control below is live
       </p>
 
@@ -499,8 +557,8 @@ export default function LookdevLab() {
             ref={canvasRef}
             tabIndex={0}
             role="application"
-            aria-roledescription="key light control"
-            aria-label="Path traced render of three lookdev reference balls. Drag, or use the arrow keys, to move the key light."
+            aria-roledescription={turnsEnv ? 'environment control' : 'key light control'}
+            aria-label={`Path traced render of the lookdev references. Drag, or use the arrow keys, to ${turnsEnv ? 'turn the environment' : 'move the key light'}.`}
             className="lab-canvas"
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
@@ -538,10 +596,16 @@ export default function LookdevLab() {
         {mode === 'live' && ready && (
           <>
             <div className="sr-only" aria-live="polite">
-              {`Key light at ${deg(lab.keyAz)} degrees azimuth, ${deg(lab.keyEl)} degrees elevation`}
+              {turnsEnv
+                ? `Environment turned ${deg(lab.envRot)} degrees`
+                : `Key light at ${deg(lab.keyAz)} degrees azimuth, ${deg(lab.keyEl)} degrees elevation`}
             </div>
             <div className="lab-hud lab-hud-left">
-              {lab.furnace ? 'White furnace' : `Key ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el  ${lab.keyKelvin}K`}
+              {lab.furnace
+                ? 'White furnace'
+                : turnsEnv
+                  ? `${ENVIRONMENTS[lab.env as Exclude<Env, 'none'>].label} environment  ${deg(lab.envRot)}°`
+                  : `Key ${deg(lab.keyAz)}° az  ${deg(lab.keyEl)}° el  ${lab.keyKelvin}K`}
             </div>
             <div className="lab-hud lab-hud-right">
               {status.model === 'failed' ? (
@@ -549,7 +613,11 @@ export default function LookdevLab() {
               ) : status.model === 'loading' ? (
                 <>
                   <WorkIndicator className="lab-work" />
-                  {status.waitingFor === 'model' && model ? `Loading the ${model.label.toLowerCase()}` : 'Compiling shaders'}
+                  {status.waitingFor === 'model' && model
+                    ? `Loading the ${model.label.toLowerCase()}`
+                    : status.waitingFor === 'environment'
+                      ? 'Loading the environment'
+                      : 'Compiling shaders'}
                 </>
               ) : (
                 <>
@@ -629,6 +697,29 @@ export default function LookdevLab() {
           </div>
 
           <LightMixer lab={lab} update={update} />
+
+          <div className="lab-row">
+            <Group label="Environment">
+              {ENV_ORDER.map(en => (
+                <Pill key={en} on={lab.env === en} onClick={() => pickEnv(en)}>
+                  {en === 'none' ? 'None' : ENVIRONMENTS[en].label}
+                </Pill>
+              ))}
+            </Group>
+            {lab.env !== 'none' && (
+              <Group label="Turn">
+                <Range
+                  min={-180}
+                  max={180}
+                  step={1}
+                  value={deg(lab.envRot)}
+                  label="Environment turn, degrees"
+                  onChange={v => update({ envRot: (v * Math.PI) / 180 })}
+                />
+                <span className="lab-readout">{deg(lab.envRot)}°</span>
+              </Group>
+            )}
+          </div>
 
           <div className="lab-row">
             <Group label="Hero">
@@ -790,6 +881,21 @@ export default function LookdevLab() {
             {' · '}
             <a href={model.credit.licenseUrl} target="_blank" rel="noopener noreferrer">
               {model.credit.license}
+            </a>
+          </span>
+        </p>
+      )}
+      {lab.env !== 'none' && (
+        <p className="lab-credit">
+          <span className="lab-label">Environment</span>
+          <span>
+            {ENVIRONMENTS[lab.env].title} by {ENVIRONMENTS[lab.env].authors}, Poly Haven.{' '}
+            <a href={ENVIRONMENTS[lab.env].url} target="_blank" rel="noopener noreferrer">
+              Source
+            </a>
+            {' · '}
+            <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener noreferrer">
+              CC0
             </a>
           </span>
         </p>

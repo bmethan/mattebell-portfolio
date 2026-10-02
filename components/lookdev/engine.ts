@@ -2,10 +2,11 @@ import { VERT, E_TABLE_FRAG, DISPLAY_FRAG, DENOISE_PREP_FRAG, ATROUS_FRAG, trace
 import { kelvinToACEScg } from './color'
 import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, BALLS_METERS_PER_UNIT, COLOR_CHECKER, heroParams, subsurfaceScale, type OpenPBR, type Hero, type PaintFinish, type SkinTone, type Stage } from './materials'
 import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
+import { ENVIRONMENTS, loadEnvironment, whiteEnvironment, type Env, type EnvData } from './environments'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
-export type { Hero, Model, PaintFinish, SkinTone, Stage }
+export type { Env, Hero, Model, PaintFinish, SkinTone, Stage }
 
 export interface LabState {
   keyAz: number
@@ -24,6 +25,10 @@ export interface LabState {
   modelYaw: number // turntable angle of a model, radians
   stage: Stage
   chart: boolean // the color chart beside the reference balls
+  env: Env // an HDR environment lighting the scene, or none
+  envOn: boolean // the environment's light, in the mixer
+  envGain: number // its intensity in stops, in the mixer
+  envRot: number // its turn about the vertical axis, radians
   hero: Hero
   paint: PaintFinish // car paint's finish
   flakes: boolean // car paint flakes (metallic, pearl and iridescent finishes)
@@ -54,6 +59,10 @@ export const DEFAULT_STATE: LabState = {
   modelYaw: 0.6,
   stage: 'void',
   chart: true,
+  env: 'none',
+  envOn: true,
+  envGain: 0,
+  envRot: 0,
   hero: 'carpaint',
   paint: 'solid',
   flakes: false,
@@ -70,7 +79,7 @@ export const DEFAULT_STATE: LabState = {
 // Settings the display applies to the accumulated images (each light has its own), so they never re-render.
 const DISPLAY_KEYS = new Set<string>([
   'exposure', 'view', 'key', 'fill', 'rim', 'keyKelvin', 'fillKelvin', 'rimKelvin', 'keyGain', 'fillGain', 'rimGain',
-  'denoise',
+  'denoise', 'envOn', 'envGain',
 ])
 export const isDisplayOnly = (patch: Partial<LabState>) => Object.keys(patch).every(k => DISPLAY_KEYS.has(k))
 
@@ -99,6 +108,13 @@ export function heroMaterial(s: LabState): OpenPBR {
   return m
 }
 
+interface EnvGPU {
+  map: WebGLTexture
+  alias: WebGLTexture
+  w: number
+  h: number
+}
+
 export interface LabStatus {
   spp: number
   target: number
@@ -106,7 +122,7 @@ export interface LabStatus {
   preview: boolean // a proxy-resolution preview is on screen while the scene changes
   ms: number // render time of the current image: time spent rendering since the last change, pauses excluded
   model: 'ready' | 'loading' | 'failed' // the picked model's file and the shader variant the scene needs
-  waitingFor?: 'model' | 'shaders' // while loading: the model's file, or only the variant's compile
+  waitingFor?: 'model' | 'environment' | 'shaders' // while loading: the model's file, the environment's, or only the variant's compile
 }
 
 // The tracer variant a scene needs: meshes for a model; full glass for a solid transmissive hero; the cheaper thin
@@ -245,6 +261,9 @@ const LIGHT_POWER = [20, 1.8, 36]
 const CYC_Z = -4
 const CYC_R = 3
 
+// The camera sees an HDR environment softened, as a backdrop out of focus: this mip level of it (1k maps).
+const ENV_BACKDROP_BLUR = 2.5
+
 // Scene: three unit spheres resting on a floor at y = 0.
 export const BALL_X = [-2.4, 0, 2.4]
 const CENTROID: Vec3 = [0, 1, 0]
@@ -338,7 +357,7 @@ export class LookdevEngine {
   private vao: WebGLVertexArrayObject
   private progTrace: WebGLProgram
   private progDisplay: WebGLProgram
-  // Denoiser and adaptive sampling need the tracer's two extra images (five render targets at once).
+  // The denoiser needs the tracer's two extra images (six render targets at once).
   readonly canDenoise: boolean
   private progPrep: WebGLProgram | null = null
   private progAtrous: WebGLProgram | null = null
@@ -353,6 +372,12 @@ export class LookdevEngine {
   private meshes = new Map<Model, MeshGPU>()
   private meshLoading = new Set<Model>()
   private meshLoadFailed = new Set<Model>()
+  // HDR environments, each fetched once and kept on the GPU: its radiance (mipmapped) and its alias table.
+  private envs = new Map<Env, EnvGPU>()
+  private envLoading = new Set<Env>()
+  private envLoadFailed = new Set<Env>()
+  private envBlank: WebGLTexture | null = null // bound in their place while no environment is in use
+  private envWhite: EnvGPU | null = null // the white furnace's surround
   private parallel = false
   private uploadedFor: WebGLProgram | null = null // the trace program the scene uniforms were last set on
   private live = false
@@ -450,7 +475,7 @@ export class LookdevEngine {
     this.timer = gl.getExtension('EXT_disjoint_timer_query_webgl2')
     const parallel = !!gl.getExtension('KHR_parallel_shader_compile')
     this.parallel = parallel
-    this.canDenoise = gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 5 && gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) >= 5
+    this.canDenoise = gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 6 && gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) >= 6
     this.progTrace = startProgram(gl, traceFrag(false, 'none', this.canDenoise))
     if (this.canDenoise) {
       this.progPrep = startProgram(gl, DENOISE_PREP_FRAG)
@@ -521,9 +546,60 @@ export class LookdevEngine {
   private ensureModel() {
     if (this.disposed || !this.live) return
     this.ensureVariant(variantOf(this.state))
+    const env = this.state.env
+    if (env !== 'none' && !this.envs.has(env) && !this.envLoading.has(env) && !this.envLoadFailed.has(env)) this.loadEnv(env)
     const model = this.state.model
     if (model === 'spheres') return
     if (!this.meshes.has(model) && !this.meshLoading.has(model) && !this.meshLoadFailed.has(model)) this.loadMesh(model)
+  }
+
+  private async loadEnv(env: Exclude<Env, 'none'>) {
+    this.envLoading.add(env)
+    try {
+      const d = await loadEnvironment(env)
+      if (this.disposed) return
+      this.envs.set(env, this.uploadEnv(d))
+      this.sceneDirty = true
+    } catch (err) {
+      console.error(err)
+      this.envLoadFailed.add(env)
+    } finally {
+      this.envLoading.delete(env)
+    }
+    this.kick()
+    this.reportModel()
+  }
+
+  private uploadEnv(d: EnvData): EnvGPU {
+    const gl = this.gl
+    gl.activeTexture(gl.TEXTURE11) // its own unit, so no binding in use elsewhere changes
+    const map = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_2D, map)
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, d.w, d.h, 0, gl.RGBA, gl.FLOAT, d.rgba)
+    // Mipmaps for the backdrop need half floats to be renderable; without them it is sharp (no softening).
+    for (let i = 0; i < 8 && gl.getError() !== gl.NO_ERROR; i++); // clear earlier errors
+    gl.generateMipmap(gl.TEXTURE_2D)
+    const mips = gl.getError() === gl.NO_ERROR
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    const alias = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_2D, alias)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, d.w, d.h, 0, gl.RGBA, gl.FLOAT, d.alias)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    return { map, alias, w: d.w, h: d.h }
+  }
+
+  // The environment the tracer uses: the white furnace's, or the picked one once loaded.
+  private activeEnv(): EnvGPU | undefined {
+    const s = this.state
+    if (s.furnace) return (this.envWhite ??= this.uploadEnv(whiteEnvironment()))
+    return s.env === 'none' ? undefined : this.envs.get(s.env)
   }
 
   private ensureVariant(key: VariantKey) {
@@ -590,6 +666,7 @@ export class LookdevEngine {
   private waitingFor(): LabStatus['waitingFor'] {
     const model = this.state.model
     if (model !== 'spheres' && !this.meshes.has(model)) return 'model'
+    if (this.state.env !== 'none' && !this.envs.has(this.state.env)) return 'environment'
     const key = variantOf(this.state)
     return key === 'base' || this.variants.get(key)?.ready ? undefined : 'shaders'
   }
@@ -597,7 +674,7 @@ export class LookdevEngine {
   private modelStatus(): LabStatus['model'] {
     const model = this.state.model
     const v = this.variants.get(variantOf(this.state))
-    if (v?.failed || (model !== 'spheres' && this.meshLoadFailed.has(model))) return 'failed'
+    if (v?.failed || (model !== 'spheres' && this.meshLoadFailed.has(model)) || this.envLoadFailed.has(this.state.env)) return 'failed'
     return this.waitingFor() ? 'loading' : 'ready'
   }
 
@@ -739,11 +816,11 @@ export class LookdevEngine {
     return m.get(name) ?? null
   }
 
-  // A render target of three images (the light mixer's key, fill and rim), drawn together with draw buffers,
-  // plus the denoiser's two (albedo, normal; see AUX in the shader) where the GPU can draw five.
+  // A render target of four images (the light mixer's key, fill, rim and environment), drawn together with draw
+  // buffers, plus the denoiser's two (albedo, normal; see AUX in the shader) where the GPU can draw six.
   private makeTargets(w: number, h: number) {
     const gl = this.gl
-    const tex = Array.from({ length: this.canDenoise ? 5 : 3 }, () => this.makeTex(w, h, this.accumFmt.internal, this.accumFmt.type))
+    const tex = Array.from({ length: this.canDenoise ? 6 : 4 }, () => this.makeTex(w, h, this.accumFmt.internal, this.accumFmt.type))
     const fbo = gl.createFramebuffer()!
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     tex.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0))
@@ -834,7 +911,7 @@ export class LookdevEngine {
     // Any change may need another variant (a glass hero) or a model.
     this.ensureModel()
     this.reset()
-    if (this.modelStatus() !== 'ready' || patch.model) this.reportModel()
+    if (this.modelStatus() !== 'ready' || patch.model || patch.env) this.reportModel()
   }
 
   setInteracting(on: boolean) {
@@ -989,7 +1066,15 @@ export class LookdevEngine {
     this.bounces = bounces
     this.previewBounces = s.furnace ? bounces : Math.min(bounces, solidGlass ? PREVIEW_GLASS_BOUNCES : PREVIEW_BOUNCES)
     gl.uniform1i(L('uNumLights'), rigs.length)
-    gl.uniform3fv(L('uEnv'), s.furnace ? [1, 1, 1] : [0.0012, 0.0013, 0.0016])
+    // An HDR environment replaces the rig's faint constant one; the furnace test's white surround is one too.
+    const env = this.activeEnv()
+    gl.uniform3fv(L('uEnv'), env ? [0, 0, 0] : [0.0012, 0.0013, 0.0016])
+    gl.uniform1i(L('uEnvOn'), env ? 1 : 0)
+    gl.uniform2i(L('uEnvSize'), env?.w ?? 1, env?.h ?? 1)
+    gl.uniform1f(L('uEnvRot'), (s.env === 'none' || s.furnace ? 0 : ENVIRONMENTS[s.env].turn) + s.envRot / (2 * Math.PI))
+    gl.uniform1f(L('uEnvBlur'), ENV_BACKDROP_BLUR)
+    gl.uniform1i(L('uEnvMap'), 11)
+    gl.uniform1i(L('uEnvAlias'), 12)
     gl.uniform1i(L('uFurnace'), s.furnace ? 1 : 0)
     gl.uniform1f(L('uIndirectClamp'), s.furnace ? 0 : INDIRECT_CLAMP)
     gl.uniform1i(L('uMultiScatter'), s.multiscatter ? 1 : 0)
@@ -1058,6 +1143,12 @@ export class LookdevEngine {
     if (this.sceneDirty || this.uploadedFor !== prog) this.uploadScene()
     gl.activeTexture(gl.TEXTURE5)
     gl.bindTexture(gl.TEXTURE_3D, this.eTableT)
+    const env = this.activeEnv()
+    if (!this.envBlank) this.envBlank = this.makeTex(1, 1, gl.RGBA32F, gl.FLOAT)
+    gl.activeTexture(gl.TEXTURE11)
+    gl.bindTexture(gl.TEXTURE_2D, env?.map ?? this.envBlank)
+    gl.activeTexture(gl.TEXTURE12)
+    gl.bindTexture(gl.TEXTURE_2D, env?.alias ?? this.envBlank)
     const mesh = this.state.model === 'spheres' ? null : this.meshes.get(this.state.model)
     if (mesh) {
       gl.activeTexture(gl.TEXTURE2)
@@ -1318,11 +1409,11 @@ export class LookdevEngine {
     this.onStatus({ spp: this.spp, target: this.goal, converged: this.spp >= this.goal, preview: false, ms: this.renderMs, model: 'ready' })
   }
 
-  // The current running means (key, fill, rim; and the denoiser's two) on units 0, 6, 7, 8 and 9, and the
-  // albedo table on unit 1.
+  // The current running means (key, fill, rim, environment; and the denoiser's two) on units 0, 6, 7, 8, 9 and
+  // 10, and the albedo table on unit 1.
   private bindPrev(L: (name: string) => WebGLUniformLocation | null) {
     const gl = this.gl
-    const units = [0, 6, 7, 8, 9]
+    const units = [0, 6, 7, 8, 9, 10]
     this.accumTex[this.ping].forEach((t, i) => {
       gl.activeTexture(gl.TEXTURE0 + units[i])
       gl.bindTexture(gl.TEXTURE_2D, t)
@@ -1382,8 +1473,8 @@ export class LookdevEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
     gl.useProgram(p)
-    const units = [0, 2, 3]
-    src.slice(0, 3).forEach((t, i) => {
+    const units = [0, 2, 3, 5]
+    src.slice(0, 4).forEach((t, i) => {
       gl.activeTexture(gl.TEXTURE0 + units[i])
       gl.bindTexture(gl.TEXTURE_2D, t)
       gl.uniform1i(this.loc(p, `uAccum${i}`), units[i])
@@ -1431,14 +1522,15 @@ export class LookdevEngine {
     bind(prep, 'uAccum0', 0, src[0])
     bind(prep, 'uAccum1', 2, src[1])
     bind(prep, 'uAccum2', 3, src[2])
-    bind(prep, 'uAux0', 5, src[3])
-    bind(prep, 'uAux1', 6, src[4])
+    bind(prep, 'uAccum3', 7, src[3])
+    bind(prep, 'uAux0', 5, src[4])
+    bind(prep, 'uAux1', 6, src[5])
     gl.uniform3fv(this.loc(prep, 'uMix'), this.mixWeights().flat())
     gl.uniform2i(this.loc(prep, 'uSize'), w, h)
     gl.uniform1f(this.loc(prep, 'uSpp'), spp)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
     gl.useProgram(atrous)
-    bind(atrous, 'uAux0', 5, src[3])
+    bind(atrous, 'uAux0', 5, src[4])
     bind(atrous, 'uGuide', 6, this.dnGuide!)
     gl.uniform2i(this.loc(atrous, 'uSize'), w, h)
     for (let i = 0; i < DENOISE_LEVELS; i++) {
@@ -1451,14 +1543,16 @@ export class LookdevEngine {
     return this.dnTex[DENOISE_LEVELS % 2]
   }
 
-  // Light mixer: the weight of each light's image (key, fill, rim). Light transport is linear in emission, so a
-  // light traced in white and scaled here by its color (unit luminance) and 2^gain is the same image as one traced
-  // in that color at that power. The faint environment rides with the key's image.
+  // Light mixer: the weight of each light's image (key, fill, rim, environment). Light transport is linear in
+  // emission, so a light traced in white and scaled here by its color (unit luminance) and 2^gain is the same image
+  // as one traced in that color at that power. The rig's faint environment rides with the key's image; an HDR
+  // environment keeps its own colors and takes only its intensity here.
   private mixWeights(): [number, number, number][] {
     const s = this.state
-    if (s.furnace) return [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
+    if (s.furnace) return [[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]
     const w = (on: boolean, kelvin: number, gain: number) => (on ? scale(kelvinToACEScg(kelvin), 2 ** gain) : [0, 0, 0]) as Vec3
-    return [w(s.key, s.keyKelvin, s.keyGain), w(s.fill, s.fillKelvin, s.fillGain), w(s.rim, s.rimKelvin, s.rimGain)]
+    const e = s.envOn ? 2 ** s.envGain : 0
+    return [w(s.key, s.keyKelvin, s.keyGain), w(s.fill, s.fillKelvin, s.fillGain), w(s.rim, s.rimKelvin, s.rimGain), [e, e, e]]
   }
 
   // Encoded image of the current frame (used to produce the static fallback poster).
@@ -1467,7 +1561,7 @@ export class LookdevEngine {
     return new Promise(resolve => this.canvas.toBlob(resolve, type, quality))
   }
 
-  // The image as displayed before the view transform: linear ACEScg radiance, the three lights mixed as the mixer
+  // The image as displayed before the view transform: linear ACEScg radiance, the lights mixed as the mixer
   // is set; alpha = accumulated sphere coverage. Rows start at the bottom.
   readAccum(): { w: number; h: number; px: Float32Array } | null {
     if (this.accumFmt.type !== this.gl.FLOAT) return null
@@ -1477,7 +1571,7 @@ export class LookdevEngine {
     const layer = new Float32Array(n)
     const mix = this.mixWeights()
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFbo[this.ping])
-    for (let k = 0; k < 3; k++) {
+    for (let k = 0; k < 4; k++) {
       gl.readBuffer(gl.COLOR_ATTACHMENT0 + k)
       gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, layer)
       for (let i = 0; i < n; i += 4) {
@@ -1529,6 +1623,10 @@ export class LookdevEngine {
     this.variants.clear()
     this.meshes.forEach(m => [m.bvh, m.pos, m.nrm].forEach(t => gl.deleteTexture(t)))
     this.meshes.clear()
+    this.envs.forEach(e => [e.map, e.alias].forEach(t => gl.deleteTexture(t)))
+    this.envs.clear()
+    if (this.envWhite) [this.envWhite.map, this.envWhite.alias].forEach(t => gl.deleteTexture(t))
+    if (this.envBlank) gl.deleteTexture(this.envBlank)
     gl.deleteProgram(this.progDisplay)
     gl.deleteProgram(this.progTable)
     if (this.progPrep) gl.deleteProgram(this.progPrep)

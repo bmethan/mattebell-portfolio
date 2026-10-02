@@ -992,7 +992,7 @@ uniform vec3 uLightU[3];
 uniform vec3 uLightV[3];
 uniform vec3 uLightRadiance[3];
 
-bool lightOn(int k) { return maxc(uLightRadiance[k]) > 0.0; }
+bool lightOn(int k) { return k >= 3 || maxc(uLightRadiance[k]) > 0.0; } // light 3 is the environment, when on
 bool facesLight(int k, vec3 o) { return dot(o - uLightCorner[k], cross(uLightU[k], uLightV[k])) > 0.0; }
 
 struct SphQuad {
@@ -1117,6 +1117,44 @@ float intersectRect(vec3 ro, vec3 rd, int k, float tMax) {
   vec2 uv = vec2(dot(d, ex) / dot(ex, ex), dot(d, ey) / dot(ey, ey));
   return (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) ? t : -1.0;
 }
+// Image-based lighting (uEnvOn 1): the environment is light 3, after the three softboxes, with its own image.
+// uEnvMap holds its ACEScg radiance (mipmapped, so the camera can see it as a softened backdrop); uEnvAlias, per
+// pixel, the alias table's probability and alias and the pixel's pdf constant (see environments.ts). Lookups are
+// nearest-texel, so the radiance is constant over each pixel, as the sampling density is.
+uniform int uEnvOn;
+uniform sampler2D uEnvMap;
+uniform highp sampler2D uEnvAlias;
+uniform ivec2 uEnvSize;
+uniform float uEnvRot;  // turn about the vertical axis, in turns
+uniform float uEnvBlur; // mip level of the backdrop
+#define ENV_LIGHT 3
+vec2 envUV(vec3 d) {
+  return vec2(fract(atan(d.x, -d.z) * (0.5 / PI) + 0.5 + uEnvRot), acos(clamp(d.y, -1.0, 1.0)) / PI);
+}
+ivec2 envTexel(vec2 uv) { return min(ivec2(uv * vec2(uEnvSize)), uEnvSize - 1); }
+vec3 envLe(vec3 d) { return texelFetch(uEnvMap, envTexel(envUV(d)), 0).rgb; }
+vec3 envBackdrop(vec3 d) { return textureLod(uEnvMap, envUV(d), uEnvBlur).rgb; }
+// Solid-angle density of sampleEnv: the pixel's constant over sin(theta).
+float envPdf(vec3 d) {
+  float s = sqrt(max(0.0, 1.0 - d.y * d.y));
+  return s > 1e-6 ? texelFetch(uEnvAlias, envTexel(envUV(d)), 0).z / s : 0.0;
+}
+// A direction toward the environment: a pixel from the alias table (u.x picks a slot, u.y keeps it or takes its
+// alias), then a point uniform in the pixel's longitude and colatitude (u.zw).
+bool sampleEnv(vec4 u, out vec3 wi, out float pdf) {
+  int n = uEnvSize.x * uEnvSize.y;
+  int i = min(int(u.x * float(n)), n - 1);
+  vec4 a = texelFetch(uEnvAlias, ivec2(i % uEnvSize.x, i / uEnvSize.x), 0);
+  if (u.y >= a.x) i = int(a.y);
+  ivec2 px = ivec2(i % uEnvSize.x, i / uEnvSize.x);
+  float theta = (float(px.y) + u.w) / float(uEnvSize.y) * PI;
+  float phi = ((float(px.x) + u.z) / float(uEnvSize.x) - 0.5 - uEnvRot) * TWO_PI;
+  float s = sin(theta);
+  wi = vec3(s * sin(phi), cos(theta), -s * cos(phi));
+  pdf = s > 1e-6 ? texelFetch(uEnvAlias, px, 0).z / s : 0.0;
+  return pdf > 0.0;
+}
+
 // Power heuristic, beta = 2 (Veach and Guibas 1995).
 float powerHeuristic(float f, float g) {
   float f2 = f * f, g2 = g * g;
@@ -1335,25 +1373,29 @@ uniform vec3 uBallX;
 uniform Mat uMat[4];
 #endif
 
-// Light mixer: every softbox's light lands in its own image, traced in white, so the display can recolor,
-// rescale or switch off each light exactly without tracing again (light transport is linear in each light's
-// emission). The environment rides with the key; alpha of the key image is the coverage mask.
+// Light mixer: every light's light lands in its own image (the softboxes traced in white), so the display can
+// recolor, rescale or switch off each light exactly without tracing again (light transport is linear in each
+// light's emission). The faint constant environment of the softbox rig rides with the key; an HDR environment has
+// the fourth image. Alpha of the key image is the coverage mask.
 layout(location = 0) out vec4 outKey;
 layout(location = 1) out vec4 outFill;
 layout(location = 2) out vec4 outRim;
+layout(location = 3) out vec4 outEnv;
+uniform sampler2D uPrev3;
 #ifdef AUX
 // For the denoiser, as running means like the light images: fill.a, the mean of Y^2, where Y is the luminance
-// of the pixel's light (all three lights, in white); outAux0, the first-hit albedo with a = mean of Y; outAux1,
-// the first-hit normal.
-layout(location = 3) out vec4 outAux0;
-layout(location = 4) out vec4 outAux1;
-uniform sampler2D uPrev3;
+// of the pixel's light (all lights, in white); outAux0, the first-hit albedo with a = mean of Y; outAux1, the
+// first-hit normal.
+layout(location = 4) out vec4 outAux0;
+layout(location = 5) out vec4 outAux1;
 uniform sampler2D uPrev4;
+uniform sampler2D uPrev5;
 #endif
-void addLight(int k, vec3 c, inout vec3 L0, inout vec3 L1, inout vec3 L2) {
+void addLight(int k, vec3 c, inout vec3 L0, inout vec3 L1, inout vec3 L2, inout vec3 L3) {
   if (k == 0) L0 += c;
   else if (k == 1) L1 += c;
-  else L2 += c;
+  else if (k == 2) L2 += c;
+  else L3 += c;
 }
 
 // Loop bounds come from uniforms so the Direct3D compiler cannot unroll the path loop (compile time).
@@ -1399,7 +1441,8 @@ vec3 offsetRay(vec3 p, vec3 n) {
 
 // n: shading normal; ng: geometric normal on the side the ray arrived from (they differ only on meshes).
 // back: the ray arrived from inside the object (only a transmissive material lets a path get there).
-struct Hit { float t; vec3 n; vec3 ng; int mat; int light; bool back; };
+// light, lightT: the nearest softbox in front of the hit (path rays only), which does not block it (see main).
+struct Hit { float t; vec3 n; vec3 ng; int mat; int light; float lightT; bool back; };
 
 // The cyc's back wall and sweep (the floor is the plane test in trace()): nearest hit before tMax, with the
 // normal facing into the room, or -1. Also a shadow occluder: a key light dragged low and behind can end up
@@ -1490,7 +1533,7 @@ vec3 thinPassT(Mat m, float c) {
 // smooth thin glass (uThinGlass: the hero ball, or the model's glass slot) dims T at each crossing instead.
 Hit trace(vec3 ro, vec3 rd, float tMax, bool shadow, bool withLights, inout vec3 T) {
   Hit h;
-  h.t = tMax; h.mat = -1; h.light = -1; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
+  h.t = tMax; h.mat = -1; h.light = -1; h.lightT = tMax; h.n = vec3(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
 #ifdef MESH
   for (int i = 0; i < 3; i++) {
     vec4 s = uBall[i];
@@ -1573,8 +1616,8 @@ Hit trace(vec3 ro, vec3 rd, float tMax, bool shadow, bool withLights, inout vec3
   if (withLights) {
     for (int k = 0; k < uNumLights; k++) {
       if (!lightOn(k)) continue;
-      float t = intersectRect(ro, rd, k, h.t);
-      if (t > 0.0) { h.t = t; h.light = k; h.mat = -1; }
+      float t = intersectRect(ro, rd, k, min(h.lightT, h.t)); // in front of the surface hit, if any
+      if (t > 0.0) { h.lightT = t; h.light = k; }
     }
   }
   return h;
@@ -1663,7 +1706,8 @@ vec3 sampleHG(vec3 d, float g, float u1, float u2) {
 void main() {
   ivec2 pix = ivec2(gl_FragCoord.xy);
   uint pixSeed = pcg3d(uvec3(uvec2(pix), 0x9e37u)).x;
-  vec3 acc0 = vec3(0.0), acc1 = vec3(0.0), acc2 = vec3(0.0);
+  vec3 acc0 = vec3(0.0), acc1 = vec3(0.0), acc2 = vec3(0.0), acc3 = vec3(0.0);
+  int nL = uNumLights + uEnvOn; // lights sampled at each vertex: the softboxes, then the environment
   float accMask = 0.0;
   vec3 accAlbedo = vec3(0.0), accN = vec3(0.0);
   float accY = 0.0, accY2 = 0.0;
@@ -1675,7 +1719,7 @@ void main() {
     vec3 ro = uCamPos;
     vec3 rd = normalize(uCamFwd + ndc.x * uTanHalf.x * uCamRight + ndc.y * uTanHalf.y * uCamUp);
 
-    vec3 L = vec3(0.0), L1 = vec3(0.0), L2 = vec3(0.0); // per light: key (and environment), fill, rim
+    vec3 L = vec3(0.0), L1 = vec3(0.0), L2 = vec3(0.0), L3 = vec3(0.0); // per light: key, fill, rim, environment
     vec3 firstAlbedo = vec3(0.0), firstN = vec3(0.0); // at the camera ray's hit (zero on a miss)
     vec3 beta = vec3(1.0);
     float mask = 0.0;
@@ -1706,7 +1750,7 @@ void main() {
     int filt = 0;
     bool solidInside = false, last = false;
     vec3 pending = vec3(0.0); // what the shadow ray in flight delivers if it gets through
-    int maxSteps = uMaxBounces * (uNumLights + 1) + 1;
+    int maxSteps = uMaxBounces * (nL + 1) + 1;
     // Subsurface random walk (spec, Subsurface). The path refracts into the medium through the material's own
     // rough dielectric surface (so the specular reflection and the Fresnel split are OpenPBR's), then walks:
     // free flights with extinction 1 / mean free path per channel, scattering with the single-scattering albedo
@@ -1737,14 +1781,21 @@ void main() {
       float tMax = 1e30;
       bool shadow = false;
       if (atVertex) {
-        bool isLight = k < uNumLights;
+        bool isLight = k < nL;
         if (!isLight && last) break; // the continuation ray from the last vertex is never traced
         if (isLight && (!lightOn(k) || solidInside)) { k++; continue; } // from inside a solid, every light is behind its wall
         vec4 u = sample4(sampleIndex, pixSeed, depth, k);
         vec3 dirW, wi;
         float ldist = 0.0, lpdf = 0.0;
         if (isLight) {
-          if (!sampleLight(k, po, u.xy, dirW, ldist, lpdf)) { k++; continue; }
+          bool got;
+          if (k == ENV_LIGHT) {
+            got = sampleEnv(u, dirW, lpdf);
+            ldist = 1e30;
+          } else {
+            got = sampleLight(k, po, u.xy, dirW, ldist, lpdf);
+          }
+          if (!got) { k++; continue; }
           wi = vec3(dot(dirW, t1), dot(dirW, t2), dot(dirW, n));
           if (wi.z <= 0.0) { k++; continue; }
         } else {
@@ -1772,7 +1823,10 @@ void main() {
           if (maxc(f) <= 0.0) { k++; continue; }
           // At the last vertex the BSDF-sampled ray is never traced, so light sampling takes the full weight.
           float wl = last ? 1.0 : powerHeuristic(lpdf, bpdf);
-          pending = beta * f * uLightRadiance[k] * (wl / lpdf);
+          vec3 Le;
+          if (k == ENV_LIGHT) Le = envLe(dirW);
+          else Le = uLightRadiance[k];
+          pending = beta * f * Le * (wl / lpdf);
           tro = po;
           trd = dirW;
           tMax = ldist * (1.0 - 1e-4);
@@ -1848,14 +1902,14 @@ void main() {
       if (shadow) {
         if (h.mat < 0 && maxc(T) > 0.0) {
           vec3 c = pending * T;
-          addLight(k, depth - sssCross >= 1 ? clampIndirect(c) : c, L, L1, L2);
+          addLight(k, depth - sssCross >= 1 ? clampIndirect(c) : c, L, L1, L2, L3);
         }
         k++;
         continue;
       }
 #ifdef SSS
       if (inSSS) {
-        bool scattered = h.mat < 0 && h.light < 0; // no surface before the flight ends
+        bool scattered = h.mat < 0; // no surface before the flight ends
         float tt = scattered ? tFlight : h.t;
         vec3 Tr = exp(-sigT * tt);
         // Each channel's flight density (scattered) or probability of flying this far (surface), over the hero's,
@@ -1890,16 +1944,24 @@ void main() {
 #endif
 
       if (h.light >= 0) {
-        // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling.
-        float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.t));
+        // Softbox reached by BSDF sampling (lights are invisible to camera rays). MIS vs light sampling. It emits
+        // but does not block what lies behind it, as shadow rays never see it: so an environment light sampled
+        // through a softbox's place and one reached past it agree (and a switched-off softbox leaves no hole).
+        float pl = lightPdf(h.light, prevP, rd, distance(prevP, ro + rd * h.lightT));
         vec3 c = beta * uLightRadiance[h.light] * (prevTrans ? 1.0 : powerHeuristic(prevPdf, pl));
-        addLight(h.light, depth - sssCross >= 2 ? clampIndirect(c) : c, L, L1, L2);
-        break;
+        addLight(h.light, depth - sssCross >= 2 ? clampIndirect(c) : c, L, L1, L2, L3);
       }
       if (h.mat < 0) {
         if (!(depth == 0 && uPass >= 3)) {
-          vec3 c = beta * uEnv;
-          L += depth - sssCross >= 2 ? clampIndirect(c) : c;
+          if (uEnvOn == 1) {
+            // The camera sees the softened backdrop; a bounce sees the environment as a light, weighted against
+            // sampling it from the vertex before (none was made through a refraction).
+            vec3 c = beta * (depth == 0 ? envBackdrop(rd) : envLe(rd)) * (depth == 0 || prevTrans ? 1.0 : powerHeuristic(prevPdf, envPdf(rd)));
+            L3 += depth - sssCross >= 2 ? clampIndirect(c) : c;
+          } else {
+            vec3 c = beta * uEnv;
+            L += depth - sssCross >= 2 ? clampIndirect(c) : c;
+          }
         }
         break;
       }
@@ -1954,12 +2016,13 @@ void main() {
       atVertex = true;
       k = 0;
     }
-    // A sample with any non-finite light is dropped whole, so the three images stay consistent.
-    vec3 all = L + L1 + L2;
+    // A sample with any non-finite light is dropped whole, so the light images stay consistent.
+    vec3 all = L + L1 + L2 + L3;
     if (!(nonFinite(all.r) || nonFinite(all.g) || nonFinite(all.b))) {
       acc0 += L;
       acc1 += L1;
       acc2 += L2;
+      acc3 += L3;
       float Y = lum(all);
       accY += Y;
       accY2 += Y * Y;
@@ -1976,20 +2039,23 @@ void main() {
   vec4 cur0 = min(vec4(acc0 / nNew, accMask / nNew), vec4(65504.0));
   vec4 cur1 = min(vec4(acc1 / nNew, accY2 / nNew), vec4(65504.0));
   vec4 cur2 = min(vec4(acc2 / nNew, 1.0), vec4(65504.0));
+  vec4 cur3 = min(vec4(acc3 / nNew, 1.0), vec4(65504.0));
   if (uSppDone == 0) {
     outKey = cur0;
     outFill = cur1;
     outRim = cur2;
+    outEnv = cur3;
   } else {
     outKey = mix(texelFetch(uPrev0, pix, 0), cur0, w);
     outFill = mix(texelFetch(uPrev1, pix, 0), cur1, w);
     outRim = mix(texelFetch(uPrev2, pix, 0), cur2, w);
+    outEnv = mix(texelFetch(uPrev3, pix, 0), cur3, w);
   }
 #ifdef AUX
-  vec4 cur3 = min(vec4(accAlbedo / nNew, accY / nNew), vec4(65504.0));
-  vec4 cur4 = vec4(accN / nNew, 1.0);
-  outAux0 = uSppDone == 0 ? cur3 : mix(texelFetch(uPrev3, pix, 0), cur3, w);
-  outAux1 = uSppDone == 0 ? cur4 : mix(texelFetch(uPrev4, pix, 0), cur4, w);
+  vec4 cur4 = min(vec4(accAlbedo / nNew, accY / nNew), vec4(65504.0));
+  vec4 cur5 = vec4(accN / nNew, 1.0);
+  outAux0 = uSppDone == 0 ? cur4 : mix(texelFetch(uPrev4, pix, 0), cur4, w);
+  outAux1 = uSppDone == 0 ? cur5 : mix(texelFetch(uPrev5, pix, 0), cur5, w);
 #endif
 }
 `
@@ -2003,10 +2069,11 @@ void main() {
 // ------------------------------------------------------------------------------------------------------------
 export const DISPLAY_FRAG = /* glsl */ `${HEADER}
 ${COMMON}
-uniform sampler2D uAccum0; // key (and environment); the AOV passes use this one alone
+uniform sampler2D uAccum0; // key (and the rig's faint environment); the AOV passes use this one alone
 uniform sampler2D uAccum1; // fill
 uniform sampler2D uAccum2; // rim
-uniform vec3 uMix[3];      // light mixer: each light's color times its intensity (traced in white)
+uniform sampler2D uAccum3; // HDR environment
+uniform vec3 uMix[4];      // light mixer: each light's color times its intensity (traced in white)
 uniform int uAccumDiv;  // 1 for the accumulation; k for a 1/k-resolution preview (nearest, like an IPR proxy)
 uniform sampler3D uAcesLut;
 uniform int uAcesReady;
@@ -2092,7 +2159,8 @@ void main() {
   vec3 c = texelFetch(uAccum0, px, 0).rgb;
   if (uPass == 4) { outColor = vec4(c, 1.0); return; }                                   // normals: raw data
   if (uPass == 3) { outColor = vec4(srgbOETF(max(AP1_TO_REC709 * c, 0.0)), 1.0); return; } // albedo
-  c = c * uMix[0] + texelFetch(uAccum1, px, 0).rgb * uMix[1] + texelFetch(uAccum2, px, 0).rgb * uMix[2];
+  c = c * uMix[0] + texelFetch(uAccum1, px, 0).rgb * uMix[1] + texelFetch(uAccum2, px, 0).rgb * uMix[2] +
+    texelFetch(uAccum3, px, 0).rgb * uMix[3];
   if (uDenoiseMix > 0.0) c = mix(c, texelFetch(uDenoised, px, 0).rgb, uDenoiseMix);
   c = max(c, 0.0) * exp2(uExposure);
   if (uView == 0 && uAcesReady == 1) { outColor = vec4(aces2(c), 1.0); return; }
@@ -2129,15 +2197,17 @@ ${DENOISE_COMMON}
 uniform sampler2D uAccum0;
 uniform sampler2D uAccum1;
 uniform sampler2D uAccum2;
+uniform sampler2D uAccum3;
 uniform sampler2D uAux0;
 uniform sampler2D uAux1;
-uniform vec3 uMix[3];
+uniform vec3 uMix[4];
 uniform float uSpp; // samples per pixel in the image
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec4 outGuide;
 
 vec3 demod(ivec2 q) {
-  vec3 c = texelFetch(uAccum0, q, 0).rgb * uMix[0] + texelFetch(uAccum1, q, 0).rgb * uMix[1] + texelFetch(uAccum2, q, 0).rgb * uMix[2];
+  vec3 c = texelFetch(uAccum0, q, 0).rgb * uMix[0] + texelFetch(uAccum1, q, 0).rgb * uMix[1] + texelFetch(uAccum2, q, 0).rgb * uMix[2] +
+    texelFetch(uAccum3, q, 0).rgb * uMix[3];
   return max(c, 0.0) / demodBase(texelFetch(uAux0, q, 0).rgb);
 }
 

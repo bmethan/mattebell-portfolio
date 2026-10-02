@@ -171,6 +171,15 @@ section[id], .anchor-target { scroll-margin-top: 80px; }
 
 /* Two-col grids that collapse to one */
 .grid-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); }
+/* Skill rows that name a category and its tools (Generative AI): label, tools, bar, in aligned columns; on a
+   narrow card the label sits above its tools, which keep the row's line with the bar. */
+.skill-tool-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) 80px; column-gap: 16px; align-items: center; margin-bottom: 10px; }
+.skill-tool-cat { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-dim); }
+.skill-tool-list { font-size: 13px; line-height: 1.5; color: var(--text-soft); }
+@media (max-width: 560px) {
+  .skill-tool-row { grid-template-columns: minmax(0, 1fr) 80px; row-gap: 2px; margin-bottom: 12px; }
+  .skill-tool-cat { grid-column: 1 / -1; }
+}
 .grid-2col-gap { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; align-items: start; }
 .grid-2col-contact { display: grid; grid-template-columns: 1fr 1fr; gap: 80px; }
 

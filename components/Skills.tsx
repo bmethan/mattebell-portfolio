@@ -94,19 +94,38 @@ export default function Skills() {
           <div key={group.cat} style={{ background: 'var(--bg)', padding: '24px 28px' }}>
             <div style={{ fontSize: 10, letterSpacing: '0.14em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4 }}>{group.cat}</div>
             <div style={{ fontSize: 11, color: 'var(--text-ghost)', marginBottom: 16, fontStyle: 'italic' }}>{group.desc}</div>
-            {group.skills.map(s => (
-              <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 'tools' in s ? 14 : 10 }}>
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 13, color: 'var(--text-soft)' }}>{s.name}</div>
-                  {'tools' in s && (
-                    <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 3, lineHeight: 1.5 }}>{s.tools}</div>
-                  )}
-                </div>
+            {group.skills.map(s => {
+              const bar = (
                 <div style={{ width: 80, height: 2, background: 'var(--border)', flexShrink: 0 }}>
                   <div style={{ width: `${s.pct}%`, height: 2, background: group.rnd ? 'var(--bar-dim)' : 'var(--accent)' }} />
                 </div>
-              </div>
-            ))}
+              )
+              // A category row (Generative AI): a small label column, then its tools in the place the software
+              // name takes in the other groups, then the bar, so every card reads as one line per row.
+              if ('tools' in s) {
+                return (
+                  <div key={s.name} className="skill-tool-row">
+                    <div className="skill-tool-cat">{s.name}</div>
+                    <div className="skill-tool-list">
+                      {/* Lines break between tools, never inside one (LTX-2.5, LoRAs & control adapters). */}
+                      {s.tools.split(' · ').map((t, i, all) => (
+                        <span key={t}>
+                          <span style={{ whiteSpace: 'nowrap' }}>{t}</span>
+                          {i < all.length - 1 && ' · '}
+                        </span>
+                      ))}
+                    </div>
+                    {bar}
+                  </div>
+                )
+              }
+              return (
+                <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 10 }}>
+                  <div style={{ fontSize: 13, color: 'var(--text-soft)', minWidth: 0 }}>{s.name}</div>
+                  {bar}
+                </div>
+              )
+            })}
           </div>
         ))}
       </div>

@@ -618,7 +618,7 @@ export default function LookdevLab() {
 
           <div className="lab-row">
             <Group label="Hero">
-              {HERO_ORDER.map(h => (
+              {(model?.heroes ?? HERO_ORDER).map(h => (
                 <Pill key={h} on={lab.hero === h} onClick={() => update({ hero: h, heroRoughness: null, heroAniso: null })}>
                   {HERO_PRESETS[h].label}
                 </Pill>

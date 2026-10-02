@@ -2,7 +2,7 @@
 // built offline by tools/lookdev-models/build.mjs (reduced, BVH built, gzipped) and fetched only when picked.
 import { OPENPBR_DEFAULTS, type Hero, type OpenPBR } from './materials'
 
-export type Model = 'spheres' | 'sportscar' | 'teapot' | 'victory' | 'fountain'
+export type Model = 'spheres' | 'sportscar' | 'teapot' | 'victory'
 
 export interface ModelInfo {
   label: string
@@ -12,18 +12,18 @@ export interface ModelInfo {
   // Has parts in the glass slot (thin-walled), so shadow rays must pass through them.
   thinGlass: boolean
   credit: { text: string; source: string; license: string; licenseUrl: string }
-  // Its own materials for slots 4-9 (otherwise MESH_MATERIALS, the car's).
-  materials?: OpenPBR[]
   // Height the camera aims at (default MODEL_CAM_TARGET's): tall models are framed higher.
   camTargetY?: number
   // The hero material picked with the model, if it has one it is shown in, and its turntable angle then.
   hero?: Hero
+  // The only hero materials it offers, if limited (the car is a car paint showcase).
+  heroes?: Hero[]
   yaw?: number
   // Real size: meters per scene unit (for lengths like subsurface radii).
   metersPerUnit: number
 }
 
-export const MODEL_ORDER: Model[] = ['spheres', 'sportscar', 'teapot', 'victory', 'fountain']
+export const MODEL_ORDER: Model[] = ['spheres', 'sportscar', 'teapot', 'victory']
 
 export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
   sportscar: {
@@ -31,6 +31,10 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
     url: '/lookdev/models/sportscar.bin.gz?v=4', // bump with each rebuild so caches fetch the new file
     scale: 4.5,
     thinGlass: true,
+    // A car paint showcase: only the body takes the hero material (wheels, glass and trim keep their own), and
+    // other heroes on a car body read as a mistake.
+    hero: 'carpaint',
+    heroes: ['carpaint'],
     metersPerUnit: 1, // a car about 4.5 m long (an estimate; the scene does not state its size)
     credit: {
       text: 'Sports Car by Yasutoshi Mori, from the pbrt-v4 scenes; reduced and rematerialed in OpenPBR for the lab.',
@@ -71,40 +75,7 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
       licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
     },
   },
-  fountain: {
-    label: 'Table fountain',
-    url: '/lookdev/models/fountain.bin.gz?v=1',
-    scale: 1.5,
-    thinGlass: false,
-    camTargetY: 1.0,
-    hero: 'gold',
-    metersPerUnit: 0.162, // 33.8 cm tall (the museum's record), standing 2.09 units
-    credit: {
-      text: 'Table Fountain, Paris, c. 1320-40, gilt silver and translucent enamels; Cleveland Museum of Art 1924.859, open access. Reduced for the lab.',
-      source: 'https://sketchfab.com/3d-models/1924859-table-fountain-c03c9b6836aa42328803baeef085be40',
-      license: 'CC0',
-      licenseUrl: 'https://creativecommons.org/publicdomain/zero/1.0/',
-    },
-    // Slot 4: basse-taille enamel, translucent glass fused over engraved silver: a clear coat tinted blue-green
-    // over the metal (OpenPBR's coat color tints what passes through it).
-    materials: [
-      {
-        ...OPENPBR_DEFAULTS,
-        base_metalness: 1,
-        base_color: [0.94, 0.93, 0.9],
-        specular_roughness: 0.2,
-        coat_weight: 1,
-        coat_color: [0.18, 0.42, 0.62],
-        coat_roughness: 0.04,
-        coat_ior: 1.55,
-      },
-    ],
-  },
 }
-
-// Slots 4-9 for a model: its own, then the car's for any it does not set.
-export const modelMaterials = (m: Exclude<Model, 'spheres'>): OpenPBR[] =>
-  MESH_MATERIALS.map((d, i) => MODELS[m].materials?.[i] ?? d)
 
 // With a model in the middle, the gray and chrome references shrink to the sides, as on a turntable plate.
 // Each ball: center x, y, z and radius; the hero ball is absent (its material dresses the model).

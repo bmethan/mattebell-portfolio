@@ -20,9 +20,7 @@ await MeshoptSimplifier.ready
 
 // Material slots shared with the renderer (components/lookdev/models.ts): 0-3 are the scene's own (gray ball,
 // chrome, hero, floor); the mesh adds 4-9.
-// A model may give 4-9 its own materials (MODELS[...].materials there); the names below are the car's, plus the
-// fountain's enamel.
-export const SLOT = { chrome: 1, hero: 2, glass: 4, rubber: 5, trim: 6, aluminum: 7, lamp: 8, plastic: 9, enamel: 4 }
+export const SLOT = { chrome: 1, hero: 2, glass: 4, rubber: 5, trim: 6, aluminum: 7, lamp: 8, plastic: 9 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // PLY (binary little endian, as exported for the pbrt-v4 scenes).
@@ -286,8 +284,6 @@ function loadGltf(dir, slots) {
 const VICTORY_SLOTS = Object.fromEntries(
   [...Array.from({ length: 9 }, (_, i) => `Texture_${i}.001`), 'Untextured.001'].map(n => [n, SLOT.hero]),
 )
-// Table Fountain, Cleveland Museum of Art 1924.859 (CC0): gilt silver (the hero) and translucent enamel.
-const FOUNTAIN_SLOTS = { Fountain_Mats: SLOT.hero, Enamel_Mats: SLOT.enamel }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Reduction: one triangle budget for the model, shared by the parts in proportion to their triangle counts, with
@@ -640,12 +636,11 @@ const SOURCES = {
   sportscar: { load: () => loadSportsCar(src), budget: arg ? +arg : 100_000, credit: 'Sports Car by Yasutoshi Mori (CC BY 4.0)' },
   teapot: { load: () => loadTeapot(src, arg ? +arg : 24), budget: Infinity, credit: 'Utah Teapot, University of Utah (2026 version, Cem Yuksel)' },
   victory: { load: () => loadGltf(src, VICTORY_SLOTS), budget: arg ? +arg : 160_000, credit: 'Winged Victory of Samothrace by CosmoWenman (CC BY 4.0)', solid: true },
-  fountain: { load: () => loadGltf(src, FOUNTAIN_SLOTS), budget: arg ? +arg : 180_000, credit: 'Table Fountain 1924.859, Cleveland Museum of Art (CC0)' },
 }
 if (!SOURCES[which] || !src) {
   console.error('usage: node tools/lookdev-models/build.mjs sportscar <pbrt-v4-scenes/sportscar dir> [triangle budget]')
   console.error('       node tools/lookdev-models/build.mjs teapot <dir with teapot_generator.js and .wasm> [resolution]')
-  console.error('       node tools/lookdev-models/build.mjs victory|fountain <dir with scene.gltf> [triangle budget]')
+  console.error('       node tools/lookdev-models/build.mjs victory <dir with scene.gltf> [triangle budget]')
   process.exit(1)
 }
 const parts = await SOURCES[which].load()

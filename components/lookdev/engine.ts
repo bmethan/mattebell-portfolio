@@ -1,7 +1,7 @@
 import { VERT, E_TABLE_FRAG, DISPLAY_FRAG, DENOISE_PREP_FRAG, ATROUS_FRAG, traceFrag } from './shaders'
 import { kelvinToACEScg } from './color'
 import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, BALLS_METERS_PER_UNIT, heroParams, subsurfaceScale, type OpenPBR, type Hero, type PaintFinish, type SkinTone, type Stage } from './materials'
-import { MODELS, MODEL_BALLS, loadModel, modelMaterials, type Model } from './models'
+import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
@@ -961,7 +961,7 @@ export class LookdevEngine {
     // (shadowT in the tracer); otherwise they keep the cheaper any-hit test.
     const hero = heroMaterial(s)
     const smoothThin = (m: OpenPBR) => m.geometry_thin_walled > 0.5 && m.transmission_weight > 0 && m.specular_roughness <= 0.01 && m.coat_weight <= 0
-    const thinGlass = smoothThin(hero) || (s.model !== 'spheres' && MODELS[s.model].thinGlass && modelMaterials(s.model).some(smoothThin))
+    const thinGlass = smoothThin(hero) || (s.model !== 'spheres' && MODELS[s.model].thinGlass && MESH_MATERIALS.some(smoothThin))
     gl.uniform1i(L('uThinGlass'), thinGlass ? 1 : 0)
     gl.uniform1i(L('uETableT'), 5)
     gl.uniform1i(L('uCyc'), stage.cyc ? 1 : 0)
@@ -972,7 +972,7 @@ export class LookdevEngine {
     if (s.model === 'spheres') {
       gl.uniform3fv(L('uBallX'), BALL_X)
     } else {
-      mats.push(...modelMaterials(s.model))
+      mats.push(...MESH_MATERIALS)
       MODEL_BALLS.forEach((b, i) => gl.uniform4fv(L(`uBall[${i}]`), b))
       const c = Math.cos(s.modelYaw), sn = Math.sin(s.modelYaw)
       // Turntable: rotation about y, column major.
@@ -981,7 +981,7 @@ export class LookdevEngine {
       gl.uniform1f(L('uModelScale'), MODELS[s.model].scale)
       gl.uniform1i(L('uMaxNodeVisits'), MAX_NODE_VISITS)
       // Slot 4 is the glass on a model that has it (thinGlass); shadow rays pass through it.
-      gl.uniform1i(L('uThinSlot'), MODELS[s.model].thinGlass && smoothThin(modelMaterials(s.model)[0]) ? 4 : -1)
+      gl.uniform1i(L('uThinSlot'), MODELS[s.model].thinGlass && smoothThin(MESH_MATERIALS[0]) ? 4 : -1)
       gl.uniform1i(L('uBvh'), 2)
       gl.uniform1i(L('uTriPos'), 3)
       gl.uniform1i(L('uTriNrm'), 4)

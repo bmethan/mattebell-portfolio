@@ -133,6 +133,21 @@ const TECH_NOTES: [string, string][] = [
   ],
 ]
 
+// Whole seconds since the current wait began (key: what is awaited, or null), ticking while it lasts.
+function useWaitSeconds(key: string | null) {
+  const [secs, setSecs] = useState(0)
+  useEffect(() => {
+    setSecs(0)
+    if (!key) return
+    const t0 = performance.now()
+    const id = setInterval(() => setSecs(Math.floor((performance.now() - t0) / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [key])
+  return secs
+}
+// The count reads after the first two seconds: shorter waits need no clock.
+const waitClock = (secs: number) => (secs >= 2 ? `  ${secs} s` : '')
+
 type ControlTab = 'look' | 'light' | 'render'
 const CONTROL_TABS: { id: ControlTab; label: string }[] = [
   { id: 'look', label: 'Look' },
@@ -283,6 +298,8 @@ export default function LookdevLab() {
   const [ready, setReady] = useState(false)
   const lastInFamily = useRef<Partial<Record<HeroFamily, Hero>>>({}) // each family's last picked material
   const [tab, setTab] = useState<ControlTab>('look')
+  const startSecs = useWaitSeconds(mode === 'live' && !ready && !paused ? 'start' : null)
+  const loadSecs = useWaitSeconds(status.model === 'loading' ? `${status.waitingFor}:${status.compiling}` : null)
   const tabsId = useId()
   const [canDenoise, setCanDenoise] = useState(false) // the GPU can draw the denoiser's extra images
   // The still is the renderer's own converged image of the default settings, so the live render (IPR) only
@@ -628,7 +645,9 @@ export default function LookdevLab() {
             ) : (
               <>
                 <WorkIndicator className="lab-work" />
-                Still frame. The live renderer is compiling its shaders.
+                {status.finishing
+                  ? 'Still frame. Finishing the live renderer, first time only; the page may pause while it finishes.'
+                  : `Still frame. The live renderer is compiling its shaders, first time only.${waitClock(startSecs)}`}
               </>
             )}
           </div>
@@ -656,6 +675,11 @@ export default function LookdevLab() {
             <div className="lab-hud lab-hud-right">
               {status.model === 'failed' ? (
                 model ? `The ${model.label.toLowerCase()} could not load` : 'The shaders for this scene failed to compile'
+              ) : status.finishing ? (
+                <>
+                  <WorkIndicator className="lab-work" />
+                  {`Finishing ${status.finishing}, first time only; the page may pause while it finishes`}
+                </>
               ) : status.model === 'loading' ? (
                 <>
                   <WorkIndicator className="lab-work" />
@@ -663,7 +687,8 @@ export default function LookdevLab() {
                     ? `Loading the ${model.label.toLowerCase()}`
                     : status.waitingFor === 'environment'
                       ? 'Loading the environment'
-                      : 'Compiling shaders'}
+                      : `Compiling ${status.compiling ?? 'shaders'}, first time only`}
+                  {waitClock(loadSecs)}
                 </>
               ) : (
                 <>

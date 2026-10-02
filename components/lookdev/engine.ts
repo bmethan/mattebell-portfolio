@@ -123,6 +123,8 @@ export interface LabStatus {
   ms: number // render time of the current image: time spent rendering since the last change, pauses excluded
   model: 'ready' | 'loading' | 'failed' // the picked model's file and the shader variant the scene needs
   waitingFor?: 'model' | 'environment' | 'shaders' // while loading: the model's file, the environment's, or only the variant's compile
+  compiling?: string // while waiting for shaders: what they render, for the status line
+  finishing?: string // the same, while its first draw (which may pause the page) is about to run
 }
 
 // The tracer variant a scene needs: meshes for a model; full glass for a solid transmissive hero; the cheaper thin
@@ -138,6 +140,16 @@ function variantOf(s: LabState): VariantKey {
   if (s.model === 'spheres') return heroGlass ? 'base+glass' : 'base'
   if (heroSolid) return 'mesh+glass'
   return heroGlass || MODELS[s.model].thinGlass ? 'mesh+thin' : 'mesh'
+}
+// What each variant adds, for the status line while it compiles.
+const VARIANT_LABEL: Record<VariantKey, string> = {
+  base: 'the renderer',
+  'base+glass': 'the glass shader',
+  'base+sss': 'the subsurface shader',
+  mesh: 'the model shader',
+  'mesh+thin': 'the model shader with glass',
+  'mesh+glass': 'the model shader with solid glass',
+  'mesh+sss': 'the model shader with subsurface',
 }
 const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full' | 'sss'> = {
   base: 'none',
@@ -213,6 +225,14 @@ const MAX_SAMPLES_PER_PASS = 8 // on fast GPUs, several samples per pass when th
 const MAX_SLICES = 128
 const SLICE_ROWS = 8
 const SCROLL_QUIET_MS = 200 // tracing pauses while the page scrolls
+// The first draw of a tracer program can block the page for seconds. On Windows, Chrome and Edge run WebGL on
+// Direct3D through ANGLE, whose background compile (KHR_parallel_shader_compile) builds a program's pixel shader for
+// its first output only; a program writing several render targets, as the tracer does (one image per light, and
+// the denoiser's two), gets its real pixel shader compiled at its first draw, on the GPU process's main thread
+// (measured: 6 s for the plain tracer, 10 to 25 s for the variants, against 3 ms for the same shader with one
+// output). ANGLE caches the result for later visits. Until the WebGPU port, the lab announces that draw and holds it
+// until the notice has painted and the page is not scrolling, so the pause never lands mid-scroll unexplained.
+const FIRST_DRAW_NOTICE_MS = 250
 const SETTLE_MS = 120 // full-resolution refinement starts once the scene has stopped changing for this long
 const PREVIEW_BUDGET_MS = 8
 const PREVIEW_MAX_DIV = 6
@@ -378,6 +398,8 @@ export class LookdevEngine {
   private envLoadFailed = new Set<Env>()
   private envBlank: WebGLTexture | null = null // bound in their place while no environment is in use
   private envWhite: EnvGPU | null = null // the white furnace's surround
+  private drawnPrograms = new WeakSet<WebGLProgram>() // tracer programs past their first draw (see FIRST_DRAW_NOTICE_MS)
+  private finishingSince = 0 // when the notice of a first draw went up
   private parallel = false
   private uploadedFor: WebGLProgram | null = null // the trace program the scene uniforms were last set on
   private live = false
@@ -503,6 +525,7 @@ export class LookdevEngine {
   // would land on the visitor's first edit. Draw one pixel into each target now, while the page is idle.
   private prime() {
     if (!this.width || this.state.model !== 'spheres') return
+    this.drawnPrograms.add(this.progTrace)
     const gl = this.gl
     gl.enable(gl.SCISSOR_TEST)
     gl.scissor(0, 0, 1, 1)
@@ -531,8 +554,19 @@ export class LookdevEngine {
     progs.forEach(p => finishProgram(gl, p))
     this.buildAlbedoTables()
     gl.deleteProgram(this.progTable)
+    // The plain tracer's first draw (prime) may pause the page (see FIRST_DRAW_NOTICE_MS): say so, and wait for
+    // the notice to paint and the page to stop scrolling.
+    if (this.width && this.state.model === 'spheres') {
+      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model: 'ready', finishing: VARIANT_LABEL.base })
+      const t0 = performance.now()
+      while (performance.now() - t0 < FIRST_DRAW_NOTICE_MS || performance.now() - this.lastScroll < SCROLL_QUIET_MS) {
+        await sleep(50)
+        if (this.disposed || gl.isContextLost()) return false
+      }
+    }
     this.live = true
     this.prime()
+    this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model: 'ready' }) // the notice is done
     this.sceneDirty = true
     this.ensureModel()
     this.kick()
@@ -684,7 +718,9 @@ export class LookdevEngine {
     if (!this.active) return
     const model = this.modelStatus()
     if (model !== 'ready') {
-      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model, waitingFor: this.waitingFor() })
+      const waitingFor = this.waitingFor()
+      const compiling = waitingFor === 'shaders' ? VARIANT_LABEL[variantOf(this.state)] : undefined
+      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model, waitingFor, compiling })
       return
     }
     const converged = this.spp >= this.goal
@@ -921,7 +957,7 @@ export class LookdevEngine {
   setVisible(v: boolean) {
     this.visible = v
     // Someone is looking at the lab: compile the glass variant in the background (off the page's thread), so a
-    // click on a glass hero usually finds it ready.
+    // click on a glass hero usually waits only for its first draw (see FIRST_DRAW_NOTICE_MS).
     if (v) this.ensureVariant('base+glass')
     if (v) this.kick()
     else this.stop()
@@ -1010,6 +1046,23 @@ export class LookdevEngine {
     this.passN = 0
     this.renderMs = 0
     this.kick()
+  }
+
+  // Before a tracer program's first draw (see FIRST_DRAW_NOTICE_MS): report it, then hold off until the notice has
+  // had time to paint and the page is not scrolling. True once the draw may run.
+  private readyForFirstDraw() {
+    const prog = this.traceProg()
+    if (this.drawnPrograms.has(prog)) return true
+    const now = performance.now()
+    if (!this.finishingSince) {
+      this.finishingSince = now
+      this.onStatus({ spp: 0, target: this.goal, converged: false, preview: false, ms: 0, model: 'ready', finishing: VARIANT_LABEL[variantOf(this.state)] })
+      return false
+    }
+    if (now - this.finishingSince < FIRST_DRAW_NOTICE_MS || now - this.lastScroll < SCROLL_QUIET_MS) return false
+    this.drawnPrograms.add(prog)
+    this.finishingSince = 0
+    return true
   }
 
   private kick() {
@@ -1170,6 +1223,7 @@ export class LookdevEngine {
       return
     }
     this.rafId = requestAnimationFrame(this.step)
+    if (!this.readyForFirstDraw()) return
     const gl = this.gl
     const dt = this.lastFrameT ? t - this.lastFrameT : 0
     this.trackFrame(dt)

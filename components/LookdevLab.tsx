@@ -7,6 +7,7 @@ import {
   isPosterState,
   TARGET_SPP,
   MESH_FURNACE_BOUNCES,
+  type Compare,
   type LabState,
   type LabStatus,
   type Pass,
@@ -147,6 +148,67 @@ function useWaitSeconds(key: string | null) {
 }
 // The count reads after the first two seconds: shorter waits need no clock.
 const waitClock = (secs: number) => (secs >= 2 ? `  ${secs} s` : '')
+
+const COMPARES: { id: Compare; label: string; sides?: [string, string] }[] = [
+  { id: 'off', label: 'Off' },
+  { id: 'denoise', label: 'Denoiser', sides: ['Raw', 'Denoised'] },
+  { id: 'multiscatter', label: 'Multiple scattering', sides: ['Compensation off', 'Compensation on'] },
+  { id: 'view', label: 'View transform', sides: ['ACES 2.0', 'AgX'] },
+]
+
+// Split compare: a line across the image with a version of it either side, dragged by its handle (or moved with
+// the arrow keys once the handle has focus).
+function SplitLine({ split, sides, frameRef, onSplit, onDrag }: {
+  split: number
+  sides: [string, string]
+  frameRef: React.RefObject<HTMLDivElement | null>
+  onSplit: (v: number) => void
+  onDrag: (on: boolean) => void
+}) {
+  const drag = useRef<number | null>(null)
+  const fromPointer = (e: React.PointerEvent) => {
+    const r = frameRef.current?.getBoundingClientRect()
+    if (r) onSplit(clamp((e.clientX - r.left) / r.width, 0.02, 0.98))
+  }
+  return (
+    <div className="lab-split" style={{ left: `${split * 100}%` }}>
+      <span className="lab-split-label left">{sides[0]}</span>
+      <span className="lab-split-label right">{sides[1]}</span>
+      <div
+        className="lab-split-handle"
+        role="slider"
+        tabIndex={0}
+        aria-label={`Compare line: ${sides[0]} left, ${sides[1]} right`}
+        aria-valuemin={2}
+        aria-valuemax={98}
+        aria-valuenow={Math.round(split * 100)}
+        aria-valuetext={`${Math.round(split * 100)}% across`}
+        onPointerDown={e => {
+          drag.current = e.pointerId
+          e.currentTarget.setPointerCapture(e.pointerId)
+          onDrag(true)
+        }}
+        onPointerMove={e => {
+          if (drag.current === e.pointerId) fromPointer(e)
+        }}
+        onPointerUp={e => {
+          if (drag.current !== e.pointerId) return
+          drag.current = null
+          onDrag(false)
+        }}
+        onPointerCancel={() => {
+          drag.current = null
+          onDrag(false)
+        }}
+        onKeyDown={e => {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+          e.preventDefault()
+          onSplit(clamp(split + (e.key === 'ArrowLeft' ? -0.02 : 0.02), 0.02, 0.98))
+        }}
+      />
+    </div>
+  )
+}
 
 type ControlTab = 'look' | 'light' | 'render'
 const CONTROL_TABS: { id: ControlTab; label: string }[] = [
@@ -315,12 +377,13 @@ export default function LookdevLab() {
     (lab.pass === 'beauty' || lab.pass === 'diffuse' || lab.pass === 'specular')
 
   const update = (patch: Partial<LabState>) => {
-    const next = { ...labRef.current, ...patch }
+    const prev = labRef.current
+    const next = { ...prev, ...patch }
     labRef.current = next
     setLab(next)
     // Anything beyond exposure, view transform and the light mixer re-renders from zero samples, so the previous
     // count and furnace reading no longer apply.
-    if (!isDisplayOnly(patch)) {
+    if (!isDisplayOnly(patch, prev)) {
       setFurnaceMean(null)
       setStatus(s => ({ ...s, spp: 0, converged: false, preview: false, ms: 0 }))
     }
@@ -652,6 +715,15 @@ export default function LookdevLab() {
             )}
           </div>
         )}
+        {mode === 'live' && ready && lab.compare !== 'off' && !lab.furnace && (
+          <SplitLine
+            split={lab.split}
+            sides={COMPARES.find(c => c.id === lab.compare)!.sides!}
+            frameRef={frameRef}
+            onSplit={v => update({ split: v })}
+            onDrag={on => engineRef.current?.setInteracting(on)}
+          />
+        )}
         {mode === 'live' &&
           labels.map((p, i) => (
             <div key={i} className="lab-ball-label" style={{ left: `${p.x * 100}%`, top: `calc(${p.y * 100}% + 12px)` }}>
@@ -926,6 +998,21 @@ export default function LookdevLab() {
                       {lab.exposure >= 0 ? '+' : ''}
                       {lab.exposure.toFixed(1)}
                     </span>
+                  </Group>
+                </div>
+
+                <div className="lab-row">
+                  <Group label="Compare">
+                    {COMPARES.filter(c => c.id !== 'denoise' || canDenoise).map(c => (
+                      <Pill
+                        key={c.id}
+                        on={lab.compare === c.id}
+                        // Turned on, the line starts through the hero, where the difference matters.
+                        onClick={() => update({ compare: c.id, ...(lab.compare === 'off' && labels[2] ? { split: clamp(labels[2].x, 0.02, 0.98) } : {}) })}
+                      >
+                        {c.label}
+                      </Pill>
+                    ))}
                   </Group>
                 </div>
 

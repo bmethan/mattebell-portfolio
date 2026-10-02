@@ -5,6 +5,8 @@ import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './mo
 import { ENVIRONMENTS, loadEnvironment, whiteEnvironment, type Env, type EnvData } from './environments'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
+// Split compare: two versions of the image either side of a draggable line (see LabState.split).
+export type Compare = 'off' | 'denoise' | 'multiscatter' | 'view'
 export type View = 'aces' | 'agx' | 'neutral' | 'standard'
 export type { Env, Hero, Model, PaintFinish, SkinTone, Stage }
 
@@ -40,6 +42,8 @@ export interface LabState {
   multiscatter: boolean
   denoise: boolean // display the denoised image (only while rendering: the still is the raw 2048 spp render)
   furnace: boolean
+  compare: Compare
+  split: number // the compare line, as a fraction of the image's width
 }
 
 export const DEFAULT_STATE: LabState = {
@@ -74,6 +78,8 @@ export const DEFAULT_STATE: LabState = {
   multiscatter: true,
   denoise: true,
   furnace: false,
+  compare: 'off',
+  split: 0.5,
 }
 
 // Settings the display applies to the accumulated images (each light has its own), so they never re-render.
@@ -81,7 +87,15 @@ const DISPLAY_KEYS = new Set<string>([
   'exposure', 'view', 'key', 'fill', 'rim', 'keyKelvin', 'fillKelvin', 'rimKelvin', 'keyGain', 'fillGain', 'rimGain',
   'denoise', 'envOn', 'envGain',
 ])
-export const isDisplayOnly = (patch: Partial<LabState>) => Object.keys(patch).every(k => DISPLAY_KEYS.has(k))
+// The compare and its line act on the display too, except the multiple-scattering compare, which the tracer
+// renders (each pixel by its side of the line).
+const tracedCompare = (s: LabState) => s.compare === 'multiscatter'
+export const isDisplayOnly = (patch: Partial<LabState>, prev: LabState) => {
+  const next = { ...prev, ...patch }
+  return Object.keys(patch).every(
+    k => DISPLAY_KEYS.has(k) || ((k === 'compare' || k === 'split') && !tracedCompare(prev) && !tracedCompare(next)),
+  )
+}
 
 // poster.jpg is this renderer's converged (2048 spp) image of DEFAULT_STATE, so that state never needs a live
 // render. Angles and roughness compare with a tolerance (arrow keys step in floats; a roughness equal to the
@@ -94,6 +108,7 @@ export function isPosterState(s: LabState) {
   return (Object.keys(d) as (keyof LabState)[]).every(k => {
     if (k === 'keyAz' || k === 'keyEl') return Math.abs(s[k] - d[k]) < 1e-6
     if (k === 'modelYaw') return s.model === 'spheres' || Math.abs(s.modelYaw - d.modelYaw) < 1e-6
+    if (k === 'split') return s.compare === 'off' || Math.abs(s.split - d.split) < 1e-6
     if (k === 'heroRoughness') return s.hero === d.hero && Math.abs(rough(s) - rough(d)) < 1e-6
     if (k === 'heroAniso') return s.hero === d.hero && Math.abs(aniso(s) - aniso(d)) < 1e-6
     return s[k] === d[k]
@@ -933,7 +948,7 @@ export class LookdevEngine {
   }
 
   setState(patch: Partial<LabState>) {
-    const displayOnly = isDisplayOnly(patch)
+    const displayOnly = isDisplayOnly(patch, this.state)
     this.state = { ...this.state, ...patch }
     if (displayOnly && (this.spp > 0 || (this.previewK > 0 && this.previewGen === this.gen))) {
       // Exposure, view transform and the light mixer act on the accumulated radiance, so no re-render is needed.
@@ -1131,6 +1146,8 @@ export class LookdevEngine {
     gl.uniform1i(L('uFurnace'), s.furnace ? 1 : 0)
     gl.uniform1f(L('uIndirectClamp'), s.furnace ? 0 : INDIRECT_CLAMP)
     gl.uniform1i(L('uMultiScatter'), s.multiscatter ? 1 : 0)
+    gl.uniform1i(L('uCompareMS'), s.compare === 'multiscatter' && !s.furnace ? 1 : 0)
+    gl.uniform1f(L('uSplitX'), s.split)
     gl.uniform1i(L('uPass'), PASS_ID[s.pass])
 
     // Materials: 0 gray card, 1 chromium, 2 hero, 3 floor; with a model, 4-9 dress its other parts.
@@ -1523,7 +1540,9 @@ export class LookdevEngine {
     const src = preview ? this.previewTex : this.accumTex[this.ping]
     const k = preview ? this.previewK : 1
     const mix = this.denoiseMix(preview)
-    const denoised = mix > 0 ? this.denoise(src, Math.ceil(this.width / k), Math.ceil(this.height / k), preview ? 1 : this.spp) : null
+    const compare = this.displayCompare()
+    const denoised =
+      mix > 0 || compare === 1 ? this.denoise(src, Math.ceil(this.width / k), Math.ceil(this.height / k), preview ? 1 : this.spp) : null
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, this.width, this.height)
     gl.useProgram(p)
@@ -1546,7 +1565,18 @@ export class LookdevEngine {
     gl.uniform1f(this.loc(p, 'uExposure'), s.furnace ? 0 : s.exposure)
     gl.uniform1i(this.loc(p, 'uView'), s.furnace ? VIEW_ID.standard : VIEW_ID[s.view])
     gl.uniform1i(this.loc(p, 'uPass'), PASS_ID[s.pass])
+    gl.uniform1i(this.loc(p, 'uCompare'), compare)
+    gl.uniform1f(this.loc(p, 'uSplitPx'), s.split * this.width)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
+  }
+
+  // The display's side of the split compare: 1, raw against denoised (where the denoiser runs on this pass); 2, ACES
+  // 2.0 against AgX; 0 otherwise (the multiple-scattering compare is the tracer's).
+  private displayCompare() {
+    const s = this.state
+    if (s.furnace) return 0
+    if (s.compare === 'denoise') return this.canDenoise && (s.pass === 'beauty' || s.pass === 'diffuse' || s.pass === 'specular') ? 1 : 0
+    return s.compare === 'view' ? 2 : 0
   }
 
   // The denoiser's share of the displayed image (see DENOISE_FULL_SPP). It runs on the beauty and lobe passes,

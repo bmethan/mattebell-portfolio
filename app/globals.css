@@ -71,6 +71,15 @@ body {
 @keyframes lab-hint-pulse { from { transform: scale(1); opacity: 0.7; } to { transform: scale(2.6); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .lab-drag-hint { animation: none; } .lab-marker.hinting::before { animation: none; } }
 .lab-ball-label { position: absolute; transform: translateX(-50%); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 4px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9); pointer-events: none; white-space: nowrap; }
+.lab-split { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px solid var(--accent); box-shadow: 0 0 3px rgba(0, 0, 0, 0.8); pointer-events: none; }
+.lab-split-label { position: absolute; top: 36px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 4px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9); white-space: nowrap; }
+.lab-split-label.left { right: 10px; }
+.lab-split-label.right { left: 10px; }
+.lab-split-handle { position: absolute; top: 50%; left: 0; width: 28px; height: 28px; transform: translate(-50%, -50%); border: 1px solid var(--accent); border-radius: 50%; background: rgba(6, 6, 7, 0.7); cursor: ew-resize; pointer-events: auto; touch-action: none; }
+.lab-split-handle::before, .lab-split-handle::after { content: ''; position: absolute; top: 50%; width: 5px; height: 5px; margin-top: -3px; border: solid var(--accent); border-width: 0 0 1px 1px; }
+.lab-split-handle::before { left: 7px; transform: rotate(45deg); }
+.lab-split-handle::after { right: 7px; transform: rotate(-135deg); }
+.lab-split-handle:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
 .lab-controls { display: flex; flex-direction: column; gap: 18px; margin: 20px 0 0; padding: 0; border: 0; min-width: 0; transition: opacity 0.3s; }
 .lab-controls:disabled { opacity: 0.45; }
 .lab-controls:disabled .lab-pill, .lab-controls:disabled .lab-range, .lab-controls:disabled .lab-tab { cursor: default; }

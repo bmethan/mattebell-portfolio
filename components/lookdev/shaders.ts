@@ -569,6 +569,8 @@ struct Surf {
 uniform sampler3D uETable;
 uniform sampler3D uETableT; // dielectric albedo: R entering, G leaving (see E_TABLE_FRAG)
 uniform int uMultiScatter;
+// The compensation as this pixel renders it: uMultiScatter, except in the split compare of it (see main).
+bool gMultiScatter;
 
 // Coat roughens the base specular (spec, Coat > Roughening). Products instead of pow() for pow(0, y) safety.
 float openpbrCoatedSpecRoughness(float rB, float rC, float C) {
@@ -698,7 +700,7 @@ Surf setupSurf(Mat m, vec3 wo, bool back, float lambda, bool colored) {
   float etaTable = s.eta >= 1.0 ? s.eta : 1.0 / s.eta;
 
   float mu = clamp(wo.z, 1e-4, 1.0);
-  bool ms = uMultiScatter == 1;
+  bool ms = gMultiScatter;
   vec3 F0m = s.baseWeight * s.baseColor;
 
   // textureLod: implicit-derivative fetches inside loops force Direct3D to unroll them.
@@ -1703,9 +1705,14 @@ vec3 sampleHG(vec3 d, float g, float u1, float u2) {
 }
 #endif
 
+// Split compare of the multiple-scattering compensation: off left of uSplitX (a fraction of the width), on right.
+uniform int uCompareMS;
+uniform float uSplitX;
+
 void main() {
   ivec2 pix = ivec2(gl_FragCoord.xy);
   uint pixSeed = pcg3d(uvec3(uvec2(pix), 0x9e37u)).x;
+  gMultiScatter = uCompareMS == 1 ? gl_FragCoord.x >= uSplitX * uResolution.x : uMultiScatter == 1;
   vec3 acc0 = vec3(0.0), acc1 = vec3(0.0), acc2 = vec3(0.0), acc3 = vec3(0.0);
   int nL = uNumLights + uEnvOn; // lights sampled at each vertex: the softboxes, then the environment
   float accMask = 0.0;
@@ -2082,6 +2089,9 @@ uniform int uView;   // 0 ACES 2.0, 1 AgX, 2 PBR Neutral, 3 Standard
 uniform int uPass;
 uniform sampler2D uDenoised; // the denoiser's output (mixed radiance)
 uniform float uDenoiseMix;   // its share of the displayed image: 1 while noisy, falling to 0 as the render converges
+// Split compare (uCompare): 1, raw left of uSplitPx and fully denoised right; 2, ACES 2.0 left and AgX right.
+uniform int uCompare;
+uniform float uSplitPx;
 out vec4 outColor;
 
 // IEC 61966-2-1 sRGB encoding.
@@ -2161,12 +2171,15 @@ void main() {
   if (uPass == 3) { outColor = vec4(srgbOETF(max(AP1_TO_REC709 * c, 0.0)), 1.0); return; } // albedo
   c = c * uMix[0] + texelFetch(uAccum1, px, 0).rgb * uMix[1] + texelFetch(uAccum2, px, 0).rgb * uMix[2] +
     texelFetch(uAccum3, px, 0).rgb * uMix[3];
-  if (uDenoiseMix > 0.0) c = mix(c, texelFetch(uDenoised, px, 0).rgb, uDenoiseMix);
+  bool right = gl_FragCoord.x >= uSplitPx;
+  float dm = uCompare == 1 ? (right ? 1.0 : 0.0) : uDenoiseMix;
+  if (dm > 0.0) c = mix(c, texelFetch(uDenoised, px, 0).rgb, dm);
+  int view = uCompare == 2 ? (right ? 1 : 0) : uView;
   c = max(c, 0.0) * exp2(uExposure);
-  if (uView == 0 && uAcesReady == 1) { outColor = vec4(aces2(c), 1.0); return; }
+  if (view == 0 && uAcesReady == 1) { outColor = vec4(aces2(c), 1.0); return; }
   vec3 r = max(AP1_TO_REC709 * c, 0.0);
-  if (uView == 2) r = PBRNeutralToneMapping(r);
-  else if (uView != 3) r = AgXToneMapping(r); // AgX, and the fallback while the ACES LUT loads
+  if (view == 2) r = PBRNeutralToneMapping(r);
+  else if (view != 3) r = AgXToneMapping(r); // AgX, and the fallback while the ACES LUT loads
   outColor = vec4(srgbOETF(r), 1.0);
 }
 `

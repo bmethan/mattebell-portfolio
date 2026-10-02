@@ -32,6 +32,7 @@ const VIEWS: { id: View; label: string }[] = [
   { id: 'standard', label: 'Standard' },
 ]
 
+const LIGHT_HINT_KEY = 'lab-light-moved'
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it drags the light
 const POSTER_SPP = 2048 // samples per pixel of poster.jpg, the converged render of the default settings
 
@@ -365,7 +366,25 @@ export default function LookdevLab() {
     if (e) setLabels(e.labelPoints().map(p => e.project(p)))
   }, [lab.model, lab.modelYaw, status.model, ready])
 
+  // "Drag me" by the key light's marker until the visitor first moves the light (remembered on this device).
+  const [lightMoved, setLightMoved] = useState(true) // until read below, so the hint never flashes for returners
+  useEffect(() => {
+    try {
+      setLightMoved(localStorage.getItem(LIGHT_HINT_KEY) === '1')
+    } catch {
+      setLightMoved(false)
+    }
+  }, [])
+  const noteLightMoved = () => {
+    if (lightMoved) return
+    setLightMoved(true)
+    try {
+      localStorage.setItem(LIGHT_HINT_KEY, '1')
+    } catch {}
+  }
+
   const setFromPointer = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    noteLightMoved()
     const r = e.currentTarget.getBoundingClientRect()
     const u = clamp((e.clientX - r.left) / r.width, 0, 1)
     const v = clamp((e.clientY - r.top) / r.height, 0, 1)
@@ -419,6 +438,7 @@ export default function LookdevLab() {
     else if (e.key === 'ArrowDown') keyEl -= s
     else return
     e.preventDefault()
+    noteLightMoved()
     update({ keyAz: clamp(keyAz, -AZ_RANGE / 2, AZ_RANGE / 2), keyEl: clamp(keyEl, EL_MIN, EL_MAX) })
   }
 
@@ -533,7 +553,19 @@ export default function LookdevLab() {
               style={{ transform: `scaleX(${pristine ? 1 : status.spp / status.target})` }}
             />
             {lab.key && !lab.furnace && (
-              <div className="lab-marker" style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }} />
+              <div
+                className={`lab-marker${lightMoved ? '' : ' hinting'}`}
+                style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }}
+              />
+            )}
+            {lab.key && !lab.furnace && !lightMoved && (
+              <div
+                className={`lab-drag-hint${markerX > 70 ? ' left' : ''}`}
+                style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }}
+                aria-hidden="true"
+              >
+                Drag me
+              </div>
             )}
           </>
         )}

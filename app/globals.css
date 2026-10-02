@@ -53,6 +53,16 @@ body {
 .lab-progress { position: absolute; left: 0; bottom: 0; width: 100%; height: 1px; background: var(--accent); transform-origin: left; opacity: 0.6; pointer-events: none; }
 .lab-marker { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border: 1px solid var(--accent); border-radius: 50%; opacity: 0.8; pointer-events: none; }
 .lab-marker::after { content: ''; position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px; border-radius: 50%; background: var(--accent); }
+/* "Drag me" by the key light's marker, until the light is first moved: a short leader line and a label, beside
+   the marker (to its left near the frame's right edge), with three slow pulses of the marker's ring. */
+.lab-drag-hint { position: absolute; display: flex; align-items: center; gap: 6px; transform: translate(12px, -50%); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 4px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9); pointer-events: none; white-space: nowrap; animation: lab-hint-in 0.6s ease 0.5s both; }
+.lab-drag-hint::before { content: ''; width: 14px; height: 1px; background: var(--accent); opacity: 0.7; }
+.lab-drag-hint.left { flex-direction: row-reverse; transform: translate(calc(-100% - 12px), -50%); }
+.lab-marker.hinting { opacity: 1; }
+.lab-marker.hinting::before { content: ''; position: absolute; inset: -1px; border: 1px solid var(--accent); border-radius: 50%; animation: lab-hint-pulse 2.4s ease-out 1s 3; opacity: 0; }
+@keyframes lab-hint-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes lab-hint-pulse { from { transform: scale(1); opacity: 0.7; } to { transform: scale(2.6); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .lab-drag-hint { animation: none; } .lab-marker.hinting::before { animation: none; } }
 .lab-ball-label { position: absolute; transform: translateX(-50%); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 4px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9); pointer-events: none; white-space: nowrap; }
 .lab-controls { display: flex; flex-direction: column; gap: 14px; margin: 20px 0 0; padding: 0; border: 0; min-width: 0; transition: opacity 0.3s; }
 .lab-controls:disabled { opacity: 0.45; }

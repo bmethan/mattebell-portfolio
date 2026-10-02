@@ -459,7 +459,7 @@ export default function LookdevLab() {
 
   return (
     <section ref={sectionRef} id="lab" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
-      <div style={{ marginBottom: 32 }}>
+      <div style={{ marginBottom: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
           <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
           Lookdev lab
@@ -470,9 +470,17 @@ export default function LookdevLab() {
         </h2>
         <p style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.8, maxWidth: 640 }}>
           A progressive path tracer running a subset of OpenPBR Surface on the reference balls every lighting department
-          shoots: an 18% gray ball, a chrome ball, and a hero material. Drag the frame to move the key light.
+          shoots: an 18% gray ball, a chrome ball, and a hero material.
         </p>
       </div>
+
+      <p className="lab-howto">
+        <span className="lab-howto-pointer">Drag anywhere on the image</span>
+        <span className="lab-howto-touch">Swipe sideways on the image</span> to move the key light (
+        <span className="lab-howto-marker" aria-hidden="true" />
+        <span className="sr-only">the small circle</span> marks it)<span aria-hidden="true"> · </span>
+        <span className="sr-only">. </span>Every control below is live
+      </p>
 
       <div ref={frameRef} className="lab-frame">
         {mode === 'fallback' ? (

@@ -12,7 +12,7 @@ import {
   type Pass,
   type View,
 } from './lookdev/engine'
-import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, SKIN_ORDER, SKIN_TONES, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
+import { HERO_PRESETS, HERO_FAMILIES, familyOf, type Hero, type HeroFamily, PAINT_FINISHES, PAINT_ORDER, SKIN_ORDER, SKIN_TONES, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
 import { MODELS, MODEL_ORDER, type Model } from './lookdev/models'
 import { CITATIONS, CITATION_GROUPS, citeAuthors } from './lookdev/citations'
 import WorkIndicator from './WorkIndicator'
@@ -114,8 +114,8 @@ const TECH_NOTES: [string, string][] = [
   ],
   ['Glass', 'Dispersion is spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm.'],
   [
-    'Skin',
-    "OpenPBR subsurface: light refracts in through the rough surface, walks a scattering medium and leaves through a diffuse exit, as in Cycles' random walk. The official skin presets give no length unit; the lab reads them as centimeters, at each scene's real size (Winged Victory at the statue's 2.75 m).",
+    'Subsurface',
+    "Skin and marble use OpenPBR subsurface: light refracts in through the surface, walks a scattering medium and leaves through a diffuse exit, as in Cycles' random walk. The official presets give no length unit; the lab reads them, and the depth of its honey, as centimeters, at each scene's real size (Winged Victory at the statue's 2.75 m).",
   ],
   ['Light mixer', "Each light renders into its own image, like a production renderer's light groups, so switching, dimming or recoloring a light needs no new render."],
   [
@@ -205,6 +205,7 @@ export default function LookdevLab() {
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
   const [paused, setPaused] = useState(false)
   const [ready, setReady] = useState(false)
+  const lastInFamily = useRef<Partial<Record<HeroFamily, Hero>>>({}) // each family's last picked material
   const [canDenoise, setCanDenoise] = useState(false) // the GPU can draw the denoiser's extra images
   // The still is the renderer's own converged image of the default settings, so the live render (IPR) only
   // runs once something differs: the first edit (a click or drag on the frame, an arrow key, any control)
@@ -443,6 +444,9 @@ export default function LookdevLab() {
   }
 
   const hero = HERO_PRESETS[lab.hero]
+  const family = familyOf(lab.hero)
+  lastInFamily.current[family.id] = lab.hero
+  const pickHero = (h: Hero) => update({ hero: h, heroRoughness: null, heroAniso: null })
   const heroBase = heroParams(lab.hero, lab.paint, lab.flakes, lab.skinTone)
   const heroRough = lab.heroRoughness ?? heroBase[hero.roughnessParam]
   const brushed = heroBase.specular_roughness_anisotropy > 0
@@ -618,13 +622,31 @@ export default function LookdevLab() {
 
           <div className="lab-row">
             <Group label="Hero">
-              {(model?.heroes ?? HERO_ORDER).map(h => (
-                <Pill key={h} on={lab.hero === h} onClick={() => update({ hero: h, heroRoughness: null, heroAniso: null })}>
-                  {HERO_PRESETS[h].label}
-                </Pill>
-              ))}
+              {model?.heroes
+                ? model.heroes.map(h => (
+                    <Pill key={h} on={lab.hero === h} onClick={() => pickHero(h)}>
+                      {HERO_PRESETS[h].label}
+                    </Pill>
+                  ))
+                : HERO_FAMILIES.map(f => (
+                    <Pill key={f.id} on={f.id === family.id} onClick={() => pickHero(lastInFamily.current[f.id] ?? f.heroes[0])}>
+                      {f.label}
+                    </Pill>
+                  ))}
             </Group>
           </div>
+
+          {!model?.heroes && family.heroes.length > 1 && (
+            <div className="lab-row">
+              <Group label={family.label}>
+                {family.heroes.map(h => (
+                  <Pill key={h} on={lab.hero === h} onClick={() => pickHero(h)}>
+                    {HERO_PRESETS[h].label}
+                  </Pill>
+                ))}
+              </Group>
+            </div>
+          )}
 
           {lab.hero === 'carpaint' && (
             <div className="lab-row">

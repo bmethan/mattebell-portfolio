@@ -26,7 +26,7 @@ export interface OpenPBR {
   thin_film_ior: number
   transmission_weight: number
   transmission_color: RGB
-  transmission_depth: number // scene units; 0 = no medium, the color tints the refraction instead
+  transmission_depth: number // centimeters in the presets, as subsurface_radius; 0 = no medium, the color tints the refraction
   transmission_dispersion_scale: number
   transmission_dispersion_abbe_number: number
   subsurface_weight: number
@@ -148,12 +148,22 @@ export const STAGES: Record<Stage, { label: string; cyc: boolean; material: Open
 
 export type Hero =
   | 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium' | 'glass' | 'diamond' | 'soapbubble'
-  | 'skin'
+  | 'skin' | 'marble' | 'ceramic' | 'honey' | 'copper' | 'silver'
 type RoughnessParam = 'specular_roughness' | 'fuzz_roughness' | 'coat_roughness'
 
-export const HERO_ORDER: Hero[] = [
-  'carpaint', 'gold', 'brushed', 'titanium', 'glass', 'diamond', 'soapbubble', 'skin', 'velvet', 'thinfilm', 'plastic',
+// The hero materials by family: the Hero row picks a family, a second row its material (a family of one has no
+// second row). Car paint and skin have their own rows below (finish, tone).
+export type HeroFamily = 'metal' | 'dielectric' | 'layered' | 'transparent' | 'translucent' | 'fabric'
+export const HERO_FAMILIES: { id: HeroFamily; label: string; heroes: Hero[] }[] = [
+  { id: 'layered', label: 'Layered', heroes: ['carpaint', 'thinfilm'] },
+  { id: 'metal', label: 'Metal', heroes: ['gold', 'copper', 'silver', 'brushed', 'titanium'] },
+  { id: 'dielectric', label: 'Dielectric', heroes: ['plastic', 'ceramic'] },
+  { id: 'transparent', label: 'Transparent', heroes: ['glass', 'diamond', 'honey', 'soapbubble'] },
+  { id: 'translucent', label: 'Translucent', heroes: ['skin', 'marble'] },
+  { id: 'fabric', label: 'Fabric', heroes: ['velvet'] },
 ]
+export const HERO_ORDER: Hero[] = HERO_FAMILIES.flatMap(f => f.heroes)
+export const familyOf = (h: Hero) => HERO_FAMILIES.find(f => f.heroes.includes(h))!
 
 export interface HeroPreset {
   label: string
@@ -187,6 +197,72 @@ export const HERO_PRESETS: Record<Hero, HeroPreset> = {
       base_metalness: 1,
       specular_color: [0.987, 1.013, 0.997],
       specular_roughness: 0.02,
+    }),
+  },
+  // Official: examples/open_pbr_copper.mtlx
+  copper: {
+    label: 'Copper',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      base_color: [0.811, 0.643, 0.542],
+      base_metalness: 1,
+      specular_color: [0.97, 0.95, 0.946],
+      specular_roughness: 0.02,
+    }),
+  },
+  // Official: examples/open_pbr_silver.mtlx
+  silver: {
+    label: 'Silver',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      base_color: [0.988, 0.985, 0.975],
+      base_metalness: 1,
+      specular_color: [0.995, 0.995, 0.998],
+      specular_roughness: 0.02,
+    }),
+  },
+  // Authored: glazed porcelain, a white body under a clear, glossy glaze (OpenPBR's coat). There is no official
+  // ceramic example; the values are chosen for the look, not measured.
+  ceramic: {
+    label: 'Glazed ceramic',
+    official: false,
+    roughnessParam: 'coat_roughness',
+    params: mat({
+      base_color: [0.82, 0.81, 0.78],
+      specular_roughness: 0.35,
+      coat_weight: 1,
+      coat_roughness: 0.03,
+      coat_ior: 1.5,
+    }),
+  },
+  // Authored on official examples/open_pbr_honey_liquid.mtlx: its color, given a depth of 12 cm (centimeters as
+  // read for the subsurface presets, see subsurfaceScale). The official example has no depth, so its color tints
+  // the refraction at the surface; with a depth it is the color light takes after that distance in the honey
+  // (spec, Transmission: Beer-Lambert), so thin edges stay pale and the thick middle runs deep amber.
+  honey: {
+    label: 'Honey',
+    official: false,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      specular_ior: 1.5,
+      transmission_weight: 1,
+      transmission_color: [0.705, 0.582, 0.112],
+      transmission_depth: 12,
+    }),
+  },
+  // Official: examples/open_pbr_marble.mtlx (subsurface, the default radius of 1 read as centimeters).
+  marble: {
+    label: 'Marble',
+    official: true,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      subsurface_weight: 1,
+      subsurface_color: [0.813, 0.793, 0.759],
+      subsurface_radius_scale: [0.851, 0.557, 0.395],
     }),
   },
   // Official: examples/open_pbr_velvet.mtlx

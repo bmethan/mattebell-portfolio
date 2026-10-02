@@ -986,12 +986,13 @@ export class LookdevEngine {
       gl.uniform1i(L('uTriPos'), 3)
       gl.uniform1i(L('uTriNrm'), 4)
     }
-    // Subsurface radii are given in centimeters (the presets'); the walk needs scene units.
+    // Subsurface radii and transmission depths are given in centimeters (the presets'); the tracer needs scene
+    // units.
     const sss = subsurfaceScale(s.model === 'spheres' ? BALLS_METERS_PER_UNIT : MODELS[s.model].metersPerUnit)
     gl.uniform1i(L('uMaxScatter'), s.furnace ? FURNACE_MAX_SCATTER : MAX_SCATTER)
     mats.forEach((m, i) => {
       for (const f of MATERIAL_FIELDS) {
-        const v = f === 'subsurface_radius' ? m[f] * sss : m[f]
+        const v = f === 'subsurface_radius' || f === 'transmission_depth' ? m[f] * sss : m[f]
         const loc = L(`uMat[${i}].${f}`)
         if (Array.isArray(v)) gl.uniform3fv(loc, v)
         else gl.uniform1f(loc, v)

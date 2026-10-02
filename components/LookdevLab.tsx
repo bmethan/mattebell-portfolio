@@ -14,7 +14,7 @@ import {
 } from './lookdev/engine'
 import { HERO_PRESETS, HERO_ORDER, PAINT_FINISHES, PAINT_ORDER, SKIN_ORDER, SKIN_TONES, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
 import { MODELS, MODEL_ORDER, type Model } from './lookdev/models'
-import { CITATIONS } from './lookdev/citations'
+import { CITATIONS, CITATION_GROUPS, citeAuthors } from './lookdev/citations'
 import WorkIndicator from './WorkIndicator'
 
 const PASSES: { id: Pass; label: string }[] = [
@@ -103,6 +103,25 @@ function modelPatch(m: Model): Partial<LabState> {
   const { hero, yaw } = MODELS[m]
   return { model: m, ...(hero ? { hero, heroRoughness: null, heroAniso: null } : {}), ...(yaw !== undefined ? { modelYaw: yaw } : {}) }
 }
+
+// The lab's technical notes, one short entry per topic (shown under "Technical notes and references").
+const TECH_NOTES: [string, string][] = [
+  ['Color', 'Rendered in ACEScg, shown through ACES 2.0 (baked from OpenColorIO 2.5), AgX, Khronos PBR Neutral or a plain sRGB curve.'],
+  [
+    'Validation',
+    'In a white furnace test, with multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of 1.0, and rough glass stays within about 1.5% through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%.',
+  ],
+  ['Glass', 'Dispersion is spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm.'],
+  [
+    'Skin',
+    "OpenPBR subsurface: light refracts in through the rough surface, walks a scattering medium and leaves through a diffuse exit, as in Cycles' random walk. The official skin presets give no length unit; the lab reads them as centimeters, at each scene's real size (Winged Victory at the statue's 2.75 m).",
+  ],
+  ['Light mixer', "Each light renders into its own image, like a production renderer's light groups, so switching, dimming or recoloring a light needs no new render."],
+  [
+    'Denoiser',
+    "While it renders, the image is shown through an edge-avoiding wavelet filter guided by albedo, normals and each pixel's noise, labelled in the frame. It hands over to the raw render as samples build up: the finished image is never filtered.",
+  ],
+]
 
 const MIXER_LIGHTS = [
   { id: 'key', label: 'Key', gain: 'keyGain', kelvin: 'keyKelvin' },
@@ -688,45 +707,53 @@ export default function LookdevLab() {
         </fieldset>
       )}
 
-      <div className="lab-methods">
-        {model && (
-          <p className="lab-note" style={{ width: '100%', margin: '0 0 8px' }}>
+      {model && (
+        <p className="lab-credit">
+          <span className="lab-label">Model</span>
+          <span>
             {model.credit.text}{' '}
             <a href={model.credit.source} target="_blank" rel="noopener noreferrer">
               Source
             </a>
-            {', '}
+            {' · '}
             <a href={model.credit.licenseUrl} target="_blank" rel="noopener noreferrer">
               {model.credit.license}
             </a>
-            .
-          </p>
-        )}
-        <p className="lab-note" style={{ width: '100%', margin: '0 0 4px' }}>
-          Rendered in ACEScg. With multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of
-          1.0 in a white furnace test, and rough glass, compensated for multiple scattering, stays within about 1.5%
-          through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%. Dispersion is
-          spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm. Each
-          light renders into its own image, like a production renderer&apos;s light groups, so the light mixer switches,
-          dims and recolors a light without starting a new render. While it renders, the image is shown through
-          a denoiser (an edge-avoiding wavelet filter guided by albedo, normals and each pixel&apos;s noise), labelled in
-          the frame and handing over to the raw render as it converges: the finished image is never filtered.
-          Skin is OpenPBR&apos;s subsurface: light refracts in through the rough surface and walks a scattering medium
-          (the spec&apos;s albedo mapping, each walk weighted across the three color channels as in pbrt-v4), leaving
-          through a diffuse exit as in Cycles&apos; random walk. The official skin presets do not state a length unit; the
-          lab reads them as centimeters, at each scene&apos;s real size (Winged Victory at the statue&apos;s 2.75 m).
+          </span>
         </p>
-        <span className="lab-label">Methods</span>
-        <ul>
-          {CITATIONS.map(c => (
-            <li key={c.id}>
-              <a href={c.url} target="_blank" rel="noopener noreferrer" title={`${c.authors}. ${c.title}. ${c.venue}, ${c.year}.`}>
-                {c.short}
-              </a>
-            </li>
-          ))}
-        </ul>
-      </div>
+      )}
+
+      <details className="lab-tech">
+        <summary>Technical notes and references</summary>
+        <div className="lab-tech-body">
+          <dl className="lab-tech-notes">
+            {TECH_NOTES.map(([term, text]) => (
+              <div key={term}>
+                <dt>{term}</dt>
+                <dd>{text}</dd>
+              </div>
+            ))}
+          </dl>
+          <div className="lab-refs">
+            {CITATION_GROUPS.map(g => (
+              <div key={g} className="lab-refs-group">
+                <h3>{g}</h3>
+                <ol>
+                  {CITATIONS.filter(c => c.group === g).map(c => (
+                    <li key={c.id}>
+                      {citeAuthors(c)} ({c.year}).{' '}
+                      <a href={c.url} target="_blank" rel="noopener noreferrer">
+                        {c.title}
+                      </a>
+                      . <span className="lab-refs-venue">{c.venue}.</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ))}
+          </div>
+        </div>
+      </details>
     </section>
   )
 }

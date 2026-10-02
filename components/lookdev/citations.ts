@@ -1,9 +1,15 @@
-// Methods shown under the lab. Every entry was checked against its primary source (paper, journal page,
-// official spec or repository) by an independent verification pass before it went on the page.
+// References for the lab's technical notes, grouped by topic. Every entry was checked against its primary source
+// (paper, journal page, official spec or repository) before it went on the page.
+export const CITATION_GROUPS = ['Shading model', 'Sampling', 'Geometry', 'Subsurface', 'Denoising', 'Color and display'] as const
+export type CitationGroup = (typeof CITATION_GROUPS)[number]
+
 export interface Citation {
   id: string
+  group: CitationGroup
   short: string
   authors: string
+  // Short author form for the list (else derived: one or two surnames, or the first and "et al.").
+  by?: string
   title: string
   venue: string
   year: string
@@ -13,6 +19,8 @@ export interface Citation {
 export const CITATIONS: Citation[] = [
   {
     id: 'openpbr',
+    group: 'Shading model',
+    by: 'Academy Software Foundation',
     short: 'OpenPBR Surface 1.1.1',
     authors: 'Academy Software Foundation',
     title: 'OpenPBR Surface Specification v1.1.1',
@@ -22,6 +30,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'eon',
+    group: 'Shading model',
     short: 'EON diffuse',
     authors: 'Jamie Portsmouth, Peter Kutz, Stephen Hill',
     title: 'EON: A Practical Energy-Preserving Rough Diffuse BRDF',
@@ -31,6 +40,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'bvndf',
+    group: 'Sampling',
     short: 'Bounded VNDF sampling',
     authors: 'Yusuke Tokuyoshi, Kenta Eto',
     title: 'Bounded VNDF Sampling for the Smith-GGX BRDF',
@@ -40,6 +50,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'caps',
+    group: 'Sampling',
     short: 'Spherical-cap VNDF',
     authors: 'Jonathan Dupuy, Anis Benyoub',
     title: 'Sampling Visible GGX Normals with Spherical Caps',
@@ -49,6 +60,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'turquin',
+    group: 'Shading model',
     short: 'Multiple-scattering compensation',
     authors: 'Emmanuel Turquin',
     title: 'Practical Multiple Scattering Compensation for Microfacet Models',
@@ -58,6 +70,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'kulla',
+    group: 'Shading model',
     short: 'Albedo tables',
     authors: 'Christopher Kulla, Alejandro Conty',
     title: 'Revisiting Physically Based Shading at Imageworks',
@@ -67,6 +80,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'f82',
+    group: 'Shading model',
     short: 'F82-tint Fresnel',
     authors: 'Naty Hoffman',
     title: 'Fresnel Equations Considered Harmful',
@@ -76,6 +90,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'sheen',
+    group: 'Shading model',
     short: 'LTC fuzz',
     authors: 'Tizian Zeltner, Brent Burley, Matt Jen-Yuan Chiang',
     title: 'Practical Multiple-Scattering Sheen Using Linearly Transformed Cosines',
@@ -85,6 +100,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'thinfilm',
+    group: 'Shading model',
     short: 'Thin-film iridescence (KHR approx.)',
     authors: 'Laurent Belcour, Pascal Barla',
     title: 'A Practical Extension to Microfacet Theory for the Modeling of Varying Iridescence',
@@ -95,6 +111,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'heitz',
+    group: 'Shading model',
     short: 'Anisotropic GGX',
     authors: 'Eric Heitz',
     title: 'Understanding the Masking-Shadowing Function in Microfacet-Based BRDFs',
@@ -104,6 +121,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'walter',
+    group: 'Shading model',
     short: 'Rough refraction',
     authors: 'Bruce Walter, Stephen R. Marschner, Hongsong Li, Kenneth E. Torrance',
     title: 'Microfacet Models for Refraction through Rough Surfaces',
@@ -113,6 +131,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'cmf',
+    group: 'Color and display',
     short: 'CIE color matching fit',
     authors: 'Chris Wyman, Peter-Pike Sloan, Peter Shirley',
     title: 'Simple Analytic Approximations to the CIE XYZ Color Matching Functions',
@@ -122,6 +141,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'sah',
+    group: 'Geometry',
     short: 'Binned SAH BVH',
     authors: 'Ingo Wald',
     title: 'On fast Construction of SAH-based Bounding Volume Hierarchies',
@@ -131,6 +151,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'aila',
+    group: 'Geometry',
     short: 'GPU BVH traversal',
     authors: 'Timo Aila, Samuli Laine',
     title: 'Understanding the Efficiency of Ray Traversal on GPUs',
@@ -140,6 +161,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'mt',
+    group: 'Geometry',
     short: 'Ray-triangle intersection',
     authors: 'Tomas Möller, Ben Trumbore',
     title: 'Fast, Minimum Storage Ray-Triangle Intersection',
@@ -149,6 +171,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'oct',
+    group: 'Geometry',
     short: 'Octahedral normals',
     authors: 'Zina H. Cigolle, Sam Donow, Daniel Evangelakos, Michael Mara, Morgan McGuire, Quirin Meyer',
     title: 'Survey of Efficient Representations for Independent Unit Vectors',
@@ -158,6 +181,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'sphrect',
+    group: 'Sampling',
     short: 'Spherical-rectangle lights',
     authors: 'Carlos Ureña, Marcos Fajardo, Alan King',
     title: 'An Area-Preserving Parametrization for Spherical Rectangles',
@@ -167,6 +191,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'owen',
+    group: 'Sampling',
     short: "Owen-scrambled Sobol'",
     authors: 'Brent Burley',
     title: 'Practical Hash-based Owen Scrambling',
@@ -176,6 +201,8 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'aces2',
+    group: 'Color and display',
+    by: 'Academy of Motion Picture Arts and Sciences',
     short: 'ACES 2.0 via OpenColorIO 2.5',
     authors: 'Academy of Motion Picture Arts and Sciences; Academy Software Foundation',
     title: 'ACES 2.0 Output Transform (cg-config v4.0.0, OpenColorIO 2.5)',
@@ -185,6 +212,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'neutral',
+    group: 'Color and display',
     short: 'Khronos PBR Neutral',
     authors: 'Emmett Lalish',
     title: 'Neutral Tone Mapping for PBR Color Accuracy',
@@ -194,6 +222,8 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'agx',
+    group: 'Color and display',
+    by: 'Sobotka',
     short: 'AgX (three.js/Filament approx.)',
     authors: 'Troy Sobotka (AgX); Eary Chow (Blender Rec.2020 variant); Benjamin Wrensch (sigmoid fit)',
     title: 'AgX',
@@ -203,6 +233,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'blackbody',
+    group: 'Color and display',
     short: 'Blackbody locus',
     authors: 'Bongsoon Kang, Ohak Moon, Changhee Hong, Honam Lee, Bonghwan Cho, Youngsun Kim',
     title: 'Design of Advanced Color-Temperature Control System for HDTV Applications',
@@ -212,6 +243,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'atrous',
+    group: 'Denoising',
     short: 'A-trous denoiser',
     authors: 'Holger Dammertz, Daniel Sewtz, Johannes Hanika, Hendrik P. A. Lensch',
     title: 'Edge-Avoiding A-Trous Wavelet Transform for fast Global Illumination Filtering',
@@ -221,6 +253,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'svgf',
+    group: 'Denoising',
     short: 'SVGF variance guide',
     authors: 'Christoph Schied, Anton Kaplanyan, Chris Wyman, Anjul Patney, Chakravarty R. Alla Chaitanya, John Burgess, Shiqiu Liu, Carsten Dachsbacher, Aaron Lefohn, Marco Salvi',
     title: 'Spatiotemporal Variance-Guided Filtering: Real-Time Reconstruction for Path-Traced Global Illumination',
@@ -230,6 +263,7 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'hg',
+    group: 'Subsurface',
     short: 'Henyey-Greenstein phase',
     authors: 'L. C. Henyey, J. L. Greenstein',
     title: 'Diffuse radiation in the Galaxy',
@@ -239,24 +273,28 @@ export const CITATIONS: Citation[] = [
   },
   {
     id: 'pbrt4',
+    group: 'Subsurface',
     short: 'pbrt-v4 chromatic media',
     authors: 'Matt Pharr, Wenzel Jakob, Greg Humphreys',
-    title: 'Physically Based Rendering: From Theory to Implementation, 4th edition, section 14.2 (Volume Scattering Integrators)',
-    venue: 'MIT Press',
+    title: 'Physically Based Rendering: From Theory to Implementation',
+    venue: '4th edition, section 14.2, Volume Scattering Integrators. MIT Press',
     year: '2023',
     url: 'https://pbr-book.org/4ed/Light_Transport_II_Volume_Rendering/Volume_Scattering_Integrators',
   },
   {
     id: 'cycles',
+    group: 'Subsurface',
+    by: 'Blender Foundation',
     short: 'Cycles random walk',
     authors: 'Blender Foundation',
-    title: 'Cycles: random walk subsurface scattering (intern/cycles/kernel/integrator/subsurface_random_walk.h, subsurface.h)',
-    venue: 'Blender source code',
+    title: 'Cycles random walk subsurface scattering',
+    venue: 'Blender source code (subsurface_random_walk.h, subsurface.h)',
     year: 'accessed 2026',
     url: 'https://github.com/blender/blender/blob/main/intern/cycles/kernel/integrator/subsurface_random_walk.h',
   },
   {
     id: 'cwbvh',
+    group: 'Geometry',
     short: 'Compressed wide BVH',
     authors: 'Henri Ylitie, Tero Karras, Samuli Laine',
     title: 'Efficient Incoherent Ray Traversal on GPUs Through Compressed Wide BVHs',
@@ -265,3 +303,13 @@ export const CITATIONS: Citation[] = [
     url: 'https://doi.org/10.1145/3105762.3105773',
   },
 ]
+
+// "Wald", "Aila and Laine", "Schied et al." from the full author list.
+export function citeAuthors(c: Citation) {
+  if (c.by) return c.by
+  const surname = (name: string) => name.trim().split(/\s+/).pop() ?? name
+  const names = c.authors.split(',').map(a => a.trim()).filter(Boolean)
+  if (names.length === 1) return surname(names[0])
+  if (names.length === 2) return `${surname(names[0])} and ${surname(names[1])}`
+  return `${surname(names[0])} et al.`
+}

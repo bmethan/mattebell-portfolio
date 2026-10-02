@@ -97,10 +97,27 @@ body {
 .lab-mixer .lab-pill { min-width: 64px; }
 .lab-mixer .lab-range { width: 100%; }
 .lab-note { font-size: 12px; color: var(--text-muted); line-height: 1.6; max-width: 560px; }
-.lab-methods { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; margin-top: 24px; padding-top: 16px; border-top: 0.5px solid var(--border-subtle); }
-.lab-methods ul { display: flex; flex-wrap: wrap; gap: 6px 16px; list-style: none; margin: 0; padding: 0; }
-.lab-methods a { font-size: 11px; color: var(--text-muted); text-decoration: none; }
-.lab-methods a:hover { color: var(--accent); }
+/* Under the lab: the model's credit (required by its license) and the collapsed technical notes */
+.lab-credit { display: flex; gap: 12px; align-items: baseline; margin: 24px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-muted); max-width: 820px; }
+.lab-credit .lab-label { flex: none; }
+.lab-credit a, .lab-refs a { color: var(--text-soft); text-decoration: none; border-bottom: 0.5px solid var(--border); }
+.lab-credit a:hover, .lab-refs a:hover { color: var(--accent); border-color: var(--border-teal); }
+.lab-tech { margin-top: 24px; border-top: 0.5px solid var(--border-subtle); }
+.lab-tech summary { list-style: none; cursor: pointer; padding: 16px 0 0; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); }
+.lab-tech summary::-webkit-details-marker { display: none; }
+.lab-tech summary::before { content: '+'; display: inline-block; width: 16px; color: var(--accent); }
+.lab-tech[open] summary::before { content: '\2212'; }
+.lab-tech summary:hover { color: var(--text-soft); }
+.lab-tech summary:focus-visible { outline: 1px solid var(--accent); outline-offset: 4px; }
+.lab-tech-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 32px 56px; margin-top: 20px; }
+.lab-tech-notes { margin: 0; display: grid; gap: 14px; align-content: start; }
+.lab-tech-notes dt { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); margin-bottom: 4px; }
+.lab-tech-notes dd { margin: 0; font-size: 12px; line-height: 1.65; color: var(--text-muted); }
+.lab-refs { display: grid; gap: 18px; align-content: start; }
+.lab-refs h3 { margin: 0 0 6px; font-size: 10px; font-weight: 400; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+.lab-refs ol { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.lab-refs li { font-size: 12px; line-height: 1.55; color: var(--text-muted); padding-left: 14px; text-indent: -14px; }
+.lab-refs-venue { opacity: 0.8; }
 
 /* ─── Responsive ─────────────────────────────────────────── */
 
@@ -163,6 +180,8 @@ section[id], .anchor-target { scroll-margin-top: 80px; }
   .lab-frame { aspect-ratio: 4 / 3; } /* keep in step with the <source> media query in LookdevLab's Still */
   .lab-hud-left, .lab-hud-right { max-width: calc(50% - 20px); }
   .lab-row { gap: 12px 20px; }
+  .lab-tech-body { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+  .lab-credit { flex-direction: column; gap: 4px; }
   .lab-mixer { grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) auto; justify-content: stretch; gap: 6px 8px; }
   .lab-mixer .lab-pill { min-width: 0; }
   .lab-mixer .lab-readout { min-width: 36px; }

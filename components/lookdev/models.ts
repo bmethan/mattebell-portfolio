@@ -33,7 +33,7 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
     thinGlass: true,
     metersPerUnit: 1, // a car about 4.5 m long (an estimate; the scene does not state its size)
     credit: {
-      text: 'Sports Car by Yasutoshi Mori, from the pbrt-v4 scenes. Reduced to 184k triangles and rematerialed in OpenPBR for the lab.',
+      text: 'Sports Car by Yasutoshi Mori, from the pbrt-v4 scenes; reduced and rematerialed in OpenPBR for the lab.',
       source: 'https://github.com/mmp/pbrt-v4-scenes',
       license: 'CC BY 4.0',
       licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
@@ -48,7 +48,7 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
     credit: {
       // The model's terms ask that it be identified as the Utah Teapot and its origin at the University of Utah
       // acknowledged.
-      text: 'The Utah Teapot, developed at the University of Utah (Martin Newell, 1975); the 2026 version by Cem Yuksel, with curvature continuity and chamfers. 80k triangles.',
+      text: 'The Utah Teapot, developed at the University of Utah (Martin Newell, 1975), in Cem Yuksel\'s 2026 version.',
       source: 'https://graphics.cs.utah.edu/teapot/',
       license: 'Free for any use',
       licenseUrl: 'https://graphics.cs.utah.edu/teapot/',
@@ -65,7 +65,7 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
     // The statue is 2.75 m tall with its wings (Louvre); the scan stands 2.13 units, its plinth included.
     metersPerUnit: 1.36,
     credit: {
-      text: 'Based on "Winged Victory of Samothrace" by CosmoWenman, captured from the Skulpturhalle Basel\'s plaster cast. Reduced to 160k triangles; one material for the whole figure.',
+      text: 'Based on "Winged Victory of Samothrace" by CosmoWenman, captured from the Skulpturhalle Basel\'s plaster cast; reduced and given one material for the lab.',
       source: 'https://sketchfab.com/3d-models/winged-victory-of-samothrace-4edd6459f2834e7ab0b395e71cee2513',
       license: 'CC BY 4.0',
       licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
@@ -80,7 +80,7 @@ export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
     hero: 'gold',
     metersPerUnit: 0.162, // 33.8 cm tall (the museum's record), standing 2.09 units
     credit: {
-      text: 'Table Fountain, Paris, c. 1320-40, gilt silver and translucent enamels: Cleveland Museum of Art 1924.859, from its open access collection. Reduced to 180k triangles; the gilt silver takes the hero material, the enamel its own.',
+      text: 'Table Fountain, Paris, c. 1320-40, gilt silver and translucent enamels; Cleveland Museum of Art 1924.859, open access. Reduced for the lab.',
       source: 'https://sketchfab.com/3d-models/1924859-table-fountain-c03c9b6836aa42328803baeef085be40',
       license: 'CC0',
       licenseUrl: 'https://creativecommons.org/publicdomain/zero/1.0/',

@@ -14,11 +14,17 @@ import {
   type Pass,
   type View,
 } from './lookdev/engine'
+import { LookdevEngineGPU } from './lookdev/gpu/engineGPU'
 import { HERO_PRESETS, HERO_FAMILIES, familyOf, type Hero, type HeroFamily, PAINT_FINISHES, PAINT_ORDER, SKIN_ORDER, SKIN_TONES, STAGES, STAGE_ORDER, heroParams, paintHasFlakes } from './lookdev/materials'
 import { MODELS, MODEL_ORDER, type Model } from './lookdev/models'
 import { CITATIONS, CITATION_GROUPS, citeAuthors } from './lookdev/citations'
 import { ENVIRONMENTS, ENV_ORDER, type Env } from './lookdev/environments'
 import WorkIndicator from './WorkIndicator'
+
+// The renderer: WebGPU where the browser has it (compute shaders, compiled in the background), WebGL otherwise.
+// ?renderer=webgl forces the WebGL one (for comparing the two).
+type Engine = LookdevEngine | LookdevEngineGPU
+const forcedWebGL = () => typeof location !== 'undefined' && new URLSearchParams(location.search).get('renderer') === 'webgl'
 
 const PASSES: { id: Pass; label: string }[] = [
   { id: 'beauty', label: 'Beauty' },
@@ -113,6 +119,10 @@ function modelPatch(m: Model): Partial<LabState> {
 
 // The lab's technical notes, one short entry per topic (shown under "Technical notes and references").
 const TECH_NOTES: [string, string][] = [
+  [
+    'Renderer',
+    'A progressive path tracer written for the browser: compute shaders on WebGPU where the browser has it, WebGL2 otherwise. Both draw the same samples from the same sequences and render the same image.',
+  ],
   ['Color', 'Rendered in ACEScg, shown through ACES 2.0 (baked from OpenColorIO 2.5), AgX, Khronos PBR Neutral or a plain sRGB curve.'],
   [
     'Color chart',
@@ -359,7 +369,9 @@ export default function LookdevLab() {
   const sectionRef = useRef<HTMLElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const engineRef = useRef<LookdevEngine | null>(null)
+  const engineRef = useRef<Engine | null>(null)
+  // WebGPU failed after taking the canvas (a canvas keeps its first kind of context): a fresh canvas, on WebGL.
+  const [gpuFailed, setGpuFailed] = useState(false)
   const labRef = useRef<LabState>(DEFAULT_STATE)
   const dragging = useRef<number | null>(null) // pointerId of the drag moving the light
   const touchStart = useRef<{ id: number; x: number; y: number } | null>(null)
@@ -414,7 +426,8 @@ export default function LookdevLab() {
     const frame = frameRef.current
     const canvas = canvasRef.current
     if (!section || !frame || !canvas) return
-    let engine: LookdevEngine | null = null
+    let engine: Engine | null = null
+    let unmounted = false
 
     const layout = () => {
       if (!engine) return
@@ -429,8 +442,10 @@ export default function LookdevLab() {
       setStatus(s)
       if (s.spp > 0 || s.preview) setLiveShown(true)
       if (s.converged && labRef.current.furnace && engineRef.current) {
-        const m = engineRef.current.readSphereMean()
-        setFurnaceMean(m ? (m[0] + m[1] + m[2]) / 3 : null)
+        const e = engineRef.current
+        Promise.resolve(e.readSphereMean()).then(m => {
+          if (engineRef.current === e && labRef.current.furnace) setFurnaceMean(m ? (m[0] + m[1] + m[2]) / 3 : null)
+        })
       }
     }
 
@@ -446,13 +461,21 @@ export default function LookdevLab() {
       io?.disconnect()
     }
 
-    const create = () => {
+    const create = async () => {
       try {
-        const e = new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
+        let e: Engine | null = null
+        if (!gpuFailed && !forcedWebGL()) {
+          e = await LookdevEngineGPU.create(canvas, handleStatus, labRef.current, onDeviceLost)
+          if (unmounted) {
+            e?.dispose()
+            return
+          }
+        }
+        e ??= new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
         engine = e
         engineRef.current = e
         if (process.env.NODE_ENV !== 'production') {
-          ;(window as unknown as { __lookdev?: LookdevEngine }).__lookdev = e
+          ;(window as unknown as { __lookdev?: Engine }).__lookdev = e
         }
         setMode('live')
         setCanDenoise(e.canDenoise)
@@ -465,7 +488,9 @@ export default function LookdevLab() {
           },
           err => {
             console.error(err)
-            if (engine === e) fallback()
+            if (engine !== e) return
+            if (e instanceof LookdevEngineGPU) setGpuFailed(true)
+            else fallback()
           },
         )
       } catch (err) {
@@ -477,7 +502,7 @@ export default function LookdevLab() {
     const start = () => {
       if (started) return
       started = true
-      if (LookdevEngine.detect()) create()
+      if (LookdevEngineGPU.detect() || LookdevEngine.detect()) create()
       else fallback()
     }
 
@@ -494,6 +519,11 @@ export default function LookdevLab() {
     const onContextRestored = () => {
       setPaused(false)
       create()
+    }
+    // WebGPU has no restore event: a lost device is replaced with a new one.
+    const onDeviceLost = () => {
+      onContextLost()
+      setTimeout(() => !unmounted && onContextRestored(), 1000)
     }
     canvas.addEventListener('webglcontextrestored', onContextRestored)
 
@@ -520,6 +550,7 @@ export default function LookdevLab() {
     const ro = new ResizeObserver(layout)
     ro.observe(frame)
     return () => {
+      unmounted = true
       cancelIdle()
       io?.disconnect()
       onScreen.disconnect()
@@ -531,7 +562,7 @@ export default function LookdevLab() {
       setReady(false)
       setLiveShown(false)
     }
-  }, [])
+  }, [gpuFailed])
 
   // Labels follow the plate: a model moves the reference balls aside, and its own label tracks the turntable; the
   // chart widens the frame.
@@ -701,6 +732,7 @@ export default function LookdevLab() {
           <Still alt="Path traced lookdev references: a color chart, an 18% gray card ball, a chromium ball and a clear coated car paint ball under a three point softbox rig" />
         ) : (
           <canvas
+            key={gpuFailed ? 'webgl' : 'gpu'}
             ref={canvasRef}
             tabIndex={0}
             role="application"
@@ -821,7 +853,7 @@ export default function LookdevLab() {
           </>
         )}
         {mode === 'fallback' && (
-          <div className="lab-hud lab-hud-left">Still frame. Your browser lacks the WebGL2 features the live renderer needs.</div>
+          <div className="lab-hud lab-hud-left">Still frame. Your browser lacks the WebGPU or WebGL2 features the live renderer needs.</div>
         )}
       </div>
 

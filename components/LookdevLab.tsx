@@ -133,6 +133,50 @@ const TECH_NOTES: [string, string][] = [
   ],
 ]
 
+type ControlTab = 'look' | 'light' | 'render'
+const CONTROL_TABS: { id: ControlTab; label: string }[] = [
+  { id: 'look', label: 'Look' },
+  { id: 'light', label: 'Light' },
+  { id: 'render', label: 'Render' },
+]
+
+// The controls in three tabs by intent: what is shot, how it is lit, how it is rendered and shown. WAI-ARIA tabs:
+// the arrow keys, Home and End move between them.
+function LabTabs({ id, tab, onTab }: { id: string; tab: ControlTab; onTab: (t: ControlTab) => void }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([])
+  const onKeyDown = (e: React.KeyboardEvent, i: number) => {
+    const n = CONTROL_TABS.length
+    const j = e.key === 'ArrowRight' ? (i + 1) % n : e.key === 'ArrowLeft' ? (i + n - 1) % n : e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : -1
+    if (j < 0) return
+    e.preventDefault()
+    onTab(CONTROL_TABS[j].id)
+    refs.current[j]?.focus()
+  }
+  return (
+    <div className="lab-tabs" role="tablist" aria-label="Lab controls">
+      {CONTROL_TABS.map((t, i) => (
+        <button
+          key={t.id}
+          ref={el => {
+            refs.current[i] = el
+          }}
+          type="button"
+          role="tab"
+          id={`${id}-${t.id}`}
+          aria-selected={tab === t.id}
+          aria-controls={`${id}-panel`}
+          tabIndex={tab === t.id ? 0 : -1}
+          className={`lab-tab${tab === t.id ? ' on' : ''}`}
+          onClick={() => onTab(t.id)}
+          onKeyDown={e => onKeyDown(e, i)}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 const MIXER_LIGHTS = [
   { id: 'key', label: 'Key', gain: 'keyGain', kelvin: 'keyKelvin' },
   { id: 'fill', label: 'Fill', gain: 'fillGain', kelvin: 'fillKelvin' },
@@ -238,6 +282,8 @@ export default function LookdevLab() {
   const [paused, setPaused] = useState(false)
   const [ready, setReady] = useState(false)
   const lastInFamily = useRef<Partial<Record<HeroFamily, Hero>>>({}) // each family's last picked material
+  const [tab, setTab] = useState<ControlTab>('look')
+  const tabsId = useId()
   const [canDenoise, setCanDenoise] = useState(false) // the GPU can draw the denoiser's extra images
   // The still is the renderer's own converged image of the default settings, so the live render (IPR) only
   // runs once something differs: the first edit (a click or drag on the frame, an arrow key, any control)
@@ -661,210 +707,226 @@ export default function LookdevLab() {
 
       {mode !== 'fallback' && (
         <fieldset className="lab-controls" disabled={!ready}>
-          <div className="lab-row">
-            <Group label="Model">
-              {MODEL_ORDER.map(m => (
-                <Pill key={m} on={lab.model === m} onClick={() => update(modelPatch(m))}>
-                  {m === 'spheres' ? 'Reference balls' : MODELS[m].label}
-                </Pill>
-              ))}
-            </Group>
-            <Group label="Stage">
-              {STAGE_ORDER.map(st => (
-                <Pill key={st} on={lab.stage === st} onClick={() => update({ stage: st })}>
-                  {STAGES[st].label}
-                </Pill>
-              ))}
-            </Group>
-            <Group label="Chart">
-              <Pill on={lab.chart} onClick={() => update({ chart: !lab.chart })}>
-                Color chart {lab.chart ? 'on' : 'off'}
-              </Pill>
-            </Group>
-            {model && (
-              <Group label="Turntable">
-                <Range
-                  min={-180}
-                  max={180}
-                  step={1}
-                  value={deg(lab.modelYaw)}
-                  label="Turntable angle, degrees"
-                  onChange={v => update({ modelYaw: (v * Math.PI) / 180 })}
-                />
-                <span className="lab-readout">{deg(lab.modelYaw)}°</span>
-              </Group>
-            )}
-          </div>
-
-          <LightMixer lab={lab} update={update} />
-
-          <div className="lab-row">
-            <Group label="Environment">
-              {ENV_ORDER.map(en => (
-                <Pill key={en} on={lab.env === en} onClick={() => pickEnv(en)}>
-                  {en === 'none' ? 'None' : ENVIRONMENTS[en].label}
-                </Pill>
-              ))}
-            </Group>
-            {lab.env !== 'none' && (
-              <Group label="Turn">
-                <Range
-                  min={-180}
-                  max={180}
-                  step={1}
-                  value={deg(lab.envRot)}
-                  label="Environment turn, degrees"
-                  onChange={v => update({ envRot: (v * Math.PI) / 180 })}
-                />
-                <span className="lab-readout">{deg(lab.envRot)}°</span>
-              </Group>
-            )}
-          </div>
-
-          <div className="lab-row">
-            <Group label="Hero">
-              {model?.heroes
-                ? model.heroes.map(h => (
-                    <Pill key={h} on={lab.hero === h} onClick={() => pickHero(h)}>
-                      {HERO_PRESETS[h].label}
+          <LabTabs id={tabsId} tab={tab} onTab={setTab} />
+          <div className="lab-panel" role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`}>
+            {tab === 'look' && (
+              <>
+                <div className="lab-row">
+                  <Group label="Model">
+                    {MODEL_ORDER.map(m => (
+                      <Pill key={m} on={lab.model === m} onClick={() => update(modelPatch(m))}>
+                        {m === 'spheres' ? 'Reference balls' : MODELS[m].label}
+                      </Pill>
+                    ))}
+                  </Group>
+                  <Group label="Stage">
+                    {STAGE_ORDER.map(st => (
+                      <Pill key={st} on={lab.stage === st} onClick={() => update({ stage: st })}>
+                        {STAGES[st].label}
+                      </Pill>
+                    ))}
+                  </Group>
+                  <Group label="Chart">
+                    <Pill on={lab.chart} onClick={() => update({ chart: !lab.chart })}>
+                      Color chart {lab.chart ? 'on' : 'off'}
                     </Pill>
-                  ))
-                : HERO_FAMILIES.map(f => (
-                    <Pill key={f.id} on={f.id === family.id} onClick={() => pickHero(lastInFamily.current[f.id] ?? f.heroes[0])}>
-                      {f.label}
+                  </Group>
+                  {model && (
+                    <Group label="Turntable">
+                      <Range
+                        min={-180}
+                        max={180}
+                        step={1}
+                        value={deg(lab.modelYaw)}
+                        label="Turntable angle, degrees"
+                        onChange={v => update({ modelYaw: (v * Math.PI) / 180 })}
+                      />
+                      <span className="lab-readout">{deg(lab.modelYaw)}°</span>
+                    </Group>
+                  )}
+                </div>
+
+                <div className="lab-row">
+                  <Group label="Hero">
+                    {model?.heroes
+                      ? model.heroes.map(h => (
+                          <Pill key={h} on={lab.hero === h} onClick={() => pickHero(h)}>
+                            {HERO_PRESETS[h].label}
+                          </Pill>
+                        ))
+                      : HERO_FAMILIES.map(f => (
+                          <Pill key={f.id} on={f.id === family.id} onClick={() => pickHero(lastInFamily.current[f.id] ?? f.heroes[0])}>
+                            {f.label}
+                          </Pill>
+                        ))}
+                  </Group>
+                </div>
+
+                {!model?.heroes && family.heroes.length > 1 && (
+                  <div className="lab-row">
+                    <Group label={family.label}>
+                      {family.heroes.map(h => (
+                        <Pill key={h} on={lab.hero === h} onClick={() => pickHero(h)}>
+                          {HERO_PRESETS[h].label}
+                        </Pill>
+                      ))}
+                    </Group>
+                  </div>
+                )}
+
+                {lab.hero === 'carpaint' && (
+                  <div className="lab-row">
+                    <Group label="Finish">
+                      {PAINT_ORDER.map(f => (
+                        <Pill key={f} on={lab.paint === f} onClick={() => update({ paint: f, heroRoughness: null })}>
+                          {PAINT_FINISHES[f].label}
+                        </Pill>
+                      ))}
+                    </Group>
+                    {lab.paint !== 'solid' && (
+                      <Group label="Flakes">
+                        <Pill on={lab.flakes} onClick={() => update({ flakes: !lab.flakes, heroRoughness: null })}>
+                          Flakes {lab.flakes ? 'on' : 'off'}
+                        </Pill>
+                      </Group>
+                    )}
+                  </div>
+                )}
+
+                {lab.hero === 'skin' && (
+                  <div className="lab-row">
+                    <Group label="Tone">
+                      {SKIN_ORDER.map(t => (
+                        <Pill key={t} on={lab.skinTone === t} onClick={() => update({ skinTone: t, heroRoughness: null })}>
+                          {SKIN_TONES[t].label}
+                        </Pill>
+                      ))}
+                    </Group>
+                  </div>
+                )}
+
+                <div className="lab-row">
+                  <Group label={`${hero.label} roughness`}>
+                    <Range
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={heroRough}
+                      label={`${hero.label} roughness`}
+                      onChange={v => update({ heroRoughness: v })}
+                    />
+                    <span className="lab-readout">{heroRough.toFixed(2)}</span>
+                  </Group>
+                  {brushed && (
+                    <Group label="Brushing">
+                      <Range
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={heroAniso}
+                        label="Brushing, specular roughness anisotropy"
+                        onChange={v => update({ heroAniso: v })}
+                      />
+                      <span className="lab-readout">{heroAniso.toFixed(2)}</span>
+                    </Group>
+                  )}
+                </div>
+              </>
+            )}
+            {tab === 'light' && (
+              <>
+                <LightMixer lab={lab} update={update} />
+
+                <div className="lab-row">
+                  <Group label="Environment">
+                    {ENV_ORDER.map(en => (
+                      <Pill key={en} on={lab.env === en} onClick={() => pickEnv(en)}>
+                        {en === 'none' ? 'None' : ENVIRONMENTS[en].label}
+                      </Pill>
+                    ))}
+                  </Group>
+                  {lab.env !== 'none' && (
+                    <Group label="Turn">
+                      <Range
+                        min={-180}
+                        max={180}
+                        step={1}
+                        value={deg(lab.envRot)}
+                        label="Environment turn, degrees"
+                        onChange={v => update({ envRot: (v * Math.PI) / 180 })}
+                      />
+                      <span className="lab-readout">{deg(lab.envRot)}°</span>
+                    </Group>
+                  )}
+                </div>
+              </>
+            )}
+            {tab === 'render' && (
+              <>
+                <div className="lab-row">
+                  <Group label="Pass">
+                    {PASSES.map(p => (
+                      <Pill key={p.id} on={lab.pass === p.id} onClick={() => update({ pass: p.id })}>
+                        {p.label}
+                      </Pill>
+                    ))}
+                  </Group>
+                  {canDenoise && (
+                    <Group label="Denoiser">
+                      <Pill on={lab.denoise} onClick={() => update({ denoise: !lab.denoise })}>
+                        Denoiser {lab.denoise ? 'on' : 'off'}
+                      </Pill>
+                    </Group>
+                  )}
+                </div>
+
+                <div className="lab-row">
+                  <Group label="View">
+                    {VIEWS.map(v => (
+                      <Pill key={v.id} on={lab.view === v.id} onClick={() => update({ view: v.id })}>
+                        {v.label}
+                      </Pill>
+                    ))}
+                  </Group>
+                  <Group label="Exposure">
+                    <Range
+                      min={-3}
+                      max={3}
+                      step={0.1}
+                      value={lab.exposure}
+                      label="Exposure, stops"
+                      onChange={v => update({ exposure: v })}
+                    />
+                    <span className="lab-readout">
+                      {lab.exposure >= 0 ? '+' : ''}
+                      {lab.exposure.toFixed(1)}
+                    </span>
+                  </Group>
+                </div>
+
+                <div className="lab-row">
+                  <Group label="Validation">
+                    <Pill on={lab.multiscatter} onClick={() => update({ multiscatter: !lab.multiscatter })}>
+                      Multiple scattering {lab.multiscatter ? 'on' : 'off'}
                     </Pill>
-                  ))}
-            </Group>
-          </div>
-
-          {!model?.heroes && family.heroes.length > 1 && (
-            <div className="lab-row">
-              <Group label={family.label}>
-                {family.heroes.map(h => (
-                  <Pill key={h} on={lab.hero === h} onClick={() => pickHero(h)}>
-                    {HERO_PRESETS[h].label}
-                  </Pill>
-                ))}
-              </Group>
-            </div>
-          )}
-
-          {lab.hero === 'carpaint' && (
-            <div className="lab-row">
-              <Group label="Finish">
-                {PAINT_ORDER.map(f => (
-                  <Pill key={f} on={lab.paint === f} onClick={() => update({ paint: f, heroRoughness: null })}>
-                    {PAINT_FINISHES[f].label}
-                  </Pill>
-                ))}
-              </Group>
-              {lab.paint !== 'solid' && (
-                <Group label="Flakes">
-                  <Pill on={lab.flakes} onClick={() => update({ flakes: !lab.flakes, heroRoughness: null })}>
-                    Flakes {lab.flakes ? 'on' : 'off'}
-                  </Pill>
-                </Group>
-              )}
-            </div>
-          )}
-
-          {lab.hero === 'skin' && (
-            <div className="lab-row">
-              <Group label="Tone">
-                {SKIN_ORDER.map(t => (
-                  <Pill key={t} on={lab.skinTone === t} onClick={() => update({ skinTone: t, heroRoughness: null })}>
-                    {SKIN_TONES[t].label}
-                  </Pill>
-                ))}
-              </Group>
-            </div>
-          )}
-
-          <div className="lab-row">
-            <Group label="Exposure">
-              <Range
-                min={-3}
-                max={3}
-                step={0.1}
-                value={lab.exposure}
-                label="Exposure, stops"
-                onChange={v => update({ exposure: v })}
-              />
-              <span className="lab-readout">
-                {lab.exposure >= 0 ? '+' : ''}
-                {lab.exposure.toFixed(1)}
-              </span>
-            </Group>
-            <Group label={`${hero.label} roughness`}>
-              <Range
-                min={0}
-                max={1}
-                step={0.01}
-                value={heroRough}
-                label={`${hero.label} roughness`}
-                onChange={v => update({ heroRoughness: v })}
-              />
-              <span className="lab-readout">{heroRough.toFixed(2)}</span>
-            </Group>
-            {brushed && (
-              <Group label="Brushing">
-                <Range
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  value={heroAniso}
-                  label="Brushing, specular roughness anisotropy"
-                  onChange={v => update({ heroAniso: v })}
-                />
-                <span className="lab-readout">{heroAniso.toFixed(2)}</span>
-              </Group>
-            )}
-          </div>
-
-          <div className="lab-row">
-            <Group label="Pass">
-              {PASSES.map(p => (
-                <Pill key={p.id} on={lab.pass === p.id} onClick={() => update({ pass: p.id })}>
-                  {p.label}
-                </Pill>
-              ))}
-            </Group>
-            <Group label="View">
-              {VIEWS.map(v => (
-                <Pill key={v.id} on={lab.view === v.id} onClick={() => update({ view: v.id })}>
-                  {v.label}
-                </Pill>
-              ))}
-            </Group>
-            {canDenoise && (
-              <Group label="Denoiser">
-                <Pill on={lab.denoise} onClick={() => update({ denoise: !lab.denoise })}>
-                  Denoiser {lab.denoise ? 'on' : 'off'}
-                </Pill>
-              </Group>
-            )}
-          </div>
-
-          <div className="lab-row">
-            <Group label="Validation">
-              <Pill on={lab.multiscatter} onClick={() => update({ multiscatter: !lab.multiscatter })}>
-                Multiple scattering {lab.multiscatter ? 'on' : 'off'}
-              </Pill>
-              <Pill on={lab.furnace} onClick={() => update({ furnace: !lab.furnace })}>
-                Furnace test
-              </Pill>
-            </Group>
-            {lab.furnace && (
-              <span className="lab-note">
-                Uniform white light, no floor, every albedo at 1. An energy conserving material disappears into the
-                background.
-                {furnaceMean !== null &&
-                  ` Measured mean over the ${model ? 'balls and model' : 'spheres'}: ${furnaceMean.toFixed(3)} (ideal 1.000).`}
-                {model &&
-                  ` A model reads a little under 1: light caught in its cavities needs dozens of bounces to escape, and the renderer stops at ${MESH_FURNACE_BOUNCES}.`}
-                {lab.hero === 'skin' &&
-                  ' Skin reads a little under 1 in blue: with nothing absorbed, a walk ends only by leaving, and the lab stops the longest walks.'}
-              </span>
+                    <Pill on={lab.furnace} onClick={() => update({ furnace: !lab.furnace })}>
+                      Furnace test
+                    </Pill>
+                  </Group>
+                  {lab.furnace && (
+                    <span className="lab-note">
+                      Uniform white light, no floor, every albedo at 1. An energy conserving material disappears into the
+                      background.
+                      {furnaceMean !== null &&
+                        ` Measured mean over the ${model ? 'balls and model' : 'spheres'}: ${furnaceMean.toFixed(3)} (ideal 1.000).`}
+                      {model &&
+                        ` A model reads a little under 1: light caught in its cavities needs dozens of bounces to escape, and the renderer stops at ${MESH_FURNACE_BOUNCES}.`}
+                      {lab.hero === 'skin' &&
+                        ' Skin reads a little under 1 in blue: with nothing absorbed, a walk ends only by leaving, and the lab stops the longest walks.'}
+                    </span>
+                  )}
+                </div>
+              </>
             )}
           </div>
         </fieldset>

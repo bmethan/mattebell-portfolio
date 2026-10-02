@@ -28,7 +28,7 @@ export const MODEL_ORDER: Model[] = ['spheres', 'sportscar', 'teapot', 'victory'
 export const MODELS: Record<Exclude<Model, 'spheres'>, ModelInfo> = {
   sportscar: {
     label: 'Sports car',
-    url: '/lookdev/models/sportscar.bin.gz?v=3', // bump with each rebuild so caches fetch the new file
+    url: '/lookdev/models/sportscar.bin.gz?v=4', // bump with each rebuild so caches fetch the new file
     scale: 4.5,
     thinGlass: true,
     metersPerUnit: 1, // a car about 4.5 m long (an estimate; the scene does not state its size)

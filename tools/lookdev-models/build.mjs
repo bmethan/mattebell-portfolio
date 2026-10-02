@@ -105,7 +105,7 @@ const CAR_MATERIALS = {
   Winker_Mat_phong_SG: SLOT.lamp,
   StopLightRed_Mat_phong_SG: SLOT.lamp,
   CamCover_phong_SG: SLOT.lamp,
-  initialShadingGroup: SLOT.lamp,
+  initialShadingGroup: SLOT.aluminum, // the brake calipers (red in the scene); silver to match the wheels
   MirrorMat_phong_SG: SLOT.chrome,
   LightReflecMat_phong_SG: SLOT.chrome,
   LightReflectInner_phong_SG: SLOT.chrome,

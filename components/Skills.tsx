@@ -100,8 +100,8 @@ export default function Skills() {
                   <div style={{ width: `${s.pct}%`, height: 2, background: group.rnd ? 'var(--bar-dim)' : 'var(--accent)' }} />
                 </div>
               )
-              // A category row (Generative AI): a small label column, then its tools in the place the software
-              // name takes in the other groups, then the bar, so every card reads as one line per row.
+              // A category row (Generative AI): its tools in the place the software name takes in the other groups,
+              // then the category as a small label before the bar (laid out in globals.css, .skill-tool-row).
               if ('tools' in s) {
                 return (
                   <div key={s.name} className="skill-tool-row">

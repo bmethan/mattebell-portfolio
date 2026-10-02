@@ -148,11 +148,17 @@ export interface LabStatus {
 // The tracer variant a scene needs: meshes for a model; full glass for a solid transmissive hero; the cheaper thin
 // glass for thin-walled transmission (a model's windows). On the balls any glass hero takes the full variant,
 // which is compiled ahead while the lab is in view.
-type VariantKey = 'base' | 'base+glass' | 'base+sss' | 'base+fluor' | 'mesh' | 'mesh+thin' | 'mesh+glass' | 'mesh+sss' | 'mesh+fluor'
+type VariantKey =
+  | 'base' | 'base+glass' | 'base+sss' | 'base+fluor' | 'base+fluor+glass'
+  | 'mesh' | 'mesh+thin' | 'mesh+glass' | 'mesh+sss' | 'mesh+fluor' | 'mesh+fluor+glass'
 function variantOf(s: LabState): VariantKey {
   const hero = heroMaterial(s)
   // Fluorescence carries a fourth (ultraviolet) band along the path: its own variant, so nothing else pays for it.
-  if (hero.lab_fluor_weight > 0) return s.model === 'spheres' ? 'base+fluor' : 'mesh+fluor'
+  if (hero.lab_fluor_weight > 0) {
+    // A fluorescent medium (uranium glass, tonic water) needs the solid glass as well.
+    const medium = hero.transmission_weight > 0 && hero.geometry_thin_walled < 0.5
+    return `${s.model === 'spheres' ? 'base' : 'mesh'}+fluor${medium ? '+glass' : ''}`
+  }
   // Subsurface scattering is a medium under a refracting surface: its own solid variant, with the walk.
   if (hero.subsurface_weight > 0 && hero.geometry_thin_walled < 0.5) return s.model === 'spheres' ? 'base+sss' : 'mesh+sss'
   const heroGlass = hero.transmission_weight > 0
@@ -168,17 +174,21 @@ const VARIANT_LABEL: Record<VariantKey, string> = {
   'base+sss': 'the subsurface shader',
   'base+fluor': 'the fluorescence shader',
   'mesh+fluor': 'the model shader with fluorescence',
+  'base+fluor+glass': 'the fluorescent glass shader',
+  'mesh+fluor+glass': 'the model shader with fluorescent glass',
   mesh: 'the model shader',
   'mesh+thin': 'the model shader with glass',
   'mesh+glass': 'the model shader with solid glass',
   'mesh+sss': 'the model shader with subsurface',
 }
-const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full' | 'sss' | 'fluor'> = {
+const VARIANT_GLASS: Record<VariantKey, 'none' | 'thin' | 'full' | 'sss' | 'fluor' | 'fluorglass'> = {
   base: 'none',
   'base+glass': 'full',
   'base+sss': 'sss',
   'base+fluor': 'fluor',
   'mesh+fluor': 'fluor',
+  'base+fluor+glass': 'fluorglass',
+  'mesh+fluor+glass': 'fluorglass',
   mesh: 'none',
   'mesh+thin': 'thin',
   'mesh+glass': 'full',
@@ -1210,7 +1220,14 @@ export class LookdevEngine {
     gl.uniform1i(L('uMaxScatter'), s.furnace ? FURNACE_MAX_SCATTER : MAX_SCATTER)
     mats.forEach((m, i) => {
       for (const f of MATERIAL_FIELDS) {
-        const v = f === 'subsurface_radius' || f === 'transmission_depth' ? m[f] * sss : m[f]
+        // A fluorescent medium's absorption is per centimeter: per scene unit, divided by the same scale.
+        const perLength = (f === 'lab_fluor_absorb' || f === 'lab_fluor_uv') && m.transmission_weight > 0
+        const v =
+          f === 'subsurface_radius' || f === 'transmission_depth'
+            ? m[f] * sss
+            : perLength
+              ? Array.isArray(m[f]) ? (m[f] as number[]).map(x => x / sss) : (m[f] as number) / sss
+              : m[f]
         const loc = L(`uMat[${i}].${f}`)
         if (Array.isArray(v)) gl.uniform3fv(loc, v)
         else gl.uniform1f(loc, v)

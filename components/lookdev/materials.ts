@@ -46,6 +46,9 @@ export interface OpenPBR {
   // energy (quantum yield times the Stokes loss) diffusely, spread over red, green and blue as lab_fluor_color
   // (summing to 1). With base_color + lab_fluor_absorb at most 1 per channel, no energy is created. lab_uv_ratio:
   // the base's diffuse reflectance of ultraviolet, relative to its mean visible reflectance.
+  // In a transmissive solid the fluorophore fills the medium instead: lab_fluor_absorb and lab_fluor_uv are then
+  // its absorption per centimeter (transmission_color and depth hold the medium's total visible absorption, the
+  // fluorophore's included).
   lab_fluor_weight: number
   lab_fluor_color: RGB
   lab_fluor_absorb: RGB
@@ -182,7 +185,7 @@ export const COLOR_CHECKER: RGB[] = [
 
 export type Hero =
   | 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium' | 'glass' | 'diamond' | 'soapbubble'
-  | 'skin' | 'marble' | 'ceramic' | 'honey' | 'copper' | 'silver' | 'highlighter' | 'dayglo' | 'paper'
+  | 'skin' | 'marble' | 'ceramic' | 'honey' | 'copper' | 'silver' | 'highlighter' | 'dayglo' | 'paper' | 'uranium' | 'tonic'
 type RoughnessParam = 'specular_roughness' | 'fuzz_roughness' | 'coat_roughness'
 
 // The hero materials by family: the Hero row picks a family, a second row its material (a family of one has no
@@ -194,7 +197,7 @@ export const HERO_FAMILIES: { id: HeroFamily; label: string; heroes: Hero[] }[] 
   { id: 'dielectric', label: 'Dielectric', heroes: ['plastic', 'ceramic'] },
   { id: 'transparent', label: 'Transparent', heroes: ['glass', 'diamond', 'honey', 'soapbubble'] },
   { id: 'translucent', label: 'Translucent', heroes: ['skin', 'marble'] },
-  { id: 'fluorescent', label: 'Fluorescent', heroes: ['highlighter', 'dayglo', 'paper'] },
+  { id: 'fluorescent', label: 'Fluorescent', heroes: ['highlighter', 'dayglo', 'paper', 'uranium', 'tonic'] },
   { id: 'fabric', label: 'Fabric', heroes: ['velvet'] },
 ]
 export const HERO_ORDER: Hero[] = HERO_FAMILIES.flatMap(f => f.heroes)
@@ -282,6 +285,41 @@ export const HERO_PRESETS: Record<Hero, HeroPreset> = {
       lab_fluor_color: [0.2, 0.25, 0.55],
       lab_fluor_uv: 0.9,
       lab_uv_ratio: 0.1,
+    }),
+  },
+  // Authored, lab extension: uranium ("Vaseline") glass. The uranyl ion in it absorbs ultraviolet and violet-blue
+  // light and re-emits green: pale yellow-green in daylight, glowing green right through under a black light.
+  uranium: {
+    label: 'Uranium glass',
+    official: false,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      specular_ior: 1.52,
+      transmission_weight: 1,
+      transmission_color: [0.85, 0.92, 0.55],
+      transmission_depth: 5,
+      lab_fluor_weight: 0.6,
+      lab_fluor_color: [0.25, 0.72, 0.03],
+      lab_fluor_absorb: [0, 0, 0.1],
+      lab_fluor_uv: 1,
+    }),
+  },
+  // Authored, lab extension: tonic water, clear, with quinine (about 80 mg per liter) that absorbs near-ultraviolet
+  // within a centimeter or so and re-emits blue: under a black light it glows where the light enters.
+  tonic: {
+    label: 'Tonic water',
+    official: false,
+    roughnessParam: 'specular_roughness',
+    params: mat({
+      specular_roughness: 0,
+      specular_ior: 1.34,
+      transmission_weight: 1,
+      transmission_color: [0.98, 0.98, 0.97],
+      transmission_depth: 10,
+      lab_fluor_weight: 0.45,
+      lab_fluor_color: [0.15, 0.3, 0.55],
+      lab_fluor_uv: 3.4,
     }),
   },
   // Official: examples/open_pbr_copper.mtlx

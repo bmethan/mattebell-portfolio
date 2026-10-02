@@ -1285,6 +1285,13 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
         if (v < 0.0 || u + v > 1.0) continue;
         float t = dot(e2, qv) * inv;
         if (t > 0.0 && t < tBest) {
+#if defined(FLUOR) && defined(GLASS)
+          if (anyHit && gMediumShadow && int(texelFetch(uTriNrm, texAt(tri), 0).w) == 2) {
+            mediumPass(abs(dot(normalize(cross(e1, e2)), normalize(d))), t, Tthin);
+            if (maxc(Tthin) <= 0.0) return t;
+            continue;
+          }
+#endif
 #ifdef THIN
           if (anyHit && uThinSlot >= 0 && int(texelFetch(uTriNrm, texAt(tri), 0).w) == uThinSlot) {
             Tthin *= thinGlassT(abs(dot(normalize(cross(e1, e2)), normalize(d))));
@@ -1324,9 +1331,10 @@ float traceMesh(vec3 roW, vec3 rdW, float tMax, bool anyHit, out int triHit, out
 // not disperse), so neither glass nor skin compiles the other's code.
 // AUX adds the denoiser's guide images and noise statistics (two more render targets), on GPUs that can draw
 // five at once.
-export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' | 'sss' | 'fluor' = 'none', aux = false) {
-  const solid = glass === 'full' || glass === 'sss'
-  const defs = `${mesh ? '#define MESH 1\n' : ''}${solid ? '#define GLASS 1\n' : ''}${glass === 'sss' ? '#define SSS 1\n#define NO_DISPERSION 1\n' : ''}${glass !== 'none' && glass !== 'fluor' ? '#define THIN 1\n' : ''}${glass === 'fluor' ? '#define FLUOR 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
+export function traceFrag(mesh: boolean, glass: 'none' | 'thin' | 'full' | 'sss' | 'fluor' | 'fluorglass' = 'none', aux = false) {
+  const solid = glass === 'full' || glass === 'sss' || glass === 'fluorglass'
+  const fluor = glass === 'fluor' || glass === 'fluorglass'
+  const defs = `${mesh ? '#define MESH 1\n' : ''}${solid ? '#define GLASS 1\n' : ''}${glass === 'sss' || glass === 'fluorglass' ? '#define NO_DISPERSION 1\n' : ''}${glass === 'sss' ? '#define SSS 1\n' : ''}${glass !== 'none' && glass !== 'fluor' ? '#define THIN 1\n' : ''}${fluor ? '#define FLUOR 1\n' : ''}${glass === 'fluor' ? '#define FLUOR_SURFACE 1\n' : ''}${aux ? '#define AUX 1\n' : ''}`
   return /* glsl */ `${HEADER}${defs}
 ${COMMON}
 ${MICROFACET}
@@ -1504,6 +1512,20 @@ float chartHit(vec3 ro, vec3 rd, float tMax, out vec3 nOut, out int cellId) {
   return t;
 }
 
+#if defined(FLUOR) && defined(GLASS)
+// A shadow ray from a medium event (gMediumShadow) leaves the medium through the hero's surface instead of being
+// stopped by it: each crossing passes the unreflected share, and the first (the exit) marks how far it ran inside.
+bool gMediumShadow = false;
+float gTuv = 1.0;    // its ultraviolet share
+float gExitT = 0.0;  // distance to the exit
+void mediumPass(float cosT, float t, inout vec3 T) {
+  float pass = 1.0 - fresnelDielectric(cosT, 1.0 / max(uMat[2].specular_ior, 1.0));
+  T *= pass;
+  gTuv *= pass;
+  gExitT = min(gExitT, t);
+}
+#endif
+
 #ifdef MESH
 ${MESH_GLSL}
 float intersectBall(vec3 ro, vec3 rd, vec4 s, float tMax) {
@@ -1574,15 +1596,27 @@ Hit trace(vec3 ro, vec3 rd, float tMax, bool shadow, bool withLights, inout vec3
   for (int i = 0; i < 3; i++) {
     vec3 c = vec3(ballX(i), 1.0, 0.0);
 #ifdef THIN
-    if (shadow && i == 2 && uThinGlass == 1) {
-      // Both crossings of the bubble within the segment.
+#if defined(FLUOR) && defined(GLASS)
+    bool passHero = uThinGlass == 1 || gMediumShadow;
+#else
+    bool passHero = uThinGlass == 1;
+#endif
+    if (shadow && i == 2 && passHero) {
+      // Both crossings of the bubble within the segment (or the exit from a medium event).
       vec3 f = ro - c;
       float b = dot(f, rd), disc = b * b - (dot(f, f) - 1.0);
       if (disc > 0.0) {
         float sq = sqrt(disc);
         for (int j = 0; j < 2; j++) {
           float t = -b + (j == 0 ? -sq : sq);
-          if (t > 1e-4 && t < tMax) T *= thinPassT(uMat[2], abs(dot(rd, normalize(ro + rd * t - c))));
+          if (t > 1e-4 && t < tMax) {
+            float cs = abs(dot(rd, normalize(ro + rd * t - c)));
+#if defined(FLUOR) && defined(GLASS)
+            if (gMediumShadow) mediumPass(cs, t, T);
+            else
+#endif
+            T *= thinPassT(uMat[2], cs);
+          }
         }
       }
       continue;
@@ -1698,6 +1732,34 @@ vec3 fluorBase(Surf s) { return s.tBase * (1.0 - s.metal) * (1.0 - s.transW) * (
 // Ultraviolet reflectance of a vertex in a sampled direction, from its visible lobes: the specular as it is, the
 // diffuse by the material's lab_uv_ratio.
 float uvAlbedo(vec3 fD, vec3 fS, Mat m) { return dot(fS, vec3(1.0 / 3.0)) + dot(fD, vec3(1.0 / 3.0)) * m.lab_uv_ratio; }
+#ifdef GLASS
+// A fluorescent medium (uranium glass, tonic water): the fluorophore is dissolved through a transmissive solid, its
+// absorption per unit length (lab_fluor_absorb, lab_fluor_uv; the presets' per centimeter, scaled to the scene).
+// A camera path crossing it may stop at a point inside, with probability FLUOR_EVENT_P, at a depth drawn by the
+// fluorophore's absorption (truncated to the segment; half the time by its UV absorption, which ultraviolet light
+// excites near where it enters, half by its visible, which daylight excites throughout, both weighed together: the
+// balance heuristic), and there switch band: re-emission is isotropic, so the
+// path leaves in a uniform direction to gather the light that excites the point. Otherwise it crosses as before,
+// weighted by 1 / (1 - FLUOR_EVENT_P). Direct light reaches such a point only through the medium's refracting
+// surface, which no light sample can aim through, so a path would find a light only by escaping toward it: far
+// too noisy. Instead the point samples each light along a straight line, as if the surface did not bend it (the
+// light loses the surface's Fresnel reflection and the medium's absorption on the way, but not its focusing: no
+// caustics inside), the "transparent shadows" of production renderers. Direct light reached by the path from the
+// point is then left out, until the path scatters off anything but the medium's surface.
+#define FLUOR_EVENT_P 0.5
+// Distances in [0, T] drawn with density proportional to exp(-c t) (uniform when c T is negligible).
+float truncExpSample(float c, float T, float u) {
+  float a = 1.0 - exp(-c * T);
+  return c * T < 1e-4 ? u * T : -log(max(1.0 - u * a, 1e-30)) / c;
+}
+float truncExpPdf(float c, float T, float t) {
+  return c * T < 1e-4 ? 1.0 / T : c * exp(-c * t) / max(1.0 - exp(-c * T), 1e-30);
+}
+vec3 sampleSphere(vec2 u) {
+  float z = 1.0 - 2.0 * u.x, r = sqrt(max(0.0, 1.0 - z * z)), phi = TWO_PI * u.y;
+  return vec3(r * cos(phi), r * sin(phi), z);
+}
+#endif
 #endif
 // Cosine-weighted direction about +z (the Lambertian exit of a walk).
 vec3 sampleCosine(vec2 u) {
@@ -1777,6 +1839,16 @@ void main() {
     bool solidInside = false, last = false;
     vec3 pending = vec3(0.0); // what the shadow ray in flight delivers if it gets through
     int maxSteps = uMaxBounces * (nL + 1) + 1;
+#if defined(FLUOR) && defined(GLASS)
+    // Lighting a medium event (once per path). The event is a vertex of its own (evVertex), so its light samples
+    // come from the same code as a surface vertex's (each call site costs Direct3D a full inlined copy), and their
+    // shadow rays leave the medium through its surface (gMediumShadow).
+    bool evVertex = false;
+    vec3 evLe = vec3(0.0);
+    float evLuv = 0.0, evPdf = 1.0;
+    bool fromEvent = false; // the excited path has scattered off nothing but the medium's surface since the event
+    maxSteps += 2 * nL + 1;
+#endif
     // Subsurface random walk (spec, Subsurface). The path refracts into the medium through the material's own
     // rough dielectric surface (so the specular reflection and the Fresnel split are OpenPBR's), then walks:
     // free flights with extinction 1 / mean free path per channel, scattering with the single-scattering albedo
@@ -1815,11 +1887,25 @@ void main() {
       vec3 tro = ro, trd = rd;
       float tMax = 1e30;
       bool shadow = false;
+#if defined(FLUOR) && defined(GLASS)
+      if (evVertex && k >= nL) {
+        // Every light sampled: the path goes on from the event, in the direction drawn there (ro, rd).
+        evVertex = false;
+        atVertex = false;
+      }
+      if (atVertex) {
+        bool isLight = k < nL;
+        if (!isLight && last) break; // the continuation ray from the last vertex is never traced
+        // From inside a solid every light is behind its wall, except from an event, lit through it (see above).
+        if (isLight && (!lightOn(k) || (solidInside && !evVertex))) { k++; continue; }
+        vec4 u = sample4(sampleIndex, pixSeed, evVertex ? depth + 16 : depth, k);
+#else
       if (atVertex) {
         bool isLight = k < nL;
         if (!isLight && last) break; // the continuation ray from the last vertex is never traced
         if (isLight && (!lightOn(k) || solidInside)) { k++; continue; } // from inside a solid, every light is behind its wall
         vec4 u = sample4(sampleIndex, pixSeed, depth, k);
+#endif
         vec3 dirW, wi;
 #ifdef FLUOR
         bool flLobe = false; // the continuation samples the fluorescent lobe
@@ -1835,13 +1921,17 @@ void main() {
           }
           if (!got) { k++; continue; }
           wi = vec3(dot(dirW, t1), dot(dirW, t2), dot(dirW, n));
+#if defined(FLUOR) && defined(GLASS)
+          if (wi.z <= 0.0 && !evVertex) { k++; continue; }
+#else
           if (wi.z <= 0.0) { k++; continue; }
+#endif
         } else {
 #ifdef SSS
           if (sssExit) wi = sampleCosine(u.xy);
           else
 #endif
-#ifdef FLUOR
+#ifdef FLUOR_SURFACE
           flLobe = pF > 0.0 && sample4(sampleIndex, pixSeed, depth, 5).x < pF;
           if (flLobe) wi = sampleCosine(u.xy);
           else
@@ -1856,6 +1946,13 @@ void main() {
           fD = vec3(wi.z / PI); // Lambertian exit, white: the walk's weight carries the color
           fS = vec3(0.0);
           bpdf = wi.z / PI;
+        } else
+#endif
+#if defined(FLUOR) && defined(GLASS)
+        if (evVertex) {
+          fD = vec3(1.0 / (4.0 * PI)); // isotropic re-emission (its color and weight are in flOut)
+          fS = vec3(0.0);
+          bpdf = 1.0 / (4.0 * PI);
         } else
 #endif
 #ifdef FLUOR
@@ -1886,6 +1983,14 @@ void main() {
           pending = beta * f * Le * (wl / lpdf);
 #ifdef FLUOR
           float Luv = k == ENV_LIGHT ? 0.0 : uLightUV[k]; // the environment maps record no ultraviolet
+#ifdef GLASS
+          if (evVertex) {
+            // From the event: weighed once the shadow ray has left the medium (see the shadow ray's result).
+            evPdf = lpdf;
+            evLe = Le;
+            evLuv = Luv;
+          } else
+#endif
           if (excited) {
             pending = flOut * (dot(flIn.rgb, pending) + flIn.a * betaUV * uvAlbedo(fD, fS, m) * Luv * (wl / lpdf));
           } else if (pF > 0.0) {
@@ -1983,11 +2088,26 @@ void main() {
       }
 #endif
       vec3 T = vec3(1.0);
+#if defined(FLUOR) && defined(GLASS)
+      gMediumShadow = shadow && evVertex;
+      gTuv = 1.0;
+      gExitT = 1e30;
+#endif
       Hit h = trace(tro, trd, tMax, shadow, !shadow && depth > 0, T);
 
       if (shadow) {
         if (h.mat < 0 && maxc(T) > 0.0) {
           vec3 c = pending * T;
+#if defined(FLUOR) && defined(GLASS)
+          if (evVertex) {
+            // Out of the medium: its absorption up to the exit, R, G, B and UV. Isotropic re-emission: the event's
+            // weight (flOut) assumed a direction drawn uniformly, density 1 / 4 pi.
+            Mat mm = uMat[2];
+            float dIn = gExitT < 1e29 ? gExitT : 0.0;
+            vec3 Trgb = mm.transmission_depth > 0.0 ? exp(log(clamp(mm.transmission_color, 1e-4, 1.0)) / mm.transmission_depth * dIn) : vec3(1.0);
+            c = flOut * (dot(flIn.rgb, evLe * T * Trgb) + flIn.a * evLuv * gTuv * exp(-mm.lab_fluor_uv * dIn)) / (4.0 * PI * evPdf);
+          }
+#endif
           addLight(k, depth - sssCross >= 1 ? clampIndirect(c) : c, L, L1, L2, L3);
         }
         k++;
@@ -2039,6 +2159,9 @@ void main() {
 #ifdef FLUOR
         if (excited) c = flOut * (dot(flIn.rgb, c) + flIn.a * betaUV * uLightUV[h.light] * wL);
 #endif
+#if defined(FLUOR) && defined(GLASS)
+        if (excited && fromEvent) c = vec3(0.0); // sampled from the event already
+#endif
         addLight(h.light, depth - sssCross >= 2 ? clampIndirect(c) : c, L, L1, L2, L3);
       }
       if (h.mat < 0) {
@@ -2049,6 +2172,9 @@ void main() {
             vec3 c = beta * (depth == 0 ? envBackdrop(rd) : envLe(rd)) * (depth == 0 || prevTrans ? 1.0 : powerHeuristic(prevPdf, envPdf(rd)));
 #ifdef FLUOR
             if (excited) c = flOut * dot(flIn.rgb, c);
+#endif
+#if defined(FLUOR) && defined(GLASS)
+            if (excited && fromEvent) c = vec3(0.0);
 #endif
             L3 += depth - sssCross >= 2 ? clampIndirect(c) : c;
           } else {
@@ -2071,8 +2197,41 @@ void main() {
       ng = flip ? -h.ng : h.ng;
       m = getMat(h.mat);
       vBack = h.back && !walkExit;
+#if defined(FLUOR) && defined(GLASS)
+      if (!(m.transmission_weight > 0.0 && m.lab_fluor_weight > 0.0)) fromEvent = false;
+#endif
 #ifdef GLASS
       solidInside = vBack && (m.transmission_weight > 0.0 || m.subsurface_weight > 0.0) && m.geometry_thin_walled < 0.5;
+#ifdef FLUOR
+      if (solidInside && excited) betaUV *= exp(-m.lab_fluor_uv * h.t); // the medium absorbs the exciting UV too
+      if (solidInside && !excited && m.lab_fluor_weight > 0.0) {
+        vec4 sig = vec4(m.lab_fluor_absorb, m.lab_fluor_uv);
+        float cU = sig.a, cV = dot(sig.rgb, vec3(1.0 / 3.0));
+        vec4 ue = sample4(sampleIndex, pixSeed, depth, 5);
+        if (ue.x < FLUOR_EVENT_P) {
+          float te = truncExpSample(ue.x < 0.5 * FLUOR_EVENT_P ? cU : cV, h.t, ue.y);
+          float pdfT = 0.5 * (truncExpPdf(cU, h.t, te) + truncExpPdf(cV, h.t, te));
+          vec3 Tr = m.transmission_depth > 0.0 ? exp(log(clamp(m.transmission_color, 1e-4, 1.0)) / m.transmission_depth * te) : vec3(1.0);
+          excited = true;
+          flOut = beta * Tr * m.lab_fluor_weight * m.lab_fluor_color / (FLUOR_EVENT_P * pdfT);
+          flIn = sig;
+          beta = vec3(1.0);
+          betaUV = 1.0;
+          ro = tro + trd * te;
+          rd = sampleSphere(ue.zw);
+          po = ro;
+          k = 0;
+          evVertex = true;
+          fromEvent = true;
+          prevTrans = true; // the event samples lights itself (see above): what the path reaches takes no MIS weight
+          prevP = ro;
+          atVertex = true;
+          depth++;
+          continue;
+        }
+        beta /= 1.0 - FLUOR_EVENT_P;
+      }
+#endif
       if (solidInside && m.transmission_depth > 0.0) {
         // The segment just traced ran through the medium: Beer-Lambert with mu_t = -ln(color) / depth (spec).
         beta *= exp(log(clamp(m.transmission_color, 1e-4, 1.0)) / m.transmission_depth * h.t);
@@ -2102,8 +2261,9 @@ void main() {
       wo = vec3(dot(-rd, t1), dot(-rd, t2), dot(-rd, n));
       if (wo.z <= 1e-6 && !walkExit) break;
       if (!walkExit) s = setupSurf(m, wo, h.back, lambda, colored);
-#ifdef FLUOR
-      // A fluorescent vertex (not on the diffuse-free specular pass; and only once along a path).
+#ifdef FLUOR_SURFACE
+      // A fluorescent vertex (not on the diffuse-free specular pass; and only once along a path). Not compiled with a
+      // fluorescent medium, whose own variant leaves every surface plain.
       flEmit = filt == 2 ? vec3(0.0) : fluorBase(s) * m.lab_fluor_weight * m.lab_fluor_color;
       flAbs = vec4(m.lab_fluor_absorb, m.lab_fluor_uv);
       pF = !excited && maxc(flEmit) > 0.0 && dot(flAbs, vec4(1.0)) > 0.0 ? FLUOR_LOBE_P : 0.0;

@@ -130,7 +130,7 @@ const TECH_NOTES: [string, string][] = [
   ['Light mixer', "Each light renders into its own image, like a production renderer's light groups, so switching, dimming or recoloring a light needs no new render."],
   [
     'Fluorescence',
-    'A lab extension, as OpenPBR has none. Light carries a fourth band, ultraviolet, which only the black light emits. A fluorescent base absorbs part of the ultraviolet and visible light reaching it and re-emits it in its own color, never more energy than it took in. The fluorescent presets are authored from how their dyes behave, not measured, and the environment maps carry no ultraviolet.',
+    'A lab extension, as OpenPBR has none. Light carries a fourth band, ultraviolet, which only the black light emits. A fluorescent base absorbs part of the ultraviolet and visible light reaching it and re-emits it in its own color, never more energy than it took in. In uranium glass and tonic water the dye fills the medium and glows throughout: there, direct light is sampled along straight lines through the surface, losing its reflection and the absorption on the way but not its focusing (no caustics inside), as production renderers do. The presets are authored from how their dyes behave, not measured, and the environment maps carry no ultraviolet.',
   ],
   [
     'Environments',

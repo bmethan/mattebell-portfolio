@@ -1,6 +1,6 @@
 import { VERT, E_TABLE_FRAG, DISPLAY_FRAG, DENOISE_PREP_FRAG, ATROUS_FRAG, traceFrag } from './shaders'
 import { kelvinToACEScg } from './color'
-import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, BALLS_METERS_PER_UNIT, heroParams, subsurfaceScale, type OpenPBR, type Hero, type PaintFinish, type SkinTone, type Stage } from './materials'
+import { SCENE_MATERIALS, HERO_PRESETS, MATERIAL_FIELDS, STAGES, BALLS_METERS_PER_UNIT, COLOR_CHECKER, heroParams, subsurfaceScale, type OpenPBR, type Hero, type PaintFinish, type SkinTone, type Stage } from './materials'
 import { MODELS, MODEL_BALLS, MESH_MATERIALS, loadModel, type Model } from './models'
 
 export type Pass = 'beauty' | 'diffuse' | 'specular' | 'albedo' | 'normal'
@@ -23,6 +23,7 @@ export interface LabState {
   model: Model
   modelYaw: number // turntable angle of a model, radians
   stage: Stage
+  chart: boolean // the color chart beside the reference balls
   hero: Hero
   paint: PaintFinish // car paint's finish
   flakes: boolean // car paint flakes (metallic, pearl and iridescent finishes)
@@ -52,6 +53,7 @@ export const DEFAULT_STATE: LabState = {
   model: 'spheres',
   modelYaw: 0.6,
   stage: 'void',
+  chart: true,
   hero: 'carpaint',
   paint: 'solid',
   flakes: false,
@@ -254,6 +256,13 @@ const CAM_TARGET: Vec3 = [0, 0.95, 0]
 const H_HALF_EXTENT = 4.0
 const MODEL_CAM_TARGET: Vec3 = [0, 0.62, 0]
 const MODEL_H_HALF_EXTENT = 3.55
+
+// The color chart stands at the left end of the row, beside the gray ball, as on a lookdev plate (chart, gray
+// ball, chrome ball): on the floor, leaning back, turned to face the camera. Its width is in gray ball radii; the
+// frame widens and moves left to take it in, keeping its margins.
+const CHART_GAP = 0.18 // the tracer's CHART_GAP: between patches and around them, in patch widths
+const CHART_ASPECT = (4 + 5 * CHART_GAP) / (6 + 7 * CHART_GAP) // height over width
+const CHART_TILT = (15 * Math.PI) / 180
 
 function direction(az: number, el: number): Vec3 {
   return [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)]
@@ -610,8 +619,13 @@ export class LookdevEngine {
     return key === 'base' ? this.progTrace : this.variants.get(key)!.prog
   }
 
-  // World points under each labelled object: the two reference balls and the hero (ball or model).
+  // World points under each labelled object: the two reference balls, the hero (ball or model), then the chart.
   labelPoints(): Vec3[] {
+    const chart = this.frame().chart
+    return chart ? [...this.objectPoints(), chart.foot] : this.objectPoints()
+  }
+
+  private objectPoints(): Vec3[] {
     if (this.state.model === 'spheres') return BALL_X.map((x): Vec3 => [x, 0, 0])
     const mesh = this.meshes.get(this.state.model)
     const scaleW = MODELS[this.state.model].scale
@@ -737,10 +751,12 @@ export class LookdevEngine {
     return { tex, fbo }
   }
 
+  // Cap on the internal resolution, so the path tracer stays interactive on large or dense displays (and the light
+  // mixer's three float images per buffer stay modest in GPU memory). The poster renders raise it.
+  maxPixels = 1_200_000
+
   resize(cssW: number, cssH: number, dpr: number) {
-    // Cap the internal resolution so the path tracer stays interactive on large or dense displays (and the light
-    // mixer's three float images per buffer stay modest in GPU memory).
-    const maxPixels = 1_200_000
+    const maxPixels = this.maxPixels
     let scaleF = Math.min(dpr, 1.5)
     if (cssW * cssH * scaleF * scaleF > maxPixels) scaleF = Math.sqrt(maxPixels / (cssW * cssH))
     const w = Math.max(1, Math.round(cssW * scaleF))
@@ -866,24 +882,48 @@ export class LookdevEngine {
 
   // Normalized screen position (0..1, y down) of a world point, used for HTML labels.
   project(p: Vec3) {
-    const { fwd, right, up, tanH, tanV } = this.camera()
-    const d = sub(p, CAM_POS)
+    const { pos, fwd, right, up, tanH, tanV } = this.camera()
+    const d = sub(p, pos)
     const z = dot(d, fwd)
     const x = dot(d, right) / z / tanH
     const y = dot(d, up) / z / tanV
     return { x: (x + 1) / 2, y: 1 - (y + 1) / 2 }
   }
 
+  // The framing (camera position and aim, horizontal half extent at the aim) and the chart's card, if shown.
+  private frame() {
+    const s = this.state
+    const plate = s.model !== 'spheres'
+    const y = s.model === 'spheres' ? CAM_TARGET[1] : MODELS[s.model].camTargetY ?? MODEL_CAM_TARGET[1]
+    const half0 = plate ? MODEL_H_HALF_EXTENT : H_HALF_EXTENT
+    if (!s.chart) return { pos: CAM_POS, target: [0, y, 0] as Vec3, half: half0, chart: null }
+    // The row's right end (the hero ball, or the chrome ball beside a model) and the gray ball at its left.
+    const right = plate ? MODEL_BALLS[1][0] + MODEL_BALLS[1][3] : BALL_X[2] + 1
+    const [gx, gz, gr] = plate ? [MODEL_BALLS[0][0], MODEL_BALLS[0][2], MODEL_BALLS[0][3]] : [BALL_X[0], 0, 1]
+    const w = gr * (plate ? 2.2 : 1.6)
+    const h = w * CHART_ASPECT
+    const cx = gx - gr * 1.3 - w / 2
+    const left = cx - w / 2
+    const mid = (left + right) / 2
+    const pos: Vec3 = [mid, CAM_POS[1], CAM_POS[2]]
+    // The card's bottom edge stands on the floor; its face turns toward the camera and leans back.
+    const cz = gz + gr * 0.6 // a little forward, into the key's light
+    const yaw = Math.atan2(pos[0] - cx, pos[2] - cz)
+    const U: Vec3 = [Math.cos(yaw) * w, 0, -Math.sin(yaw) * w]
+    const V: Vec3 = scale([-Math.sin(CHART_TILT) * Math.sin(yaw), Math.cos(CHART_TILT), -Math.sin(CHART_TILT) * Math.cos(yaw)], h)
+    const foot: Vec3 = [cx, 0.002, cz]
+    return { pos, target: [mid, y, 0] as Vec3, half: (right - left) / 2 + (half0 - right), chart: { O: sub(foot, scale(U, 0.5)), U, V, foot } }
+  }
+
   private camera() {
-    const plate = this.state.model !== 'spheres'
-    const target: Vec3 = plate ? [0, MODELS[this.state.model as Exclude<Model, 'spheres'>].camTargetY ?? MODEL_CAM_TARGET[1], 0] : CAM_TARGET
-    const fwd = normalize(sub(target, CAM_POS))
+    const { pos, target, half } = this.frame()
+    const fwd = normalize(sub(target, pos))
     const right = normalize(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
-    const tanH = (plate ? MODEL_H_HALF_EXTENT : H_HALF_EXTENT) / length(sub(target, CAM_POS))
+    const tanH = half / length(sub(target, pos))
     const aspect = this.width && this.height ? this.width / this.height : 2.39
     const tanV = tanH / aspect
-    return { fwd, right, up, tanH, tanV }
+    return { pos, fwd, right, up, tanH, tanV }
   }
 
   // Start over from zero samples. A pass in progress is abandoned: its finished slices sit in the destination
@@ -913,7 +953,7 @@ export class LookdevEngine {
     const L = (n: string) => this.loc(prog, n)
 
     const cam = this.camera()
-    gl.uniform3fv(L('uCamPos'), CAM_POS)
+    gl.uniform3fv(L('uCamPos'), cam.pos)
     gl.uniform3fv(L('uCamFwd'), cam.fwd)
     gl.uniform3fv(L('uCamRight'), cam.right)
     gl.uniform3fv(L('uCamUp'), cam.up)
@@ -967,6 +1007,14 @@ export class LookdevEngine {
     gl.uniform1i(L('uCyc'), stage.cyc ? 1 : 0)
     gl.uniform1f(L('uCycZ'), CYC_Z)
     gl.uniform1f(L('uCycR'), CYC_R)
+    const chart = this.frame().chart
+    gl.uniform1i(L('uChart'), chart ? 1 : 0)
+    if (chart) {
+      gl.uniform3fv(L('uChartO'), chart.O)
+      gl.uniform3fv(L('uChartU'), chart.U)
+      gl.uniform3fv(L('uChartV'), chart.V)
+    }
+    gl.uniform3fv(L('uChartColor'), COLOR_CHECKER.flat())
     const mats: OpenPBR[] = [SCENE_MATERIALS.gray, SCENE_MATERIALS.chrome, hero, stage.material]
 
     if (s.model === 'spheres') {

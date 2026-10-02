@@ -1318,6 +1318,14 @@ uniform float uCycZ;
 uniform float uCycR;
 // The scene has smooth thin-walled glass (a soap bubble, car windows): shadow rays pass through it, dimmed.
 uniform int uThinGlass;
+// The color chart (uChart 1): a card from corner uChartO along its full width uChartU and height uChartV, the front
+// facing cross(U, V). Its 24 patches (row by row from the top left), then its frame, in uChartColor.
+uniform int uChart;
+uniform vec3 uChartO;
+uniform vec3 uChartU;
+uniform vec3 uChartV;
+uniform vec3 uChartColor[25];
+#define CHART_MAT 16 // material index of the chart's first patch; the frame is CHART_MAT + 24
 #ifdef MESH
 // Material slots: 0 gray ball, 1 chrome, 2 hero, 3 floor, 4-9 the model's other parts.
 uniform vec4 uBall[3]; // center, radius (0 = absent)
@@ -1424,6 +1432,31 @@ float cycHit(vec3 ro, vec3 rd, float tMax, out vec3 n) {
   return best;
 }
 
+// The color chart: hit distance before tMax or -1, the normal facing the ray, and the patch hit (24: the frame or
+// the back). The patches are squares in a 6 x 4 grid, CHART_GAP patch widths apart and from the edges (the host
+// sizes the card to match).
+#define CHART_GAP 0.18
+float chartHit(vec3 ro, vec3 rd, float tMax, out vec3 nOut, out int cellId) {
+  vec3 N = normalize(cross(uChartU, uChartV));
+  float dn = dot(rd, N);
+  nOut = dn < 0.0 ? N : -N;
+  cellId = 24;
+  if (abs(dn) < 1e-8) return -1.0;
+  float t = dot(uChartO - ro, N) / dn;
+  if (t <= 1e-4 || t >= tMax) return -1.0;
+  vec3 q = ro + rd * t - uChartO;
+  vec2 ab = vec2(dot(q, uChartU) / dot(uChartU, uChartU), dot(q, uChartV) / dot(uChartV, uChartV));
+  if (any(lessThan(ab, vec2(0.0))) || any(greaterThan(ab, vec2(1.0)))) return -1.0;
+  if (dn < 0.0) {
+    vec2 g = ab * vec2(6.0 + 7.0 * CHART_GAP, 4.0 + 5.0 * CHART_GAP) - CHART_GAP; // from the first patch's corner
+    vec2 cell = floor(g / (1.0 + CHART_GAP));
+    vec2 f = g - cell * (1.0 + CHART_GAP);
+    if (cell.x >= 0.0 && cell.y >= 0.0 && cell.x < 6.0 && cell.y < 4.0 && f.x < 1.0 && f.y < 1.0)
+      cellId = int(cell.x) + 6 * (3 - int(cell.y));
+  }
+  return t;
+}
+
 #ifdef MESH
 ${MESH_GLSL}
 float intersectBall(vec3 ro, vec3 rd, vec4 s, float tMax) {
@@ -1516,6 +1549,15 @@ Hit trace(vec3 ro, vec3 rd, float tMax, bool shadow, bool withLights, inout vec3
     }
   }
 #endif
+  if (uChart == 1 && uFurnace == 0) {
+    vec3 nc;
+    int cid;
+    float t = chartHit(ro, rd, h.t, nc, cid);
+    if (t > 0.0) {
+      h.t = t; h.n = nc; h.ng = nc; h.mat = CHART_MAT + cid; h.back = false;
+      if (shadow) return h;
+    }
+  }
   if (uFurnace == 0 && rd.y < 0.0) {
     float t = -ro.y / rd.y;
     if (t > 0.0 && t < h.t && (uCyc == 0 || ro.z + rd.z * t >= uCycZ)) {
@@ -1540,7 +1582,12 @@ Hit trace(vec3 ro, vec3 rd, float tMax, bool shadow, bool withLights, inout vec3
 
 Mat getMat(int i) {
   Mat m;
-  if (i == 0) m = uMat[0];
+  if (i >= CHART_MAT) {
+    // The chart: the gray card's matte surface in the patch's color.
+    m = uMat[0];
+    m.base_color = uChartColor[i - CHART_MAT];
+  }
+  else if (i == 0) m = uMat[0];
   else if (i == 1) m = uMat[1];
   else if (i == 2) m = uMat[2];
 #ifdef MESH

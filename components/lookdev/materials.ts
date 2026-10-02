@@ -146,6 +146,20 @@ export const STAGES: Record<Stage, { label: string; cyc: boolean; material: Open
   gray: { label: 'Gray cyc', cyc: true, material: SCENE_MATERIALS.grayCyc },
 }
 
+// The ColorChecker Classic's 24 patches, row by row from dark skin to black, as ACEScg reflectances: X-Rite's
+// published CIE L*a*b* values for charts made after November 2014 (D50), to XYZ, Bradford-adapted to the ACES
+// white point, to ACEScg. They shade as the gray card does (its matte surface in each patch's color). Last, the
+// chart's black frame (authored).
+export const COLOR_CHECKER: RGB[] = [
+  [0.1358, 0.0851, 0.0582], [0.4474, 0.2963, 0.2254], [0.1436, 0.1848, 0.3089], [0.1184, 0.1462, 0.0629],
+  [0.2318, 0.2163, 0.3989], [0.2625, 0.4786, 0.4156], [0.5274, 0.2379, 0.0635], [0.0887, 0.1021, 0.3495],
+  [0.3761, 0.1142, 0.12], [0.0877, 0.048, 0.127], [0.3749, 0.4797, 0.0984], [0.5953, 0.3823, 0.0729],
+  [0.0424, 0.0489, 0.2528], [0.1303, 0.2717, 0.0864], [0.2879, 0.0652, 0.0484], [0.7113, 0.5854, 0.0843],
+  [0.3604, 0.1118, 0.2709], [0.0703, 0.2161, 0.3528], [0.8793, 0.8839, 0.8407], [0.5871, 0.5915, 0.5853],
+  [0.3613, 0.3664, 0.3653], [0.1904, 0.1908, 0.1899], [0.0871, 0.0885, 0.0896], [0.0315, 0.0315, 0.0322],
+  [0.02, 0.02, 0.02],
+]
+
 export type Hero =
   | 'carpaint' | 'gold' | 'velvet' | 'thinfilm' | 'plastic' | 'brushed' | 'titanium' | 'glass' | 'diamond' | 'soapbubble'
   | 'skin' | 'marble' | 'ceramic' | 'honey' | 'copper' | 'silver'

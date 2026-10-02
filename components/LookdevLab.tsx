@@ -109,6 +109,10 @@ function modelPatch(m: Model): Partial<LabState> {
 const TECH_NOTES: [string, string][] = [
   ['Color', 'Rendered in ACEScg, shown through ACES 2.0 (baked from OpenColorIO 2.5), AgX, Khronos PBR Neutral or a plain sRGB curve.'],
   [
+    'Color chart',
+    "A ColorChecker Classic: X-Rite's published values for its 24 patches, converted to ACEScg reflectances and shaded like the gray card, so every view transform can be judged against known colors.",
+  ],
+  [
     'Validation',
     'In a white furnace test, with multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of 1.0, and rough glass stays within about 1.5% through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%.',
   ],
@@ -361,11 +365,12 @@ export default function LookdevLab() {
     }
   }, [])
 
-  // Labels follow the plate: a model moves the reference balls aside, and its own label tracks the turntable.
+  // Labels follow the plate: a model moves the reference balls aside, and its own label tracks the turntable; the
+  // chart widens the frame.
   useEffect(() => {
     const e = engineRef.current
     if (e) setLabels(e.labelPoints().map(p => e.project(p)))
-  }, [lab.model, lab.modelYaw, status.model, ready])
+  }, [lab.model, lab.modelYaw, lab.chart, status.model, ready])
 
   // "Drag me" by the key light's marker until the visitor first moves the light (remembered on this device).
   const [lightMoved, setLightMoved] = useState(true) // until read below, so the hint never flashes for returners
@@ -459,7 +464,7 @@ export default function LookdevLab() {
   const markerX = (lab.keyAz / AZ_RANGE + 0.5) * 100
   const markerY = ((EL_MAX - lab.keyEl) / ((EL_MAX - EL_MIN) * 1.1)) * 100
   const model = lab.model === 'spheres' ? null : MODELS[lab.model]
-  const ballNames = ['18% gray', 'Chrome', model ? `${model.label}, ${heroName.toLowerCase()}` : heroName]
+  const ballNames = ['18% gray', 'Chrome', model ? `${model.label}, ${heroName.toLowerCase()}` : heroName, 'Color chart']
 
   return (
     <section ref={sectionRef} id="lab" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
@@ -473,8 +478,8 @@ export default function LookdevLab() {
           Light, rendered live
         </h2>
         <p style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.8, maxWidth: 640 }}>
-          A progressive path tracer running a subset of OpenPBR Surface on the reference balls every lighting department
-          shoots: an 18% gray ball, a chrome ball, and a hero material.
+          A progressive path tracer running a subset of OpenPBR Surface on the references every lighting department
+          shoots: a color chart, an 18% gray ball, a chrome ball, and a hero material.
         </p>
       </div>
 
@@ -488,7 +493,7 @@ export default function LookdevLab() {
 
       <div ref={frameRef} className="lab-frame">
         {mode === 'fallback' ? (
-          <Still alt="Path traced lookdev reference balls: an 18% gray card ball, a chromium ball and a clear coated car paint ball under a three point softbox rig" />
+          <Still alt="Path traced lookdev references: a color chart, an 18% gray card ball, a chromium ball and a clear coated car paint ball under a three point softbox rig" />
         ) : (
           <canvas
             ref={canvasRef}
@@ -602,6 +607,11 @@ export default function LookdevLab() {
                   {STAGES[st].label}
                 </Pill>
               ))}
+            </Group>
+            <Group label="Chart">
+              <Pill on={lab.chart} onClick={() => update({ chart: !lab.chart })}>
+                Color chart {lab.chart ? 'on' : 'off'}
+              </Pill>
             </Group>
             {model && (
               <Group label="Turntable">

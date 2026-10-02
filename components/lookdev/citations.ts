@@ -140,6 +140,17 @@ export const CITATIONS: Citation[] = [
     url: 'https://jcgt.org/published/0002/02/01/',
   },
   {
+    id: 'colorchecker',
+    group: 'Color and display',
+    by: 'X-Rite',
+    short: 'ColorChecker values',
+    authors: 'X-Rite; Colour Developers',
+    title: 'ColorChecker Classic, charts made after November 2014: CIE L*a*b* values (D50)',
+    venue: 'Colour, characterisation datasets',
+    year: '2014',
+    url: 'https://github.com/colour-science/colour/blob/develop/colour/characterisation/datasets/colour_checkers/chromaticity_coordinates.py',
+  },
+  {
     id: 'sah',
     group: 'Geometry',
     short: 'Binned SAH BVH',

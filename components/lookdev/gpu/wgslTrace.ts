@@ -762,6 +762,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
     var prevPdf = 0.0;
     var prevP = ro;
     var prevTrans = false;
+    // Still the camera's own ray: nothing scattered it yet, it only passed straight through thin walls (a soap
+    // bubble, a car window). It sees what the camera sees: the backdrop, at full weight (no light sampling can
+    // have reached it), and not the softboxes. Keyed on depth instead, a ray through a bubble lost the
+    // environment behind it to a zero weight (white furnace: 0.71) and could see the softboxes.
+    var straight = true;
     let lambda = 380.0 + 400.0 * sample4(sampleIndex, pixSeed, 0, 6).x;
     var colored = false;
     var depth = 0;
@@ -808,7 +813,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
         gTuv = 1.0;
         gExitT = 1e30;
 #endif
-        h = trace(ro, rd, 1e30, false, depth > 0, &T);
+        h = trace(ro, rd, 1e30, false, !straight, &T);
 #ifdef SSS
       }
 #endif
@@ -829,8 +834,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
       if (h.mat < 0) {
         if (!(depth == 0 && uPass >= 3)) {
           if (uEnvOn == 1) {
-            let Lenv = select(envLe(rd), envBackdrop(rd), depth == 0);
-            var c = beta * Lenv * select(powerHeuristic(prevPdf, envPdf(rd)), 1.0, depth == 0 || prevTrans);
+            let Lenv = select(envLe(rd), envBackdrop(rd), straight);
+            var c = beta * Lenv * select(powerHeuristic(prevPdf, envPdf(rd)), 1.0, straight || prevTrans);
 #ifdef FLUOR
             if (excited) { c = flOut * dot(flIn.rgb, c); }
 #endif
@@ -1185,6 +1190,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
         prevPdf = bpdf;
         prevTrans = through;
         prevP = ro;
+        straight = false;
       }
       rd = dirW;
       depth++;

@@ -1816,6 +1816,11 @@ void main() {
     // Next-event estimation only samples lights on the incident side, so a light reached through a refraction had
     // no light-sampling counterpart: it takes the full weight.
     bool prevTrans = false;
+    // Still the camera's own ray: nothing scattered it yet, it only passed straight through thin walls (a soap
+    // bubble, a car window). It sees what the camera sees: the backdrop, at full weight (no light sampling can
+    // have reached it), and not the softboxes. Keyed on depth instead, a ray through a bubble lost the
+    // environment behind it to a zero weight (white furnace: 0.71) and could see the softboxes.
+    bool straight = true;
     // Dispersion: each path carries one wavelength through dispersive glass, drawn here and committed (weighted by
     // its ACEScg response) at its first refraction through such glass. Drawn from the pixel's own scrambled
     // Sobol' sequence (a dimension nothing else uses), so a pixel's samples sweep the spectrum evenly instead of
@@ -2070,6 +2075,7 @@ void main() {
             prevPdf = bpdf;
             prevTrans = through;
             prevP = ro;
+            straight = false;
           }
           rd = dirW;
           tro = ro;
@@ -2093,7 +2099,7 @@ void main() {
       gTuv = 1.0;
       gExitT = 1e30;
 #endif
-      Hit h = trace(tro, trd, tMax, shadow, !shadow && depth > 0, T);
+      Hit h = trace(tro, trd, tMax, shadow, !shadow && !straight, T);
 
       if (shadow) {
         if (h.mat < 0 && maxc(T) > 0.0) {
@@ -2169,7 +2175,7 @@ void main() {
           if (uEnvOn == 1) {
             // The camera sees the softened backdrop; a bounce sees the environment as a light, weighted against
             // sampling it from the vertex before (none was made through a refraction).
-            vec3 c = beta * (depth == 0 ? envBackdrop(rd) : envLe(rd)) * (depth == 0 || prevTrans ? 1.0 : powerHeuristic(prevPdf, envPdf(rd)));
+            vec3 c = beta * (straight ? envBackdrop(rd) : envLe(rd)) * (straight || prevTrans ? 1.0 : powerHeuristic(prevPdf, envPdf(rd)));
 #ifdef FLUOR
             if (excited) c = flOut * dot(flIn.rgb, c);
 #endif

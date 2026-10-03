@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import {
   LookdevEngine,
   DEFAULT_STATE,
@@ -24,6 +24,7 @@ import WorkIndicator from './WorkIndicator'
 // The renderer: WebGPU where the browser has it (compute shaders, compiled in the background), WebGL otherwise.
 // ?renderer=webgl forces the WebGL one (for comparing the two).
 type Engine = LookdevEngine | LookdevEngineGPU
+const noSubscribe = () => () => {}
 const forcedWebGL = () => typeof location !== 'undefined' && new URLSearchParams(location.search).get('renderer') === 'webgl'
 
 const PASSES: { id: Pass; label: string }[] = [
@@ -44,6 +45,7 @@ const VIEWS: { id: View; label: string }[] = [
 const LIGHT_HINT_KEY = 'lab-light-moved'
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it drags the light
 const POSTER_SPP = 2048 // samples per pixel of poster.jpg, the converged render of the default settings
+const START_QUIET_MS = 400 // WebGPU starts once the lab is on screen and the page has not scrolled for this long
 
 const AZ_RANGE = 5.2
 const EL_MIN = 0.05
@@ -384,6 +386,11 @@ export default function LookdevLab() {
   const [furnaceMean, setFurnaceMean] = useState<number | null>(null)
   const [paused, setPaused] = useState(false)
   const [ready, setReady] = useState(false)
+  // On WebGPU the controls and the light drag work before the renderer is ready (it starts late, see the effect
+  // below): the settings wait in labRef and the first frame renders them. WebGL keeps them locked until ready,
+  // its first draw can freeze the page. (Server render: locked, as without WebGPU.)
+  const gpuInput = useSyncExternalStore(noSubscribe, () => !!navigator.gpu && !forcedWebGL(), () => false) && !gpuFailed
+  const inputOn = ready || gpuInput
   const lastInFamily = useRef<Partial<Record<HeroFamily, Hero>>>({}) // each family's last picked material
   const [tab, setTab] = useState<ControlTab>('look')
   const startSecs = useWaitSeconds(mode === 'live' && !ready && !paused ? 'start' : null)
@@ -527,21 +534,46 @@ export default function LookdevLab() {
     }
     canvas.addEventListener('webglcontextrestored', onContextRestored)
 
-    let cancelIdle: () => void
-    if ('requestIdleCallback' in window) {
-      const id = requestIdleCallback(start, { timeout: 4000 })
-      cancelIdle = () => cancelIdleCallback(id)
-    } else {
-      const id = setTimeout(start, 2000)
-      cancelIdle = () => clearTimeout(id)
+    // When to start. WebGPU starts when the page comes to rest within a screen of the lab (a visitor reading the
+    // section above, or looking at the still), or as soon as a visitor points at or uses the lab: getting a GPU
+    // adapter and compiling the first shaders holds up the browser's frames (measured: up to 0.75 s). Started at
+    // load it stuttered the scroll down from the top; started on arrival it stalled the first drag. Over a page
+    // at rest nothing moves. WebGL starts at idle, as before: its compile cannot be hidden either way (see
+    // FIRST_DRAW_NOTICE_MS).
+    const gpuPath = !gpuFailed && !forcedWebGL() && LookdevEngineGPU.detect()
+    let cancelIdle = () => {}
+    let quietTimer = 0
+    let near = false
+    const armQuiet = () => {
+      window.clearTimeout(quietTimer)
+      quietTimer = window.setTimeout(() => near && start(), START_QUIET_MS)
     }
-
-    // Approaching the section starts the renderer early if the idle callback has not yet; only a frame that is
-    // actually on screen renders.
-    io = new IntersectionObserver(entries => entries.some(en => en.isIntersecting) && start(), {
-      rootMargin: '200px 0px',
-    })
-    io.observe(section)
+    const nearby = new IntersectionObserver(entries => {
+      near = entries.some(en => en.isIntersecting)
+      if (gpuPath && near) armQuiet()
+    }, { rootMargin: '100% 0px' })
+    nearby.observe(section)
+    const startNow = () => start()
+    if (gpuPath) {
+      window.addEventListener('scroll', armQuiet, { passive: true })
+      frame.addEventListener('pointerenter', startNow)
+      section.addEventListener('pointerdown', startNow)
+      section.addEventListener('focusin', startNow)
+    } else {
+      if ('requestIdleCallback' in window) {
+        const id = requestIdleCallback(start, { timeout: 4000 })
+        cancelIdle = () => cancelIdleCallback(id)
+      } else {
+        const id = setTimeout(start, 2000)
+        cancelIdle = () => clearTimeout(id)
+      }
+      // Approaching the section starts the renderer early if the idle callback has not yet.
+      io = new IntersectionObserver(entries => entries.some(en => en.isIntersecting) && start(), {
+        rootMargin: '200px 0px',
+      })
+      io.observe(section)
+    }
+    // Only a frame that is actually on screen renders.
     const onScreen = new IntersectionObserver(entries => {
       visible = entries.some(en => en.isIntersecting)
       engine?.setVisible(visible)
@@ -552,6 +584,12 @@ export default function LookdevLab() {
     return () => {
       unmounted = true
       cancelIdle()
+      window.clearTimeout(quietTimer)
+      window.removeEventListener('scroll', armQuiet)
+      nearby.disconnect()
+      frame.removeEventListener('pointerenter', startNow)
+      section.removeEventListener('pointerdown', startNow)
+      section.removeEventListener('focusin', startNow)
       io?.disconnect()
       onScreen.disconnect()
       ro.disconnect()
@@ -611,7 +649,7 @@ export default function LookdevLab() {
     setFromPointer(e)
   }
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (lab.furnace || !ready || dragging.current !== null) return
+    if (lab.furnace || !inputOn || dragging.current !== null) return
     if (e.pointerType !== 'touch') {
       if (e.button === 0) beginDrag(e) // mouse or pen: press places the light, a drag moves it
       return
@@ -642,7 +680,7 @@ export default function LookdevLab() {
     engineRef.current?.setInteracting(false)
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
-    if (lab.furnace || !ready) return
+    if (lab.furnace || !inputOn) return
     const s = 0.08
     let { keyAz, keyEl } = labRef.current // held keys repeat faster than React re-renders
     if (turnsEnv && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
@@ -858,7 +896,7 @@ export default function LookdevLab() {
       </div>
 
       {mode !== 'fallback' && (
-        <fieldset className="lab-controls" disabled={!ready}>
+        <fieldset className="lab-controls" disabled={!inputOn}>
           <LabTabs id={tabsId} tab={tab} onTab={setTab} />
           <div className="lab-panel" role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`}>
             {tab === 'look' && (

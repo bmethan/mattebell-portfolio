@@ -45,6 +45,9 @@ const HEAVY_SAMPLE_MS = 200
 // Variants compiled ahead once the plain tracer is ready and the lab is in view, one at a time, in the order
 // visitors tend to need them. On WebGPU a pipeline compiles in the background and needs nothing more at its first
 // use, so a first pick of a model or a glass hero usually finds it ready.
+// Prewarming waits for this long without scrolling, dragging or edits: a compile holds up the browser's frames now
+// and then (measured: 100-180 ms), unseen over a page at rest, a stutter during a scroll or a drag.
+const PREWARM_QUIET_MS = 1500
 const PREWARM: VariantKey[] = ['base+glass', 'mesh', 'mesh+sss', 'mesh+thin', 'base+sss', 'base+fluor', 'mesh+glass', 'base+fluor+glass', 'mesh+fluor', 'mesh+fluor+glass']
 
 interface EnvGPU {
@@ -406,8 +409,16 @@ export class LookdevEngineGPU {
     if (!this.live || !this.visible || this.disposed) return
     if ([...this.variants.values()].some(v => !v.ready && !v.failed)) return
     const key = PREWARM.find(k => !this.variants.has(k))
-    if (key) this.ensureVariant(key)
+    if (!key) return
+    const wait = Math.max(this.lastScroll, this.lastChange) + PREWARM_QUIET_MS - performance.now()
+    if (this.interacting || wait > 0) {
+      window.clearTimeout(this.prewarmTimer)
+      this.prewarmTimer = window.setTimeout(() => this.prewarmNext(), Math.max(wait, 250))
+      return
+    }
+    this.ensureVariant(key)
   }
+  private prewarmTimer = 0
 
   private ensureModel() {
     if (this.disposed || !this.live) return
@@ -1219,6 +1230,7 @@ export class LookdevEngineGPU {
   }
 
   dispose() {
+    window.clearTimeout(this.prewarmTimer)
     this.disposed = true
     this.stop()
     window.removeEventListener('scroll', this.handleScroll)

@@ -742,10 +742,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
   var accY = 0.0;
   var accY2 = 0.0;
   let sppDone = pu.dims.z;
-  let sppNew = pu.dims.w;
+  // One sample per dispatch (the engine issues one dispatch per sample, see encodeTrace): looping over several
+  // here kept their running totals live through every path, and the subsurface and fluorescent glass kernels
+  // spilled twice as much to scratch memory (Radeon GPU Analyzer, RDNA 2: 544 -> 240 bytes for skin).
+  let sppNew = 1u;
 
-  for (var sIdx = 0u; sIdx < sppNew; sIdx++) {
-    let sampleIndex = sppDone + sIdx;
+  {
+    let sampleIndex = sppDone;
     let jitter = sample4(sampleIndex, pixSeed, 0, 7).xy;
     let ndc = ((fragCoord - 0.5 + jitter) / resolution) * 2.0 - 1.0;
     var ro = scene.camPos.xyz;
@@ -781,13 +784,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
     var sWo = vec3f(0.0, 0.0, 1.0);
     var sBack = false;
     var sColored = false;
-    var inSSS = false;
-    var sigT = vec3f(1.0);
-    var ssAlb = vec3f(0.0);
-    var walkR = vec3f(1.0);
-    var heroMask = vec3f(1.0, 0.0, 0.0);
-    var hgG = 0.0;
-    var betaIn = 1.0;
+    var walked = false; // the last iteration ended in a walk, and walkHit is where it left the medium
+    var walkHit: Hit;
     var scatters = 0;
     var walkSeed = pcg3d(vec3u(x, y, sampleIndex)).x;
     maxSteps += uMaxScatter;
@@ -798,43 +796,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
       var walkExit = false;
       var h: Hit;
 #ifdef SSS
-      if (inSSS) {
-        // The walk in a loop of its own, querying only the object walked in (see traceWalk): through the
-        // path's main loop, each flight carried the whole path's state and ran several times slower.
-        var ended = false;
-        loop {
-          let tFlight = -log(max(1.0 - walkRand(&walkSeed), 1e-30)) / dot(sigT, heroMask);
-          let hw = traceWalk(ro, rd, tFlight);
-          let scattered = hw.mat < 0;
-          let tt = select(hw.t, tFlight, scattered);
-          let Tr = exp(-sigT * tt);
-          let pc = select(Tr, sigT * Tr, scattered);
-          let ph = max(dot(pc, heroMask), 1e-30);
-          beta *= select(Tr, ssAlb * sigT * Tr, scattered) / ph;
-          walkR *= pc / ph;
-          let wn = dot(walkR, vec3f(1.0 / 3.0));
-          beta /= wn;
-          walkR /= wn;
-          if (!scattered) {
-            h = hw;
-            break;
-          }
-          scatters++;
-          if (scatters > uMaxScatter || maxc(beta) <= 0.0) { ended = true; break; }
-          let q = min(maxc(beta) / betaIn, 1.0);
-          if (q < 1.0) {
-            if (walkRand(&walkSeed) >= q) { ended = true; break; }
-            beta /= q;
-          }
-          ro += rd * tt;
-          let r1 = walkRand(&walkSeed);
-          let r2 = walkRand(&walkSeed);
-          rd = sampleHG(rd, hgG, r1, r2);
-          if (steps >= maxSteps) { ended = true; break; }
-          steps++;
-        }
-        if (ended) { break; }
-        inSSS = false;
+      if (walked) {
+        h = walkHit;
+        walked = false;
         walkExit = true;
       } else {
 #endif
@@ -1194,14 +1158,21 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
       let passed = false;
 #endif
 #ifdef SSS
+      // Refracted into a subsurface medium: the walk's parameters (kept to this iteration; carried to the next,
+      // with the path, they slowed every pixel of the kernel, walking or not, by an order of magnitude).
+      var enter = false;
+      var sigT = vec3f(1.0);
+      var ssAlb = vec3f(0.0);
+      var heroMask = vec3f(1.0, 0.0, 0.0);
+      var hgG = 0.0;
+      var betaIn = 1.0;
       if (through && !sssExit && !s.thin && !vBack && mv.subsurface_weight > 0.0) {
-        inSSS = true;
+        enter = true;
         sssCross++;
         beta *= sq(s.etaT);
         betaIn = max(maxc(beta), 1e-20);
         let uh = walkRand(&walkSeed) * 3.0;
         heroMask = vec3f(f32(uh < 1.0), f32(uh >= 1.0 && uh < 2.0), f32(uh >= 2.0));
-        walkR = vec3f(1.0);
         let r = max(mv.subsurface_radius * mv.subsurface_radius_scale, vec3f(1e-6));
         sigT = 1.0 / r;
         hgG = clamp(mv.subsurface_scatter_anisotropy, -0.95, 0.95);
@@ -1217,6 +1188,47 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
       }
       rd = dirW;
       depth++;
+#ifdef SSS
+      // The walk itself, in a loop of its own querying only the object walked in (see traceWalk); the next
+      // iteration starts from where it left the medium.
+      if (enter) {
+        var walkR = vec3f(1.0);
+        var ended = false;
+        loop {
+          let tFlight = -log(max(1.0 - walkRand(&walkSeed), 1e-30)) / dot(sigT, heroMask);
+          let hw = traceWalk(ro, rd, tFlight);
+          let scattered = hw.mat < 0;
+          let tt = select(hw.t, tFlight, scattered);
+          let Tr = exp(-sigT * tt);
+          let pc = select(Tr, sigT * Tr, scattered);
+          let ph = max(dot(pc, heroMask), 1e-30);
+          beta *= select(Tr, ssAlb * sigT * Tr, scattered) / ph;
+          walkR *= pc / ph;
+          let wn = dot(walkR, vec3f(1.0 / 3.0));
+          beta /= wn;
+          walkR /= wn;
+          if (!scattered) {
+            walkHit = hw;
+            break;
+          }
+          scatters++;
+          if (scatters > uMaxScatter || maxc(beta) <= 0.0) { ended = true; break; }
+          let q = min(maxc(beta) / betaIn, 1.0);
+          if (q < 1.0) {
+            if (walkRand(&walkSeed) >= q) { ended = true; break; }
+            beta /= q;
+          }
+          ro += rd * tt;
+          let r1 = walkRand(&walkSeed);
+          let r2 = walkRand(&walkSeed);
+          rd = sampleHG(rd, hgG, r1, r2);
+          if (steps >= maxSteps) { ended = true; break; }
+          steps++;
+        }
+        if (ended) { break; }
+        walked = true;
+      }
+#endif
     }
     let all = Ls.L0 + Ls.L1 + Ls.L2 + Ls.L3;
     if (!(nonFinite(all.r) || nonFinite(all.g) || nonFinite(all.b))) {

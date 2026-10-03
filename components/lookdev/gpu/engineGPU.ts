@@ -26,7 +26,7 @@ import { traceWGSL } from './wgslTrace'
 import { E_TABLE_WGSL, MIP_WGSL, DISPLAY_WGSL, DISPLAY, DENOISE_PREP_WGSL, ATROUS_WGSL, DENOISE, DENOISE_STRIDE } from './wgslAux'
 import { SCENE, PASS, PASS_STRIDE, matWords, MAX_MATS, MAT_VEC4S } from './sceneLayout'
 
-const MAX_DISPATCHES = 64 // pass-uniform slots per frame (a frame issues a slice or two)
+const MAX_DISPATCHES = 512 // pass-uniform slots per frame: a dispatch per slice per sample
 const TIMED_PER_FRAME = 16 // timestamp pairs per frame (a frame can issue several slices)
 const MAX_SLICES_PER_FRAME = 16
 const TIMING_SLOTS = 4 // frames whose timestamps can be in flight at once
@@ -779,17 +779,22 @@ export class LookdevEngineGPU {
     let rows = 0
     for (let b = 0; b < sliceBlocks; b++) rows += Math.min(blockRows, h - (slice + b * sliceCount) * blockRows)
     if (sliceBlocks === 0) return 0
-    const offset = this.writePass([w, h, sppDone, n], [slice, sliceCount, blockRows], bounces, res)
     let desc: GPUComputePassDescriptor = {}
     if (timed && times && times.list.length < TIMED_PER_FRAME) {
       const i = times.list.length
       desc = { timestampWrites: { querySet: this.timing[times.slot].querySet, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } }
       times.list.push({ ...timed, frac: timed.frac * rows / h }) // a preview counts as 1/k^2 of a frame
     }
+    // A dispatch per sample (the kernel traces one): each sees the last one's running means, as dispatches in a
+    // pass do. The timestamps span them all.
     const pass = enc.beginComputePass(desc)
     pass.setPipeline(pipeline)
-    pass.setBindGroup(0, this.traceBindGroup(t), [offset])
-    pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil((sliceBlocks * blockRows) / 8)) // the kernel's 8 x 8
+    const bind = this.traceBindGroup(t)
+    for (let i = 0; i < n; i++) {
+      const offset = this.writePass([w, h, sppDone + i, 1], [slice, sliceCount, blockRows], bounces, res)
+      pass.setBindGroup(0, bind, [offset])
+      pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil((sliceBlocks * blockRows) / 8)) // the kernel's 8 x 8
+    }
     pass.end()
     return rows
   }

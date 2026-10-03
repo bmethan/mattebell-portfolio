@@ -472,6 +472,26 @@ fn thinPassT(m: Mat, c: f32) -> vec3f {
 fn ballX(i: i32) -> f32 { return scene.ballX[i]; }
 
 // The one scene query, for both kinds of ray (called from a single place: see main).
+#ifdef MESH
+// A model hit's material, side and normals (shading normal interpolated, kept facing the ray's side).
+fn meshHit(mh: MeshHit, rd: vec3f, h: ptr<function, Hit>) {
+  let nn = triNrm[mh.tri];
+  (*h).mat = i32(nn.w);
+  let e1 = triPos[3 * mh.tri + 1].xyz;
+  let e2 = triPos[3 * mh.tri + 2].xyz;
+  let R = modelRot();
+  var ng = normalize(R * cross(e1, e2));
+  let bc = mh.bary;
+  var ns = normalize(R * ((1.0 - bc.x - bc.y) * octDecode(nn.x) + bc.x * octDecode(nn.y) + bc.y * octDecode(nn.z)));
+  (*h).back = dot(rd, select(ng, -ng, dot(ng, ns) < 0.0)) > 0.0;
+  if (dot(ng, rd) > 0.0) { ng = -ng; }
+  if (dot(ns, ng) < 0.0) { ns = -ns; }
+  if (dot(ns, -rd) <= 1e-4) { ns = ng; }
+  (*h).n = ns;
+  (*h).ng = ng;
+}
+#endif
+
 fn trace(ro: vec3f, rd: vec3f, tMax: f32, shadow: bool, withLights: bool, T: ptr<function, vec3f>) -> Hit {
   var h: Hit;
   h.t = tMax; h.mat = -1; h.light = -1; h.lightT = tMax; h.n = vec3f(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
@@ -490,20 +510,7 @@ fn trace(ro: vec3f, rd: vec3f, tMax: f32, shadow: bool, withLights: bool, T: ptr
   if (mh.t > 0.0) {
     h.t = mh.t;
     if (shadow) { h.mat = 4; return h; }
-    let nn = triNrm[mh.tri];
-    h.mat = i32(nn.w);
-    let e1 = triPos[3 * mh.tri + 1].xyz;
-    let e2 = triPos[3 * mh.tri + 2].xyz;
-    let R = modelRot();
-    var ng = normalize(R * cross(e1, e2));
-    let bc = mh.bary;
-    var ns = normalize(R * ((1.0 - bc.x - bc.y) * octDecode(nn.x) + bc.x * octDecode(nn.y) + bc.y * octDecode(nn.z)));
-    h.back = dot(rd, select(ng, -ng, dot(ng, ns) < 0.0)) > 0.0;
-    if (dot(ng, rd) > 0.0) { ng = -ng; }
-    if (dot(ns, ng) < 0.0) { ns = -ns; }
-    if (dot(ns, -rd) <= 1e-4) { ns = ng; }
-    h.n = ns;
-    h.ng = ng;
+    meshHit(mh, rd, &h);
   }
 #else
   for (var i = 0; i < 3; i++) {
@@ -571,6 +578,31 @@ fn trace(ro: vec3f, rd: vec3f, tMax: f32, shadow: bool, withLights: bool, T: ptr
   }
   return h;
 }
+
+#ifdef SSS
+// A subsurface walk's flight can only end on the object walked in: the hero ball, or the model (the reference
+// balls, floor, chart and lights are all outside it). Same hits as trace(), for a fraction of the work.
+fn traceWalk(ro: vec3f, rd: vec3f, tMax: f32) -> Hit {
+  var h: Hit;
+  h.t = tMax; h.mat = -1; h.light = -1; h.lightT = tMax; h.n = vec3f(0.0, 1.0, 0.0); h.ng = h.n; h.back = false;
+#ifdef MESH
+  var T = vec3f(1.0);
+  let mh = traceMesh(ro, rd, h.t, false, &T);
+  if (mh.t > 0.0) {
+    h.t = mh.t;
+    meshHit(mh, rd, &h);
+  }
+#else
+  let c = vec3f(ballX(2), 1.0, 0.0);
+  let t = intersectSphere(ro, rd, c, h.t);
+  if (t > 0.0) {
+    let nOut = normalize(ro + rd * t - c);
+    h.t = t; h.back = dot(rd, nOut) > 0.0; h.n = select(nOut, -nOut, h.back); h.ng = h.n; h.mat = 2;
+  }
+#endif
+  return h;
+}
+#endif
 
 fn getMat(i: i32) -> Mat {
   var m: Mat;
@@ -762,54 +794,58 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_ind
 #endif
 
     loop {
-      // The closest hit.
-      var tMax = 1e30;
+      // The next hit: through a subsurface medium by a random walk, else the closest along the ray.
       var walkExit = false;
-#ifdef SSS
-      var tFlight = 1e30;
-      if (inSSS) {
-        tFlight = -log(max(1.0 - walkRand(&walkSeed), 1e-30)) / dot(sigT, heroMask);
-        tMax = tFlight;
-      }
-#endif
-      var T = vec3f(1.0);
-#if defined(FLUOR) && defined(GLASS)
-      gMediumShadow = false;
-      gTuv = 1.0;
-      gExitT = 1e30;
-#endif
-      let h = trace(ro, rd, tMax, false, depth > 0, &T);
-
+      var h: Hit;
 #ifdef SSS
       if (inSSS) {
-        let scattered = h.mat < 0;
-        let tt = select(h.t, tFlight, scattered);
-        let Tr = exp(-sigT * tt);
-        let pc = select(Tr, sigT * Tr, scattered);
-        let ph = max(dot(pc, heroMask), 1e-30);
-        beta *= select(Tr, ssAlb * sigT * Tr, scattered) / ph;
-        walkR *= pc / ph;
-        let wn = dot(walkR, vec3f(1.0 / 3.0));
-        beta /= wn;
-        walkR /= wn;
-        if (scattered) {
+        // The walk in a loop of its own, querying only the object walked in (see traceWalk): through the
+        // path's main loop, each flight carried the whole path's state and ran several times slower.
+        var ended = false;
+        loop {
+          let tFlight = -log(max(1.0 - walkRand(&walkSeed), 1e-30)) / dot(sigT, heroMask);
+          let hw = traceWalk(ro, rd, tFlight);
+          let scattered = hw.mat < 0;
+          let tt = select(hw.t, tFlight, scattered);
+          let Tr = exp(-sigT * tt);
+          let pc = select(Tr, sigT * Tr, scattered);
+          let ph = max(dot(pc, heroMask), 1e-30);
+          beta *= select(Tr, ssAlb * sigT * Tr, scattered) / ph;
+          walkR *= pc / ph;
+          let wn = dot(walkR, vec3f(1.0 / 3.0));
+          beta /= wn;
+          walkR /= wn;
+          if (!scattered) {
+            h = hw;
+            break;
+          }
           scatters++;
-          if (scatters > uMaxScatter || maxc(beta) <= 0.0) { break; }
+          if (scatters > uMaxScatter || maxc(beta) <= 0.0) { ended = true; break; }
           let q = min(maxc(beta) / betaIn, 1.0);
           if (q < 1.0) {
-            if (walkRand(&walkSeed) >= q) { break; }
+            if (walkRand(&walkSeed) >= q) { ended = true; break; }
             beta /= q;
           }
           ro += rd * tt;
           let r1 = walkRand(&walkSeed);
           let r2 = walkRand(&walkSeed);
           rd = sampleHG(rd, hgG, r1, r2);
-          if (steps >= maxSteps) { break; }
+          if (steps >= maxSteps) { ended = true; break; }
           steps++;
-          continue;
         }
+        if (ended) { break; }
         inSSS = false;
         walkExit = true;
+      } else {
+#endif
+        var T = vec3f(1.0);
+#if defined(FLUOR) && defined(GLASS)
+        gMediumShadow = false;
+        gTuv = 1.0;
+        gExitT = 1e30;
+#endif
+        h = trace(ro, rd, 1e30, false, depth > 0, &T);
+#ifdef SSS
       }
 #endif
 

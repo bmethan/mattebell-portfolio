@@ -130,7 +130,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Validation',
-    'In a white furnace test, with multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of 1.0, and rough glass stays within about 1.5% through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose about 2%.',
+    'In a white furnace test, with multiple-scattering compensation on, every OpenPBR preset averages within 0.4% of 1.0, and rough glass stays within about 0.6% through a solid ball. Paint flakes are a lab extension, not part of OpenPBR, and lose under 1%.',
   ],
   ['Glass', 'Dispersion is spectral: each light path through dispersive glass is traced at one wavelength between 380 and 780 nm.'],
   [

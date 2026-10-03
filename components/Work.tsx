@@ -157,6 +157,28 @@ function WorkModal({ card, onClose }: { card: Card; onClose: () => void }) {
   )
 }
 
+// Web-sized copies of each card still (public/images/cards, made by tools/card-images/make_cards.py from the
+// originals beside them): the browser fetches the smallest that is sharp at the card's size. The cards show
+// 292-854 px wide; the originals were up to 3544 px and 6.3 MB together.
+const CARD_WIDTHS: Record<string, number[]> = {
+  rpocard: [640, 960, 1280, 1920],
+  im3card: [640, 960, 1280, 1920],
+  realsteelcard: [640, 960, 1280, 1920],
+  startrekcard: [640, 960, 1280, 1920],
+  lotcard: [640, 960, 1280, 1920],
+  'walmart-famous-visitors': [640, 960, 1280],
+}
+function cardImage(image: string): { src: string; srcSet?: string; sizes?: string } {
+  const name = image.split('/').pop()!.replace(/\.jpg$/, '')
+  const widths = CARD_WIDTHS[name]
+  if (!widths) return { src: image }
+  return {
+    src: `/images/cards/${name}-960.webp`,
+    srcSet: widths.map(w => `/images/cards/${name}-${w}.webp ${w}w`).join(', '),
+    sizes: '(max-width: 800px) 88vw, 45vw',
+  }
+}
+
 function WorkCard({ card, onClick }: { card: Card; onClick?: () => void }) {
   const clickable = !!card.modal
   return (
@@ -172,7 +194,7 @@ function WorkCard({ card, onClick }: { card: Card; onClick?: () => void }) {
         overflow: 'hidden', position: 'relative',
       }}>
         {card.image
-          ? <img src={card.image} alt={`Still from ${card.title}`} loading="lazy" decoding="async" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+          ? <img {...cardImage(card.image)} alt={`Still from ${card.title}`} loading="lazy" decoding="async" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
           : <span>◻</span>
         }
         {/* The chip is the keyboard and screen reader way in (its click bubbles to the card); the card's text

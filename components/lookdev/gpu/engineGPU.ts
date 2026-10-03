@@ -13,7 +13,7 @@
 import {
   isDisplayOnly, variantOf, frameOf, projectOf, labelPointsOf, cameraOf, lightRigOf, mixWeightsOf,
   bouncesOf, goalOf, thinGlassOf, envTurnOf, sceneMaterialsOf, VARIANT_LABEL, VARIANT_GLASS, PASS_ID, VIEW_ID,
-  TARGET_SPP, DENOISE_LEVELS, DENOISE_FULL_SPP, MAX_SCATTER, FURNACE_MAX_SCATTER, MAX_NODE_VISITS, FRAME_BUDGET_MS,
+  TARGET_SPP, DENOISE_LEVELS, DENOISE_FULL_SPP, MAX_SCATTER, FURNACE_MAX_SCATTER, MAX_NODE_VISITS,
   MAX_IN_FLIGHT, MAX_SAMPLES_PER_PASS, SLICE_ROWS, SCROLL_QUIET_MS, SETTLE_MS, PREVIEW_BUDGET_MS,
   PREVIEW_MAX_DIV, MESH_GUESS_MS, PREVIEW_HOLD_SPP, SOBOL_UNIFORM, E_SIZE, E_LAYERS, LUT_SIZE, LUT_URL, INDIRECT_CLAMP,
   CYC_Z, CYC_R, ENV_BACKDROP_BLUR, BALL_X, RIG_AMBIENT,
@@ -27,11 +27,17 @@ import { E_TABLE_WGSL, MIP_WGSL, DISPLAY_WGSL, DISPLAY, DENOISE_PREP_WGSL, ATROU
 import { SCENE, PASS, PASS_STRIDE, matWords, MAX_MATS, MAT_VEC4S } from './sceneLayout'
 
 const MAX_DISPATCHES = 64 // pass-uniform slots per frame (a frame issues a slice or two)
-const TIMED_PER_FRAME = 4 // timestamp pairs per frame
+const TIMED_PER_FRAME = 16 // timestamp pairs per frame (a frame can issue several slices)
+const MAX_SLICES_PER_FRAME = 16
 const TIMING_SLOTS = 4 // frames whose timestamps can be in flight at once
-// Slices down to single rows (the WebGL engine stops at 128), so that the heaviest scenes (a uranium glass model
-// under the black light: seconds per full-frame sample) still keep each dispatch within a frame.
-const GPU_MAX_SLICES = 512
+// Slices are at least this many rows tall. Thinner ones bound nothing (a single row through a uranium glass model
+// can take 80 ms) and keep too little of the GPU busy: on the car, 512 one-row slices rendered 3 samples in 15 s
+// where 64 rendered 15, with no worse frames. Several slices go into one frame when they fit (see traceSlice).
+const MIN_SLICE_ROWS = 8
+// The GPU time a frame may spend tracing (the WebGL engine's FRAME_BUDGET_MS is 10). Measured on an RDNA 2 iGPU:
+// about 45% more samples than 10 ms, frames as smooth while dragging and scrolling; 'health' shrinks it when frames
+// run long.
+const GPU_FRAME_BUDGET_MS = 14
 // Above this cost per full-frame sample (tonic water, uranium glass, skin), the coarse preview gives way to the
 // full-resolution image (denoised) after its first sample rather than PREVIEW_HOLD_SPP: those take seconds each.
 const HEAVY_SAMPLE_MS = 200
@@ -66,6 +72,7 @@ interface TimedDispatch {
   preview: boolean
   pass: number
   slices: number
+  slice: number
 }
 
 // float32 to IEEE half, round to nearest (for rgba16float uploads).
@@ -188,8 +195,14 @@ export class LookdevEngineGPU {
   private passId = 0
   private passTiming = new Map<number, { ns: number; frac: number; peakMs: number }>()
   private meshSlices = new Map<string, number>()
+  // Each row's GPU time per sample (from the timed slices through it), so that a frame issues as many slices as fit
+  // its budget. The slice count only bounds the costliest slice; on a model most rows cost far less (open
+  // background), and one slice per frame left the GPU mostly idle (the car: 512 frames per sample).
+  private rowCost = new Float32Array(0)
+  private rowCostKey = ''
+  private maxSlices = 64 // set from the height (MIN_SLICE_ROWS)
   private inFlight = 0
-  private budgetCap = FRAME_BUDGET_MS
+  private budgetCap = GPU_FRAME_BUDGET_MS
   private maxInFlight = MAX_IN_FLIGHT
   private previewK = 0
   private previewDirty = false
@@ -537,6 +550,7 @@ export class LookdevEngineGPU {
     if (w === this.width && h === this.height) return
     this.width = w
     this.height = h
+    this.maxSlices = Math.max(1, Math.floor(h / MIN_SLICE_ROWS))
     this.canvas.width = w
     this.canvas.height = h
     const d = this.device
@@ -715,6 +729,31 @@ export class LookdevEngineGPU {
     return this.variants.get(variantOf(this.state))?.pipeline ?? null
   }
 
+  // A slice's rows: every slice-count-th block of rows from block 'slice' (as the kernel lays them out).
+  private sliceRows(h: number, sliceCount: number, slice: number, fn: (y: number) => void) {
+    const blockRows = sliceCount === 1 ? h : Math.max(1, Math.min(SLICE_ROWS, Math.floor(h / sliceCount)))
+    for (let b = slice * blockRows; b < h; b += sliceCount * blockRows) {
+      for (let y = b; y < Math.min(h, b + blockRows); y++) fn(y)
+    }
+  }
+
+  // The predicted GPU time of a slice of the current pass, or 0 while any of its rows is unmeasured.
+  private predictSlice(slice: number) {
+    if (this.rowCostKey !== this.rowKey()) return 0
+    let ms = 0
+    let unknown = false
+    this.sliceRows(this.height, this.passSlices, slice, y => {
+      const c = this.rowCost[y]
+      if (c > 0) ms += c
+      else unknown = true
+    })
+    return unknown ? 0 : ms * this.passN
+  }
+
+  private rowKey() {
+    return `${this.costKey()}:${this.width}x${this.height}`
+  }
+
   // One dispatch of the tracer into target t: new samples per pixel, over one slice of its rows.
   private encodeTrace(
     enc: GPUCommandEncoder,
@@ -794,8 +833,12 @@ export class LookdevEngineGPU {
     }
   }
 
+  // A cost class for the pacing's measurements. Beyond the WebGL engine's (model, pass, furnace), the material
+  // and lighting: uranium glass under the black light costs some 20 times plastic on the same model, and planning
+  // its first passes from plastic's timings packed whole frames with slices of it.
   private costKey() {
-    return `${this.state.model}:${this.state.pass}:${this.state.furnace ? 1 : 0}`
+    const s = this.state
+    return `${s.model}:${s.pass}:${s.furnace ? 1 : 0}:${variantOf(s)}:${s.hero}:${s.keyType}:${s.env}`
   }
 
   private showingPreview() {
@@ -871,7 +914,7 @@ export class LookdevEngineGPU {
     const w = Math.ceil(this.width / k), h = Math.ceil(this.height / k)
     const enc = this.device.createCommandEncoder()
     const times = this.timesSlot()
-    this.encodeTrace(enc, t, w, h, [this.width / k, this.height / k], 0, 1, 1, 0, this.previewBounces, { n: 1, frac: 1 / (k * k), cost: this.costKey(), preview: true, pass: -1, slices: 1 }, times)
+    this.encodeTrace(enc, t, w, h, [this.width / k, this.height / k], 0, 1, 1, 0, this.previewBounces, { n: 1, frac: 1 / (k * k), cost: this.costKey(), preview: true, pass: -1, slices: 1, slice: 0 }, times)
     this.previewK = k
     this.previewGen = this.gen
     this.previewDirty = false
@@ -881,7 +924,7 @@ export class LookdevEngineGPU {
 
   private planPass() {
     // Before a full pass is measured, the preview's measured cost beats a guess.
-    const ms = this.fullSampleMs() ?? (this.state.model === 'spheres' ? undefined : MESH_GUESS_MS)
+    const ms = this.fullSampleMs()
     let n = 1
     if (ms !== undefined && !this.interacting && 2 * ms * n <= this.budgetMs()) {
       n = Math.max(n, Math.min(MAX_SAMPLES_PER_PASS, Math.floor(this.budgetMs() / (2 * ms))))
@@ -895,11 +938,13 @@ export class LookdevEngineGPU {
       slices = this.meshSlices.get(this.costKey())! * n
     } else if (ms !== undefined) {
       slices = Math.ceil((ms * n) / this.budgetMs())
+    } else if (this.state.model !== 'spheres') {
+      slices = this.maxSlices // a model scene not yet measured: the thinnest slices until its first timings
     } else {
       this.passAdaptive = true
     }
     this.passN = n
-    this.passSlices = Math.max(1, Math.min(GPU_MAX_SLICES, this.height, slices))
+    this.passSlices = Math.max(1, Math.min(this.maxSlices, this.height, slices))
     this.passSlice = 0
     this.passId++
   }
@@ -908,15 +953,25 @@ export class LookdevEngineGPU {
   private traceSlice() {
     const enc = this.device.createCommandEncoder()
     const times = this.timesSlot()
-    this.encodeTrace(enc, this.full!, this.width, this.height, [this.width, this.height], this.spp, this.passN, this.passSlices, this.passSlice, this.bounces,
-      { n: this.passN, frac: 1, cost: this.costKey(), preview: false, pass: this.passId, slices: this.passSlices }, times)
-    const done = ++this.passSlice >= this.passSlices
+    const budget = this.budgetMs()
+    const predict = (i: number) => this.predictSlice(i) // 0: not yet measured
+    let used = 0
+    let issued = 0
+    let done = false
+    do {
+      const p = predict(this.passSlice)
+      this.encodeTrace(enc, this.full!, this.width, this.height, [this.width, this.height], this.spp, this.passN, this.passSlices, this.passSlice, this.bounces,
+        { n: this.passN, frac: 1, cost: this.costKey(), preview: false, pass: this.passId, slices: this.passSlices, slice: this.passSlice }, times)
+      used += p > 0 ? p : budget
+      issued++
+      done = ++this.passSlice >= this.passSlices
+    } while (!done && issued < MAX_SLICES_PER_FRAME && predict(this.passSlice) > 0 && used + predict(this.passSlice) <= budget)
     if (done) {
       this.spp += this.passN
       this.passN = 0
       if (this.passAdaptive) {
         if (this.passOverran) {
-          this.slicesGuess = Math.min(GPU_MAX_SLICES, this.slicesGuess + 1)
+          this.slicesGuess = Math.min(this.maxSlices, this.slicesGuess + 1)
           this.cleanPasses = 0
         } else if (++this.cleanPasses >= 4 && this.slicesGuess > 1) {
           this.slicesGuess--
@@ -933,6 +988,17 @@ export class LookdevEngineGPU {
   // GPU time of a finished dispatch, scaled to one full-frame sample (as the WebGL engine's collectTimings).
   private recordTiming(d: TimedDispatch, ns: number) {
     if (this.disposed || !(ns > 0)) return
+    if (!d.preview && d.slices > 1) {
+      const key = `${d.cost}:${this.width}x${this.height}`
+      if (key !== this.rowCostKey) {
+        this.rowCost = new Float32Array(this.height)
+        this.rowCostKey = key
+      }
+      let rows = 0
+      this.sliceRows(this.height, d.slices, d.slice, () => rows++)
+      const perRow = ns / 1e6 / d.n / Math.max(rows, 1)
+      this.sliceRows(this.height, d.slices, d.slice, y => { this.rowCost[y] = perRow })
+    }
     let ms = ns / 1e6 / d.frac / d.n
     if (!d.preview && !d.cost.startsWith('spheres:')) {
       const acc = this.passTiming.get(d.pass) ?? { ns: 0, frac: 0, peakMs: 0 }
@@ -949,7 +1015,7 @@ export class LookdevEngineGPU {
       const ratio = acc.peakMs / this.budgetMs()
       if (ratio > 1.15 || ratio < 0.6) {
         const now = this.meshSlices.get(d.cost) ?? d.slices
-        this.meshSlices.set(d.cost, Math.max(1, Math.min(GPU_MAX_SLICES, Math.round(now * Math.min(3, Math.max(0.7, ratio))))))
+        this.meshSlices.set(d.cost, Math.max(1, Math.min(this.maxSlices, Math.round(now * Math.min(3, Math.max(0.7, ratio))))))
       }
     }
     const model = d.preview ? this.previewMsPerSpp : this.msPerSpp

@@ -15,7 +15,7 @@ import {
   bouncesOf, goalOf, thinGlassOf, envTurnOf, sceneMaterialsOf, VARIANT_LABEL, VARIANT_GLASS, PASS_ID, VIEW_ID,
   TARGET_SPP, DENOISE_LEVELS, DENOISE_FULL_SPP, MAX_SCATTER, FURNACE_MAX_SCATTER, MAX_NODE_VISITS, FRAME_BUDGET_MS,
   MAX_IN_FLIGHT, MAX_SAMPLES_PER_PASS, SLICE_ROWS, SCROLL_QUIET_MS, SETTLE_MS, PREVIEW_BUDGET_MS,
-  MESH_GUESS_MS, PREVIEW_HOLD_SPP, SOBOL_UNIFORM, E_SIZE, E_LAYERS, LUT_SIZE, LUT_URL, INDIRECT_CLAMP,
+  PREVIEW_MAX_DIV, MESH_GUESS_MS, PREVIEW_HOLD_SPP, SOBOL_UNIFORM, E_SIZE, E_LAYERS, LUT_SIZE, LUT_URL, INDIRECT_CLAMP,
   CYC_Z, CYC_R, ENV_BACKDROP_BLUR, BALL_X, RIG_AMBIENT,
   type LabState, type LabStatus, type VariantKey, type Vec3,
 } from '../scene'
@@ -29,11 +29,12 @@ import { SCENE, PASS, PASS_STRIDE, matWords, MAX_MATS, MAT_VEC4S } from './scene
 const MAX_DISPATCHES = 64 // pass-uniform slots per frame (a frame issues a slice or two)
 const TIMED_PER_FRAME = 4 // timestamp pairs per frame
 const TIMING_SLOTS = 4 // frames whose timestamps can be in flight at once
-// Pacing limits beyond the WebGL engine's: slices down to single rows, and a coarser preview, so that the heaviest
-// scenes (a uranium glass model under the black light: seconds per full-frame sample) still keep each dispatch
-// within a frame and the page painting.
+// Slices down to single rows (the WebGL engine stops at 128), so that the heaviest scenes (a uranium glass model
+// under the black light: seconds per full-frame sample) still keep each dispatch within a frame.
 const GPU_MAX_SLICES = 512
-const GPU_PREVIEW_MAX_DIV = 8
+// Above this cost per full-frame sample (tonic water, uranium glass, skin), the coarse preview gives way to the
+// full-resolution image (denoised) after its first sample rather than PREVIEW_HOLD_SPP: those take seconds each.
+const HEAVY_SAMPLE_MS = 200
 
 // Variants compiled ahead once the plain tracer is ready and the lab is in view, one at a time, in the order
 // visitors tend to need them. On WebGPU a pipeline compiles in the background and needs nothing more at its first
@@ -798,7 +799,14 @@ export class LookdevEngineGPU {
   }
 
   private showingPreview() {
-    return this.previewK > 0 && this.previewGen === this.gen && this.spp < Math.min(PREVIEW_HOLD_SPP, this.goal)
+    const hold = (this.fullSampleMs() ?? 0) > HEAVY_SAMPLE_MS ? 1 : PREVIEW_HOLD_SPP
+    return this.previewK > 0 && this.previewGen === this.gen && this.spp < Math.min(hold, this.goal)
+  }
+
+  // A full-frame sample's GPU time: measured, or before that the preview's (shorter paths, so scaled up).
+  private fullSampleMs() {
+    const previewMs = this.previewMsPerSpp.get(this.costKey())
+    return this.msPerSpp.get(this.costKey()) ?? (previewMs !== undefined ? 1.5 * previewMs : undefined)
   }
 
   private trackFrame(dt: number) {
@@ -818,7 +826,7 @@ export class LookdevEngineGPU {
     const key = this.costKey()
     const ms = this.previewMsPerSpp.get(key) ?? this.msPerSpp.get(key) ?? (this.state.model === 'spheres' ? 40 : MESH_GUESS_MS)
     const budget = Math.min(PREVIEW_BUDGET_MS, 0.5 * this.frameMs)
-    return Math.max(1, Math.min(GPU_PREVIEW_MAX_DIV, Math.ceil(Math.sqrt(ms / budget))))
+    return Math.max(1, Math.min(PREVIEW_MAX_DIV, Math.ceil(Math.sqrt(ms / budget))))
   }
 
   // Submits a frame's commands, with its timestamps when there are any, and counts it in flight until done.
@@ -872,9 +880,8 @@ export class LookdevEngineGPU {
   }
 
   private planPass() {
-    // Before a full pass is measured, the preview's measured cost (shorter paths, so scaled up) beats a guess.
-    const previewMs = this.previewMsPerSpp.get(this.costKey())
-    const ms = this.msPerSpp.get(this.costKey()) ?? (previewMs !== undefined ? 1.5 * previewMs : this.state.model === 'spheres' ? undefined : MESH_GUESS_MS)
+    // Before a full pass is measured, the preview's measured cost beats a guess.
+    const ms = this.fullSampleMs() ?? (this.state.model === 'spheres' ? undefined : MESH_GUESS_MS)
     let n = 1
     if (ms !== undefined && !this.interacting && 2 * ms * n <= this.budgetMs()) {
       n = Math.max(n, Math.min(MAX_SAMPLES_PER_PASS, Math.floor(this.budgetMs() / (2 * ms))))

@@ -25,6 +25,7 @@ import WorkIndicator from './WorkIndicator'
 // ?renderer=webgl forces the WebGL one (for comparing the two).
 type Engine = LookdevEngine | LookdevEngineGPU
 const noSubscribe = () => () => {}
+const stamped = (line: string) => `${line} (at ${(performance.now() / 1000).toFixed(1)} s)`
 // The ?debug readout: the renderer in use, the GPU it reports, and on WebGL why WebGPU was not used.
 function describeRenderer(e: LookdevEngine | LookdevEngineGPU, gpuFailed: boolean): string {
   if (e instanceof LookdevEngineGPU) return `WebGPU, ${e.adapterName}`
@@ -406,22 +407,30 @@ export default function LookdevLab() {
   // ?debug shows which renderer runs and on what GPU (for checking devices: an iPhone, a friend's laptop).
   const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
   const [rendererInfo, setRendererInfo] = useState('')
-  const [debugStage, setDebugStage] = useState('') // where startup got to, and when
-  const [debugError, setDebugError] = useState('') // the last error on the page, of any kind
+  // Startup stages, warnings and errors, oldest first (the last ten), each stamped with seconds since the page
+  // opened. It outlives a switch to a fresh canvas, so a WebGPU failure and the WebGL attempt after it both show.
+  const [debugLog, setDebugLog] = useState<string[]>([])
   useEffect(() => {
     if (!debugOn) return
-    const text = (x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 240)
-    const onError = (ev: ErrorEvent) => setDebugError(text(ev.error ?? ev.message))
-    const onRejection = (ev: PromiseRejectionEvent) => setDebugError(text(ev.reason))
+    const add = (line: string) => setDebugLog(l => [...l.slice(-9), stamped(line)])
+    const text = (args: unknown[]) => args.map(x => (x instanceof Error ? x.message : String(x))).join(' ').slice(0, 240)
+    const onError = (ev: ErrorEvent) => add(`error: ${text([ev.error ?? ev.message])}`)
+    const onRejection = (ev: PromiseRejectionEvent) => add(`error: ${text([ev.reason])}`)
     const consoleError = console.error
+    const consoleWarn = console.warn
     console.error = (...args: unknown[]) => {
-      setDebugError(args.map(text).join(' ').slice(0, 240))
+      add(`error: ${text(args)}`)
       consoleError(...args)
+    }
+    console.warn = (...args: unknown[]) => {
+      add(`warning: ${text(args)}`)
+      consoleWarn(...args)
     }
     window.addEventListener('error', onError)
     window.addEventListener('unhandledrejection', onRejection)
     return () => {
       console.error = consoleError
+      console.warn = consoleWarn
       window.removeEventListener('error', onError)
       window.removeEventListener('unhandledrejection', onRejection)
     }
@@ -514,6 +523,13 @@ export default function LookdevLab() {
             e?.dispose()
             return
           }
+          if (!e) {
+            // WebGPU may have taken this canvas before failing (a canvas keeps its first kind of context):
+            // WebGL goes on a fresh one.
+            stage('WebGPU did not start; WebGL next, on a fresh canvas')
+            setGpuFailed(true)
+            return
+          }
         }
         if (!e) stage('starting WebGL')
         e ??= new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
@@ -549,7 +565,7 @@ export default function LookdevLab() {
       }
     }
     // The ?debug readout's stage line: what startup is doing, stamped with seconds since the page opened.
-    const stage = (what: string) => setDebugStage(`${what} (at ${(performance.now() / 1000).toFixed(1)} s)`)
+    const stage = (what: string) => setDebugLog(l => [...l.slice(-9), stamped(what)])
 
     const start = () => {
       if (started) return
@@ -938,8 +954,7 @@ export default function LookdevLab() {
         {debugOn && (
           <div className="lab-hud lab-hud-bottom">
             {`Renderer: ${rendererInfo || 'not started yet (it starts when the page rests near the lab)'}`}
-            {debugStage && `\nStage: ${debugStage}`}
-            {debugError && `\nLast error: ${debugError}`}
+            {debugLog.map(line => `\n${line}`).join('')}
           </div>
         )}
         {mode === 'fallback' && (

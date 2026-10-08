@@ -113,7 +113,10 @@ export class LookdevEngineGPU {
     if (!LookdevEngineGPU.detect()) return null
     try {
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
-      if (!adapter) return null
+      if (!adapter) {
+        console.warn('WebGPU: the browser offered no adapter')
+        return null
+      }
       const features: GPUFeatureName[] = adapter.features.has('timestamp-query') ? ['timestamp-query'] : []
       const lim = adapter.limits
       const device = await adapter.requestDevice({
@@ -126,6 +129,7 @@ export class LookdevEngineGPU {
       })
       const ctx = canvas.getContext('webgpu')
       if (!ctx) {
+        console.warn('WebGPU: the canvas gave no webgpu context')
         device.destroy()
         return null
       }

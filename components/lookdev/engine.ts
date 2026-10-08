@@ -77,6 +77,8 @@ export class LookdevEngine {
   readonly canDenoise: boolean
   // The tracer's target set, for the lab's ?debug readout (see the constructor).
   readonly targetsNote: string
+  // The canvas this renderer made for itself when the lab's was taken (removed on dispose), or null.
+  private ownCanvas: HTMLCanvasElement | null = null
   private progPrep: WebGLProgram | null = null
   private progAtrous: WebGLProgram | null = null
   private dnTex: WebGLTexture[] = []
@@ -169,14 +171,34 @@ export class LookdevEngine {
     private onLost?: () => void,
   ) {
     this.state = { ...initial }
-    const gl = canvas.getContext('webgl2', {
+    const attrs: WebGLContextAttributes = {
       alpha: false,
       antialias: false,
       depth: false,
       stencil: false,
       preserveDrawingBuffer: false,
       powerPreference: 'high-performance',
-    })
+    }
+    let gl = canvas.getContext('webgl2', attrs)
+    if (!gl || gl.isContextLost()) {
+      // Something outside the page's code can take the lab's canvas first (seen in Safari on an iPad and an
+      // iPhone): with another kind of context, or a WebGL one since lost. Then the renderer draws on a canvas of
+      // its own, claimed before it joins the page and laid over the lab's, which keeps the pointer, keys and focus.
+      const own = document.createElement('canvas')
+      const ownGl = own.getContext('webgl2', attrs)
+      const had = gl ? 'a lost webgl2 context' : 'no webgl2 context'
+      console.warn(`WebGL: the canvas gave ${had}; ${ownGl ? 'drawing on one of its own' : 'nor did one of its own'}`)
+      if (ownGl) {
+        own.className = 'lab-canvas-own'
+        own.setAttribute('aria-hidden', 'true')
+        canvas.after(own)
+        // The lab listens for a restored context on its canvas.
+        own.addEventListener('webglcontextrestored', () => canvas.dispatchEvent(new Event('webglcontextrestored')))
+        this.canvas = own
+        this.ownCanvas = own
+      }
+      gl = ownGl
+    }
     if (!gl) throw new Error('WebGL2 unavailable')
     this.gl = gl
 
@@ -189,8 +211,19 @@ export class LookdevEngine {
     const half = full || gl.getExtension('EXT_color_buffer_half_float') ? { internal: gl.RGBA16F, type: gl.HALF_FLOAT } : null
     const six = gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 6 && gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) >= 6
     const sets = ([[6, full], [6, half], [4, full], [4, half]] as const).filter(([n, f]) => f && (n === 4 || six))
-    const pick = sets.find(([n, f]) => this.targetsFit(n, f!))
-    if (!pick) throw new Error('Float render targets unavailable')
+    const tried: string[] = []
+    const pick = sets.find(([n, f]) => {
+      const { status, texError } = this.targetsStatus(n, f!)
+      const hex = (x: number) => `0x${x.toString(16)}`
+      tried.push(`${n} ${f === full ? 'full' : 'half'}: ${status === gl.FRAMEBUFFER_COMPLETE ? 'ok' : hex(status)}${texError ? ` (texture ${hex(texError)})` : ''}`)
+      return status === gl.FRAMEBUFFER_COMPLETE
+    })
+    if (!pick) {
+      // Said in full for the lab's ?debug readout: each set's framebuffer status, and the float extensions offered.
+      const offered = (gl.getSupportedExtensions() ?? []).filter(x => /float|half/i.test(x)).join(', ') || 'none'
+      const lost = gl.isContextLost() ? 'context lost; ' : ''
+      throw new Error(`Float render targets unavailable (${lost}${tried.join('; ') || 'no set to try'}; offers ${offered})`)
+    }
     this.accumFmt = pick[1]!
     this.canDenoise = pick[0] === 6
     this.targetsNote = `${pick[0]} ${this.accumFmt.type === gl.FLOAT ? 'full' : 'half'}-float targets`
@@ -220,7 +253,7 @@ export class LookdevEngine {
     this.eTableT = this.createAlbedoTexture()
     this.loadAcesLut()
 
-    canvas.addEventListener('webglcontextlost', this.handleLost)
+    this.canvas.addEventListener('webglcontextlost', this.handleLost)
     // A wheel can arrive before the scroll it causes (or scroll nothing at the end of the page).
     window.addEventListener('scroll', this.handleScroll, { passive: true })
     window.addEventListener('wheel', this.handleScroll, { passive: true })
@@ -521,18 +554,21 @@ export class LookdevEngine {
     }
   }
 
-  // Whether the GPU takes n color targets of this format in one framebuffer (tried at 1x1).
-  private targetsFit(n: number, fmt: { internal: number; type: number }) {
+  // Whether the GPU takes n color targets of this format in one framebuffer (tried at 1x1): the framebuffer's
+  // status, and any error from making the textures.
+  private targetsStatus(n: number, fmt: { internal: number; type: number }) {
     const gl = this.gl
+    while (gl.getError() !== gl.NO_ERROR) {}
     const tex = Array.from({ length: n }, () => this.makeTex(1, 1, fmt.internal, fmt.type))
+    const texError = gl.getError()
     const fbo = gl.createFramebuffer()!
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     tex.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0))
-    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.deleteFramebuffer(fbo)
     tex.forEach(t => gl.deleteTexture(t))
-    return ok
+    return { status, texError }
   }
 
   private makeTex(w: number, h: number, internal: number, type: number) {
@@ -1345,5 +1381,6 @@ export class LookdevEngine {
     this.previewTex.forEach(t => gl.deleteTexture(t))
     if (this.previewFbo) gl.deleteFramebuffer(this.previewFbo)
     gl.deleteVertexArray(this.vao)
+    this.ownCanvas?.remove()
   }
 }

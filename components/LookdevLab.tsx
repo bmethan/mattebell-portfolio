@@ -414,7 +414,7 @@ export default function LookdevLab() {
   useEffect(() => {
     if (!debugOn) return
     const add = (line: string) => setDebugLog(l => [...l.slice(-13), stamped(line)])
-    const text = (args: unknown[]) => args.map(x => (x instanceof Error ? x.message : String(x))).join(' ').slice(0, 240)
+    const text = (args: unknown[]) => args.map(x => (x instanceof Error ? x.message : String(x))).join(' ').slice(0, 480)
     const onError = (ev: ErrorEvent) => add(`error: ${text([ev.error ?? ev.message])}`)
     const onRejection = (ev: PromiseRejectionEvent) => add(`error: ${text([ev.reason])}`)
     const consoleError = console.error
@@ -505,8 +505,8 @@ export default function LookdevLab() {
     let started = false
     let io: IntersectionObserver | null = null
 
-    const fallback = () => {
-      setRendererInfo('none: this browser offers neither WebGPU nor WebGL2')
+    const fallback = (why = 'this browser offers neither WebGPU nor WebGL2') => {
+      setRendererInfo(`none: ${why}`)
       engine?.dispose()
       engine = null
       engineRef.current = null
@@ -552,17 +552,17 @@ export default function LookdevLab() {
             if (ok) stage('ready')
           },
           err => {
-            stage(`failed: ${((x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 240))(err)}`)
+            stage(`failed: ${((x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 480))(err)}`)
             console.error(err)
             if (engine !== e) return
             if (e instanceof LookdevEngineGPU) setGpuFailed(true)
-            else fallback()
+            else fallback('WebGL failed (below)')
           },
         )
       } catch (err) {
-        stage(`failed to start: ${((x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 240))(err)}`)
+        stage(`failed to start: ${((x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 480))(err)}`)
         console.error(err)
-        fallback()
+        fallback('the renderer failed to start (below)')
       }
     }
     // The ?debug readout's stage line: what startup is doing, stamped with seconds since the page opened.

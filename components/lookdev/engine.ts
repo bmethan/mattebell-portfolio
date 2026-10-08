@@ -75,6 +75,8 @@ export class LookdevEngine {
   private progDisplay: WebGLProgram
   // The denoiser needs the tracer's two extra images (six render targets at once).
   readonly canDenoise: boolean
+  // The tracer's target set, for the lab's ?debug readout (see the constructor).
+  readonly targetsNote: string
   private progPrep: WebGLProgram | null = null
   private progAtrous: WebGLProgram | null = null
   private dnTex: WebGLTexture[] = []
@@ -178,22 +180,30 @@ export class LookdevEngine {
     if (!gl) throw new Error('WebGL2 unavailable')
     this.gl = gl
 
-    if (gl.getExtension('EXT_color_buffer_float')) {
-      this.accumFmt = { internal: gl.RGBA32F, type: gl.FLOAT }
-    } else if (gl.getExtension('EXT_color_buffer_half_float')) {
+    // The tracer draws its four light-group images, plus the denoiser's two where it can, in one pass. iPhone-class
+    // GPUs (Metal, through ANGLE) take at most 512 bits per pixel across a draw's color targets (ANGLE's
+    // kMaxColorTargetBitsApple4Plus; Macs and M-series iPads have no cap), and refuse a larger set: six RGBA32F
+    // images are 768, so on an iPhone (iOS 18) every sample failed and the image stayed black. The first set the
+    // GPU takes wins: six full floats; six half floats (the denoiser kept); four full floats; four half floats.
+    const full = gl.getExtension('EXT_color_buffer_float') ? { internal: gl.RGBA32F, type: gl.FLOAT } : null
+    const half = full || gl.getExtension('EXT_color_buffer_half_float') ? { internal: gl.RGBA16F, type: gl.HALF_FLOAT } : null
+    const six = gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 6 && gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) >= 6
+    const sets = ([[6, full], [6, half], [4, full], [4, half]] as const).filter(([n, f]) => f && (n === 4 || six))
+    const pick = sets.find(([n, f]) => this.targetsFit(n, f!))
+    if (!pick) throw new Error('Float render targets unavailable')
+    this.accumFmt = pick[1]!
+    this.canDenoise = pick[0] === 6
+    this.targetsNote = `${pick[0]} ${this.accumFmt.type === gl.FLOAT ? 'full' : 'half'}-float targets`
+    if (this.accumFmt.type === gl.HALF_FLOAT) {
       // Half-float running means stop absorbing small updates once the blend weight drops below the format's
       // resolution, so cap the sample count on this path.
-      this.accumFmt = { internal: gl.RGBA16F, type: gl.HALF_FLOAT }
       this.target = Math.min(this.target, HALF_FLOAT_MAX_SPP)
-    } else {
-      throw new Error('Float render targets unavailable')
     }
 
     this.vao = gl.createVertexArray()!
     this.timer = gl.getExtension('EXT_disjoint_timer_query_webgl2')
     const parallel = !!gl.getExtension('KHR_parallel_shader_compile')
     this.parallel = parallel
-    this.canDenoise = gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 6 && gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) >= 6
     this.progTrace = startProgram(gl, traceFrag(false, 'none', this.canDenoise))
     if (this.canDenoise) {
       this.progPrep = startProgram(gl, DENOISE_PREP_FRAG)
@@ -509,6 +519,20 @@ export class LookdevEngine {
     } catch (err) {
       console.warn('ACES 2.0 LUT unavailable; using AgX', err)
     }
+  }
+
+  // Whether the GPU takes n color targets of this format in one framebuffer (tried at 1x1).
+  private targetsFit(n: number, fmt: { internal: number; type: number }) {
+    const gl = this.gl
+    const tex = Array.from({ length: n }, () => this.makeTex(1, 1, fmt.internal, fmt.type))
+    const fbo = gl.createFramebuffer()!
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    tex.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0))
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.deleteFramebuffer(fbo)
+    tex.forEach(t => gl.deleteTexture(t))
+    return ok
   }
 
   private makeTex(w: number, h: number, internal: number, type: number) {

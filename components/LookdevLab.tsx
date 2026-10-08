@@ -36,7 +36,7 @@ function describeRenderer(e: LookdevEngine | LookdevEngineGPU, gpuFailed: boolea
     : gpuFailed ? 'WebGPU failed on this device'
     : !navigator.gpu ? 'this browser has no WebGPU'
     : 'no WebGPU adapter'
-  return `WebGL2, ${gpu} (${why})`
+  return `WebGL2, ${gpu}, ${e.targetsNote} (${why})`
 }
 const forcedWebGL = () => typeof location !== 'undefined' && new URLSearchParams(location.search).get('renderer') === 'webgl'
 
@@ -517,7 +517,7 @@ export default function LookdevLab() {
     const create = async () => {
       try {
         let e: Engine | null = null
-        if (!gpuFailed && !forcedWebGL()) {
+        if (!gpuFailed && !forcedWebGL() && LookdevEngineGPU.detect()) {
           stage(`starting WebGPU, on ${startedBy}`)
           e = await LookdevEngineGPU.create(canvas, handleStatus, labRef.current, onDeviceLost)
           if (unmounted) {

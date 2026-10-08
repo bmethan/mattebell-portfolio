@@ -25,6 +25,18 @@ import WorkIndicator from './WorkIndicator'
 // ?renderer=webgl forces the WebGL one (for comparing the two).
 type Engine = LookdevEngine | LookdevEngineGPU
 const noSubscribe = () => () => {}
+// The ?debug readout: the renderer in use, the GPU it reports, and on WebGL why WebGPU was not used.
+function describeRenderer(e: LookdevEngine | LookdevEngineGPU, gpuFailed: boolean): string {
+  if (e instanceof LookdevEngineGPU) return `WebGPU, ${e.adapterName}`
+  const gl = (e as unknown as { gl?: WebGL2RenderingContext }).gl
+  const ext = gl?.getExtension('WEBGL_debug_renderer_info')
+  const gpu = gl ? String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) : 'unknown GPU'
+  const why = forcedWebGL() ? 'forced by ?renderer=webgl'
+    : gpuFailed ? 'WebGPU failed on this device'
+    : !navigator.gpu ? 'this browser has no WebGPU'
+    : 'no WebGPU adapter'
+  return `WebGL2, ${gpu} (${why})`
+}
 const forcedWebGL = () => typeof location !== 'undefined' && new URLSearchParams(location.search).get('renderer') === 'webgl'
 
 const PASSES: { id: Pass; label: string }[] = [
@@ -391,6 +403,9 @@ export default function LookdevLab() {
   // its first draw can freeze the page. (Server render: locked, as without WebGPU.)
   const gpuInput = useSyncExternalStore(noSubscribe, () => !!navigator.gpu && !forcedWebGL(), () => false) && !gpuFailed
   const inputOn = ready || gpuInput
+  // ?debug shows which renderer runs and on what GPU (for checking devices: an iPhone, a friend's laptop).
+  const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
+  const [rendererInfo, setRendererInfo] = useState('')
   const lastInFamily = useRef<Partial<Record<HeroFamily, Hero>>>({}) // each family's last picked material
   const [tab, setTab] = useState<ControlTab>('look')
   const startSecs = useWaitSeconds(mode === 'live' && !ready && !paused ? 'start' : null)
@@ -461,6 +476,7 @@ export default function LookdevLab() {
     let io: IntersectionObserver | null = null
 
     const fallback = () => {
+      setRendererInfo('none: this browser offers neither WebGPU nor WebGL2')
       engine?.dispose()
       engine = null
       engineRef.current = null
@@ -480,6 +496,7 @@ export default function LookdevLab() {
         }
         e ??= new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
         engine = e
+        setRendererInfo(describeRenderer(e, gpuFailed))
         engineRef.current = e
         if (process.env.NODE_ENV !== 'production') {
           ;(window as unknown as { __lookdev?: Engine }).__lookdev = e
@@ -889,6 +906,9 @@ export default function LookdevLab() {
               </div>
             )}
           </>
+        )}
+        {debugOn && (
+          <div className="lab-hud lab-hud-bottom">Renderer: {rendererInfo || 'not started yet (it starts when the page rests near the lab)'}</div>
         )}
         {mode === 'fallback' && (
           <div className="lab-hud lab-hud-left">Still frame. Your browser lacks the WebGPU or WebGL2 features the live renderer needs.</div>

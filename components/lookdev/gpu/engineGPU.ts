@@ -129,7 +129,9 @@ export class LookdevEngineGPU {
         device.destroy()
         return null
       }
-      return new LookdevEngineGPU(canvas, ctx, device, onStatus, initial, onLost)
+      const info = adapter.info
+      const name = [info?.vendor, info?.architecture, info?.description].filter(Boolean).join(' ') || 'unnamed adapter'
+      return new LookdevEngineGPU(canvas, ctx, device, onStatus, initial, onLost, name)
     } catch (err) {
       console.warn('WebGPU unavailable; using WebGL', err)
       return null
@@ -226,6 +228,9 @@ export class LookdevEngineGPU {
   private previewBounces = 3
   private sceneDirty = true
 
+  // What the browser says the GPU is (vendor, architecture, description): shown by the lab's ?debug readout.
+  readonly adapterName: string
+
   private constructor(
     private canvas: HTMLCanvasElement,
     private ctx: GPUCanvasContext,
@@ -233,7 +238,9 @@ export class LookdevEngineGPU {
     private onStatus: (s: LabStatus) => void,
     initial: LabState,
     private onLost?: () => void,
+    adapterName = '',
   ) {
+    this.adapterName = adapterName
     this.state = { ...initial }
     const d = device
     this.format = navigator.gpu.getPreferredCanvasFormat()

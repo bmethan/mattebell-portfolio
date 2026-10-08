@@ -75,13 +75,10 @@ export async function proxy(request: NextRequest): Promise<Response> {
     const form = await request.formData()
     const supplied = form.get('password')
     if (typeof supplied === 'string' && sameText(await token(supplied), expected)) {
-      return new Response(null, {
-        status: 303,
-        headers: {
-          Location: '/',
-          'Set-Cookie': `${COOKIE_NAME}=${expected}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax`,
-        },
-      })
+      // An absolute address: Next's proxy runtime rejects a relative Location ("Invalid URL").
+      const res = NextResponse.redirect(new URL('/', request.url), 303)
+      res.cookies.set(COOKIE_NAME, expected, { path: '/', maxAge: 2592000, httpOnly: true, secure: true, sameSite: 'lax' })
+      return res
     }
     return gatePage('That password is not right.')
   }

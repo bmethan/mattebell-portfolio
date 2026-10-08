@@ -245,6 +245,8 @@ export class LookdevEngineGPU {
     const d = device
     this.format = navigator.gpu.getPreferredCanvasFormat()
     ctx.configure({ device: d, format: this.format, alphaMode: 'opaque' })
+    // Validation and out-of-memory errors the code did not catch itself: on the console, where ?debug shows them.
+    d.addEventListener('uncapturederror', ev => console.error(`WebGPU error: ${(ev as GPUUncapturedErrorEvent).error.message}`))
     d.lost.then(info => {
       if (this.disposed) return
       console.warn('WebGPU device lost', info.message)

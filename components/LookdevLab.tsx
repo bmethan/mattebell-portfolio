@@ -406,6 +406,26 @@ export default function LookdevLab() {
   // ?debug shows which renderer runs and on what GPU (for checking devices: an iPhone, a friend's laptop).
   const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
   const [rendererInfo, setRendererInfo] = useState('')
+  const [debugStage, setDebugStage] = useState('') // where startup got to, and when
+  const [debugError, setDebugError] = useState('') // the last error on the page, of any kind
+  useEffect(() => {
+    if (!debugOn) return
+    const text = (x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 240)
+    const onError = (ev: ErrorEvent) => setDebugError(text(ev.error ?? ev.message))
+    const onRejection = (ev: PromiseRejectionEvent) => setDebugError(text(ev.reason))
+    const consoleError = console.error
+    console.error = (...args: unknown[]) => {
+      setDebugError(args.map(text).join(' ').slice(0, 240))
+      consoleError(...args)
+    }
+    window.addEventListener('error', onError)
+    window.addEventListener('unhandledrejection', onRejection)
+    return () => {
+      console.error = consoleError
+      window.removeEventListener('error', onError)
+      window.removeEventListener('unhandledrejection', onRejection)
+    }
+  }, [debugOn])
   const lastInFamily = useRef<Partial<Record<HeroFamily, Hero>>>({}) // each family's last picked material
   const [tab, setTab] = useState<ControlTab>('look')
   const startSecs = useWaitSeconds(mode === 'live' && !ready && !paused ? 'start' : null)
@@ -488,15 +508,18 @@ export default function LookdevLab() {
       try {
         let e: Engine | null = null
         if (!gpuFailed && !forcedWebGL()) {
+          stage('starting WebGPU')
           e = await LookdevEngineGPU.create(canvas, handleStatus, labRef.current, onDeviceLost)
           if (unmounted) {
             e?.dispose()
             return
           }
         }
+        if (!e) stage('starting WebGL')
         e ??= new LookdevEngine(canvas, handleStatus, labRef.current, onContextLost)
         engine = e
         setRendererInfo(describeRenderer(e, gpuFailed))
+        stage('compiling shaders')
         engineRef.current = e
         if (process.env.NODE_ENV !== 'production') {
           ;(window as unknown as { __lookdev?: Engine }).__lookdev = e
@@ -509,8 +532,10 @@ export default function LookdevLab() {
         e.whenReady.then(
           ok => {
             if (ok && engine === e) setReady(true)
+            if (ok) stage('ready')
           },
           err => {
+            stage(`failed: ${((x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 240))(err)}`)
             console.error(err)
             if (engine !== e) return
             if (e instanceof LookdevEngineGPU) setGpuFailed(true)
@@ -518,10 +543,13 @@ export default function LookdevLab() {
           },
         )
       } catch (err) {
+        stage(`failed to start: ${((x: unknown) => (x instanceof Error ? x.message : String(x)).slice(0, 240))(err)}`)
         console.error(err)
         fallback()
       }
     }
+    // The ?debug readout's stage line: what startup is doing, stamped with seconds since the page opened.
+    const stage = (what: string) => setDebugStage(`${what} (at ${(performance.now() / 1000).toFixed(1)} s)`)
 
     const start = () => {
       if (started) return
@@ -908,7 +936,11 @@ export default function LookdevLab() {
           </>
         )}
         {debugOn && (
-          <div className="lab-hud lab-hud-bottom">Renderer: {rendererInfo || 'not started yet (it starts when the page rests near the lab)'}</div>
+          <div className="lab-hud lab-hud-bottom">
+            {`Renderer: ${rendererInfo || 'not started yet (it starts when the page rests near the lab)'}`}
+            {debugStage && `\nStage: ${debugStage}`}
+            {debugError && `\nLast error: ${debugError}`}
+          </div>
         )}
         {mode === 'fallback' && (
           <div className="lab-hud lab-hud-left">Still frame. Your browser lacks the WebGPU or WebGL2 features the live renderer needs.</div>

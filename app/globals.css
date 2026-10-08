@@ -67,10 +67,18 @@ body {
 .lab-drag-hint::before { content: ''; width: 14px; height: 1px; background: var(--accent); opacity: 0.7; }
 .lab-drag-hint.left { flex-direction: row-reverse; transform: translate(calc(-100% - 12px), -50%); }
 .lab-marker.hinting { opacity: 1; }
+.lab-marker.off { opacity: 0.4; border-style: dashed; }
+.lab-marker.off::after { display: none; }
+.lab-drag-hint.off { opacity: 0.55; animation: none; }
+.lab-env-handle { position: absolute; left: 50%; top: 86%; width: 28px; height: 12px; margin: -6px 0 0 -14px; color: var(--accent); opacity: 0.85; pointer-events: none; filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.9)); }
+.lab-env-handle svg { display: block; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+.lab-env-handle.hinting { opacity: 1; animation: lab-env-nudge 1.6s ease-in-out 1s 3; }
+@keyframes lab-env-nudge { 0%, 100% { transform: translateX(0); } 30% { transform: translateX(-6px); } 70% { transform: translateX(6px); } }
+.lab-env-hint { left: 50%; top: 86%; transform: translate(26px, -50%); }
 .lab-marker.hinting::before { content: ''; position: absolute; inset: -1px; border: 1px solid var(--accent); border-radius: 50%; animation: lab-hint-pulse 2.4s ease-out 1s 3; opacity: 0; }
 @keyframes lab-hint-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes lab-hint-pulse { from { transform: scale(1); opacity: 0.7; } to { transform: scale(2.6); opacity: 0; } }
-@media (prefers-reduced-motion: reduce) { .lab-drag-hint { animation: none; } .lab-marker.hinting::before { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .lab-drag-hint { animation: none; } .lab-marker.hinting::before { animation: none; } .lab-env-handle.hinting { animation: none; } }
 .lab-ball-label { position: absolute; transform: translateX(-50%); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 4px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9); pointer-events: none; white-space: nowrap; }
 .lab-split { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px solid var(--accent); box-shadow: 0 0 3px rgba(0, 0, 0, 0.8); pointer-events: none; }
 .lab-split-label { position: absolute; top: 36px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 4px rgba(0, 0, 0, 0.85), 0 0 1px rgba(0, 0, 0, 0.9); white-space: nowrap; }

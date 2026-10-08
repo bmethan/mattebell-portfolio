@@ -56,6 +56,7 @@ const VIEWS: { id: View; label: string }[] = [
 ]
 
 const LIGHT_HINT_KEY = 'lab-light-moved'
+const ENV_HINT_KEY = 'lab-env-turned'
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it drags the light
 const POSTER_SPP = 2048 // samples per pixel of poster.jpg, the converged render of the default settings
 const START_QUIET_MS = 400 // WebGPU starts once the lab is on screen and the page has not scrolled for this long
@@ -670,20 +671,25 @@ export default function LookdevLab() {
     if (e) setLabels(e.labelPoints().map(p => e.project(p)))
   }, [lab.model, lab.modelYaw, lab.chart, status.model, ready])
 
-  // "Drag me" by the key light's marker until the visitor first moves the light (remembered on this device).
-  const [lightMoved, setLightMoved] = useState(true) // until read below, so the hint never flashes for returners
+  // "Drag me" by the key light's marker until the visitor first moves the light, and "Drag to turn" by the
+  // environment's handle until they first turn it (each remembered on this device).
+  const [hintsDone, setHintsDone] = useState({ light: true, env: true }) // until read below: no flash for returners
   useEffect(() => {
-    try {
-      setLightMoved(localStorage.getItem(LIGHT_HINT_KEY) === '1')
-    } catch {
-      setLightMoved(false)
+    const seen = (key: string) => {
+      try {
+        return localStorage.getItem(key) === '1'
+      } catch {
+        return false
+      }
     }
+    setHintsDone({ light: seen(LIGHT_HINT_KEY), env: seen(ENV_HINT_KEY) })
   }, [])
-  const noteLightMoved = () => {
-    if (lightMoved) return
-    setLightMoved(true)
+  const lightMoved = hintsDone.light
+  const noteHintDone = (which: 'light' | 'env') => {
+    if (hintsDone[which]) return
+    setHintsDone(h => ({ ...h, [which]: true }))
     try {
-      localStorage.setItem(LIGHT_HINT_KEY, '1')
+      localStorage.setItem(which === 'light' ? LIGHT_HINT_KEY : ENV_HINT_KEY, '1')
     } catch {}
   }
 
@@ -691,7 +697,7 @@ export default function LookdevLab() {
   // the drag starts, a full turn across the image's width.
   const turnsEnv = !lab.key && lab.env !== 'none'
   const setFromPointer = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    noteLightMoved()
+    noteHintDone(turnsEnv ? 'env' : 'light')
     const r = e.currentTarget.getBoundingClientRect()
     const u = clamp((e.clientX - r.left) / r.width, 0, 1)
     const v = clamp((e.clientY - r.top) / r.height, 0, 1)
@@ -746,6 +752,7 @@ export default function LookdevLab() {
     let { keyAz, keyEl } = labRef.current // held keys repeat faster than React re-renders
     if (turnsEnv && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
       e.preventDefault()
+      noteHintDone('env')
       const r = labRef.current.envRot + (e.key === 'ArrowLeft' ? -s : s)
       update({ envRot: Math.atan2(Math.sin(r), Math.cos(r)) })
       return
@@ -756,7 +763,7 @@ export default function LookdevLab() {
     else if (e.key === 'ArrowDown') keyEl -= s
     else return
     e.preventDefault()
-    noteLightMoved()
+    noteHintDone('light')
     update({ keyAz: clamp(keyAz, -AZ_RANGE / 2, AZ_RANGE / 2), keyEl: clamp(keyEl, EL_MIN, EL_MAX) })
   }
 
@@ -939,6 +946,37 @@ export default function LookdevLab() {
                 className={`lab-marker${lightMoved ? '' : ' hinting'}`}
                 style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }}
               />
+            )}
+            {/* With the key off and no environment, the marker stays where the key would be, faded and named, so
+                it is clear why nothing lights up. */}
+            {!lab.key && !turnsEnv && !lab.furnace && (
+              <>
+                <div className="lab-marker off" style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }} />
+                <div
+                  className={`lab-drag-hint off${markerX > 70 ? ' left' : ''}`}
+                  style={{ left: `${markerX}%`, top: `${clamp(markerY, 0, 100)}%` }}
+                  aria-hidden="true"
+                >
+                  Key off
+                </div>
+              </>
+            )}
+            {/* An environment lighting the scene alone: a drag turns it, and a two-way handle says so where the
+                circle was (the key light, and its marker, are off). */}
+            {turnsEnv && !lab.furnace && (
+              <>
+                <div className={`lab-env-handle${hintsDone.env ? '' : ' hinting'}`} aria-hidden="true">
+                  <svg viewBox="0 0 28 12" width="28" height="12">
+                    <path d="M1.5 6h25M5.5 2 1.5 6l4 4M22.5 2l4 4-4 4" />
+                  </svg>
+                </div>
+                {!hintsDone.env && (
+                  <div className="lab-drag-hint lab-env-hint" aria-hidden="true">
+                    <span className="lab-howto-pointer">Drag to turn</span>
+                    <span className="lab-howto-touch">Swipe to turn</span>
+                  </div>
+                )}
+              </>
             )}
             {lab.key && !lab.furnace && !lightMoved && (
               <div

@@ -1,7 +1,7 @@
 'use client'
 import { useState } from 'react'
 
-const LINKS = ['Services', 'Work', 'Skills', 'About', 'Contact']
+const LINKS = ['Services', 'Work', 'Skills', 'Lab', 'About', 'Contact']
 
 export default function Nav({ available }: { available: boolean }) {
   const [open, setOpen] = useState(false)

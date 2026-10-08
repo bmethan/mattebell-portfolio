@@ -518,7 +518,7 @@ export default function LookdevLab() {
       try {
         let e: Engine | null = null
         if (!gpuFailed && !forcedWebGL()) {
-          stage('starting WebGPU')
+          stage(`starting WebGPU, on ${startedBy}`)
           e = await LookdevEngineGPU.create(canvas, handleStatus, labRef.current, onDeviceLost)
           if (unmounted) {
             e?.dispose()
@@ -568,9 +568,11 @@ export default function LookdevLab() {
     // The ?debug readout's stage line: what startup is doing, stamped with seconds since the page opened.
     const stage = (what: string) => setDebugLog(l => [...l.slice(-13), stamped(what)])
 
-    const start = () => {
+    let startedBy = ''
+    const start = (why: string) => {
       if (started) return
       started = true
+      startedBy = why
       if (LookdevEngineGPU.detect() || LookdevEngine.detect()) create()
       else fallback()
     }
@@ -616,14 +618,14 @@ export default function LookdevLab() {
     let near = false
     const armQuiet = () => {
       window.clearTimeout(quietTimer)
-      quietTimer = window.setTimeout(() => near && start(), START_QUIET_MS)
+      quietTimer = window.setTimeout(() => near && start('the page resting near the lab'), START_QUIET_MS)
     }
     const nearby = new IntersectionObserver(entries => {
       near = entries.some(en => en.isIntersecting)
       if (gpuPath && near) armQuiet()
     }, { rootMargin: '100% 0px' })
     nearby.observe(section)
-    const startNow = () => start()
+    const startNow = (ev: Event) => start(ev.type)
     if (gpuPath) {
       window.addEventListener('scroll', armQuiet, { passive: true })
       frame.addEventListener('pointerenter', startNow)
@@ -631,14 +633,14 @@ export default function LookdevLab() {
       section.addEventListener('focusin', startNow)
     } else {
       if ('requestIdleCallback' in window) {
-        const id = requestIdleCallback(start, { timeout: 4000 })
+        const id = requestIdleCallback(() => start('idle'), { timeout: 4000 })
         cancelIdle = () => cancelIdleCallback(id)
       } else {
-        const id = setTimeout(start, 2000)
+        const id = setTimeout(() => start('idle'), 2000)
         cancelIdle = () => clearTimeout(id)
       }
       // Approaching the section starts the renderer early if the idle callback has not yet.
-      io = new IntersectionObserver(entries => entries.some(en => en.isIntersecting) && start(), {
+      io = new IntersectionObserver(entries => entries.some(en => en.isIntersecting) && start('approach'), {
         rootMargin: '200px 0px',
       })
       io.observe(section)

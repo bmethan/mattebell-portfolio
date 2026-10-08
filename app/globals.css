@@ -37,6 +37,8 @@ body {
 .lab-frame { position: relative; width: 100%; aspect-ratio: 2.39 / 1; background: #060607; border: 0.5px solid var(--border); overflow: hidden; }
 .lab-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: pan-y; outline: none; }
 .lab-canvas:active { cursor: grabbing; }
+/* WebGPU's own canvas, when the lab's refused it: over the lab's canvas, which still takes the pointer. */
+.lab-canvas-own { position: absolute; inset: 0; display: block; width: 100%; height: 100%; pointer-events: none; }
 .lab-canvas:focus-visible { outline: 1px solid var(--border-teal); outline-offset: -1px; }
 /* Where :has() works, the ring is drawn above everything in the frame, since the still can cover the canvas. */
 @supports selector(:has(*)) {

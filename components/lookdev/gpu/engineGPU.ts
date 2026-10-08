@@ -107,27 +107,41 @@ export class LookdevEngineGPU {
     return typeof navigator !== 'undefined' && !!navigator.gpu
   }
 
-  // Takes the canvas's webgpu context first, then asks for an adapter and device: Safari on an iPad (iOS 27) gave
-  // no context when asked after the device. A canvas keeps its first kind of context, so when WebGPU fails after
-  // this, the lab puts the WebGL fallback on a fresh canvas. Resolves null where WebGPU is missing or refuses, and
-  // says why on the console (the lab's ?debug readout shows it).
+  // Takes the canvas's webgpu context first, then asks for an adapter and device. A canvas keeps its first kind of
+  // context, so when WebGPU fails after this, the lab puts the WebGL fallback on a fresh canvas. Resolves null where
+  // WebGPU is missing or refuses, and says why on the console (the lab's ?debug readout shows it).
+  //
+  // On an iPad (Safari, iOS 27) the lab's canvas refused a webgpu context while a new canvas gave one: something
+  // outside the page's code had taken it with another kind of context. The renderer then draws on a canvas of its
+  // own, claimed before it joins the page and laid over the refused one, which keeps the pointer, keys and focus.
   static async create(canvas: HTMLCanvasElement, onStatus: (s: LabStatus) => void, initial: LabState, onLost?: () => void) {
     if (!LookdevEngineGPU.detect()) return null
+    let own: HTMLCanvasElement | null = null
+    const fail = (why: string) => {
+      console.warn(why)
+      own?.remove()
+      return null
+    }
     try {
       let ctx = canvas.getContext('webgpu')
       if (!ctx) {
-        // A refused canvas has no context yet, so it can be asked again.
-        const probe = LookdevEngineGPU.probeContexts()
+        // A canvas refused for a passing reason has no context yet, so it can be asked again.
         await new Promise(r => setTimeout(r, 250))
         ctx = canvas.getContext('webgpu')
-        console.warn(`WebGPU: the canvas gave no webgpu context${ctx ? ' at first; a second try worked' : ''} (${probe})`)
-        if (!ctx) return null
+        if (ctx) console.warn('WebGPU: the canvas gave no webgpu context at first; a second try worked')
+      }
+      if (!ctx) {
+        const probe = LookdevEngineGPU.probeContexts(canvas)
+        own = document.createElement('canvas')
+        ctx = own.getContext('webgpu')
+        if (!ctx) return fail(`WebGPU: the canvas gave no webgpu context, nor did one of its own (${probe})`)
+        own.className = 'lab-canvas-own'
+        own.setAttribute('aria-hidden', 'true')
+        canvas.after(own)
+        console.warn(`WebGPU: the canvas gave no webgpu context; drawing on one of its own (${probe})`)
       }
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
-      if (!adapter) {
-        console.warn('WebGPU: the browser offered no adapter')
-        return null
-      }
+      if (!adapter) return fail('WebGPU: the browser offered no adapter')
       const features: GPUFeatureName[] = adapter.features.has('timestamp-query') ? ['timestamp-query'] : []
       const lim = adapter.limits
       const device = await adapter.requestDevice({
@@ -140,15 +154,20 @@ export class LookdevEngineGPU {
       })
       const info = adapter.info
       const name = [info?.vendor, info?.architecture, info?.description].filter(Boolean).join(' ') || 'unnamed adapter'
-      return new LookdevEngineGPU(canvas, ctx, device, onStatus, initial, onLost, name)
+      const engine = new LookdevEngineGPU(own ?? canvas, ctx, device, onStatus, initial, onLost, name)
+      engine.ownCanvas = own
+      return engine
     } catch (err) {
+      own?.remove()
       console.warn('WebGPU unavailable; using WebGL', err)
       return null
     }
   }
 
-  // When a canvas refuses a webgpu context: whether a new canvas, or an offscreen one, gives one (for ?debug).
-  private static probeContexts(): string {
+  // When a canvas refuses a webgpu context, for ?debug: the kind of context it holds (asking for the kind it has
+  // returns it; asking a canvas with none would claim it, which no longer matters once it has refused WebGPU), and
+  // whether a new canvas, or an offscreen one, gives a webgpu context.
+  private static probeContexts(canvas: HTMLCanvasElement): string {
     const ask = (make: () => unknown) => {
       try {
         return make() ? 'yes' : 'no'
@@ -156,9 +175,16 @@ export class LookdevEngineGPU {
         return `threw ${err instanceof Error ? err.message : String(err)}`
       }
     }
+    let held = 'none of 2d, webgl, webgl2, bitmaprenderer'
+    for (const kind of ['2d', 'webgl', 'webgl2', 'bitmaprenderer']) {
+      if (ask(() => canvas.getContext(kind)) === 'yes') {
+        held = kind
+        break
+      }
+    }
     const fresh = ask(() => document.createElement('canvas').getContext('webgpu'))
     const offscreen = typeof OffscreenCanvas === 'undefined' ? 'absent' : ask(() => new OffscreenCanvas(1, 1).getContext('webgpu'))
-    return `a new canvas: ${fresh}; an offscreen canvas: ${offscreen}`
+    return `it holds: ${held}; a new canvas: ${fresh}; an offscreen canvas: ${offscreen}`
   }
 
   readonly kind = 'webgpu'
@@ -253,6 +279,8 @@ export class LookdevEngineGPU {
 
   // What the browser says the GPU is (vendor, architecture, description): shown by the lab's ?debug readout.
   readonly adapterName: string
+  // The canvas this renderer made for itself when the lab's refused it (removed on dispose), or null.
+  private ownCanvas: HTMLCanvasElement | null = null
 
   private constructor(
     private canvas: HTMLCanvasElement,
@@ -1271,6 +1299,7 @@ export class LookdevEngineGPU {
       this.ctx.unconfigure()
     } catch {}
     this.device.destroy()
+    this.ownCanvas?.remove()
   }
 }
 

@@ -408,12 +408,12 @@ export default function LookdevLab() {
   // ?debug shows which renderer runs and on what GPU (for checking devices: an iPhone, a friend's laptop).
   const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
   const [rendererInfo, setRendererInfo] = useState('')
-  // Startup stages, warnings and errors, oldest first (the last ten), each stamped with seconds since the page
+  // Startup stages, warnings and errors, oldest first (the last fourteen), each stamped with seconds since the page
   // opened. It outlives a switch to a fresh canvas, so a WebGPU failure and the WebGL attempt after it both show.
   const [debugLog, setDebugLog] = useState<string[]>([])
   useEffect(() => {
     if (!debugOn) return
-    const add = (line: string) => setDebugLog(l => [...l.slice(-9), stamped(line)])
+    const add = (line: string) => setDebugLog(l => [...l.slice(-13), stamped(line)])
     const text = (args: unknown[]) => args.map(x => (x instanceof Error ? x.message : String(x))).join(' ').slice(0, 240)
     const onError = (ev: ErrorEvent) => add(`error: ${text([ev.error ?? ev.message])}`)
     const onRejection = (ev: PromiseRejectionEvent) => add(`error: ${text([ev.reason])}`)
@@ -566,7 +566,7 @@ export default function LookdevLab() {
       }
     }
     // The ?debug readout's stage line: what startup is doing, stamped with seconds since the page opened.
-    const stage = (what: string) => setDebugLog(l => [...l.slice(-9), stamped(what)])
+    const stage = (what: string) => setDebugLog(l => [...l.slice(-13), stamped(what)])
 
     const start = () => {
       if (started) return
@@ -589,9 +589,17 @@ export default function LookdevLab() {
       setPaused(false)
       create()
     }
-    // WebGPU has no restore event: a lost device is replaced with a new one.
+    // WebGPU has no restore event: a lost device is replaced with a new one, twice at most; a device that keeps
+    // being lost hands over to WebGL (on a fresh canvas).
+    let devicesLost = 0
     const onDeviceLost = () => {
       onContextLost()
+      if (++devicesLost > 2) {
+        stage('WebGPU device lost three times; WebGL next, on a fresh canvas')
+        setPaused(false)
+        setGpuFailed(true)
+        return
+      }
       setTimeout(() => !unmounted && onContextRestored(), 1000)
     }
     canvas.addEventListener('webglcontextrestored', onContextRestored)

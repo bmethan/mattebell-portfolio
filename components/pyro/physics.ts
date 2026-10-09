@@ -32,8 +32,9 @@ export const SCHMIDT_T = 0.5
 // plume (without them the plume stays three to four times too hot), so synthetic turbulence stands in for them, at
 // the strength of eddies of the fire's own velocity: TURB_C u^2 / l, with u = 1.9 Q^(1/5) m/s (McCaffrey's velocity
 // scale, Q in kW) and l the noise's scale. TURB_C was calibrated once, on an 80 kW fire, against McCaffrey's measured
-// plume temperatures; other fire sizes then follow from the scaling.
-export const TURB_C = 0.022
+// centreline temperatures (balancing the intermittent flame against the plume above), with FDS's mixing time in the
+// combustion; other fire sizes then follow from the scaling.
+export const TURB_C = 0.025
 export const fireTurbulence = (kW: number, scale: number) => (TURB_C * (1.9 * kW ** 0.2) ** 2) / scale
 
 // Soot optics. Mass-specific extinction of flame-generated smoke, 8.7 m2/g at 633 nm (Mulholland and Croarkin

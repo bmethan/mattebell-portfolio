@@ -73,13 +73,41 @@ fn riseOf(s: vec4<f32>) -> f32 {
   return s.y;
 }
 
+// The resolved strain rate at a cell, |S| = sqrt(2 S_ij S_ij), from central differences of the cell-centred velocity.
+const C_S = ${wf(SMAGORINSKY)};
+fn cellVel(vt: texture_3d<f32>, c0: vec3<i32>) -> vec3<f32> {
+  let c = clamp(c0, vec3<i32>(0), nCells() - 1);
+  let a = textureLoad(vt, c, 0);
+  return 0.5 * vec3<f32>(a.x + textureLoad(vt, c + X, 0).x, a.y + textureLoad(vt, c + Y, 0).y, a.z + textureLoad(vt, c + Z, 0).z);
+}
+fn strainRate(vt: texture_3d<f32>, c: vec3<i32>) -> f32 {
+  let h = 2.0 * P.grid.x;
+  let gx = (cellVel(vt, c + X) - cellVel(vt, c - X)) / h;
+  let gy = (cellVel(vt, c + Y) - cellVel(vt, c - Y)) / h;
+  let gz = (cellVel(vt, c + Z) - cellVel(vt, c - Z)) / h;
+  let sxy = 0.5 * (gy.x + gx.y);
+  let sxz = 0.5 * (gz.x + gx.z);
+  let syz = 0.5 * (gz.y + gy.z);
+  return sqrt(2.0 * (gx.x * gx.x + gy.y * gy.y + gz.z * gz.z + 2.0 * (sxy * sxy + sxz * sxz + syz * syz)));
+}
+// How long fuel and air take to mix in a cell, as FDS models it: the faster of the subgrid turbulence's time,
+// C_u dx / sqrt(2/3 k_sgs) (C_u = 0.4, which FDS calibrated against Heskestad's flame heights; k_sgs from the eddy
+// viscosity, (C_s dx)^2 |S| = 0.1 dx sqrt(k_sgs), Deardorff's relation) and the buoyant time sqrt(2 dx / g). No
+// faster than a turbulent flame's 100 m/s crossing the cell.
+fn mixTime(strain: f32) -> f32 {
+  let dx = P.grid.x;
+  let sqrtK = C_S * C_S * dx * strain / 0.1;
+  let tauU = 0.4 * dx / max(0.8164966 * sqrtK, 1e-6);
+  return max(min(tauU, P.fire2.y), dx / 100.0);
+}
+
 // Fast chemistry, mixing-limited (the eddy dissipation concept, as NIST's Fire Dynamics Simulator uses it): in each
 // cell, fuel burns with the oxygen mixed in with it as fast as turbulence mixes them, at min(Y_fuel, Y_O2 / s) /
 // tau_mix. The oxygen is what the air brought (the mixture fraction says how much of the gas is air) less what burning
 // has used. Returns the mass fraction of fuel burned in dt.
-fn fuelBurned(g: Gas, dt: f32) -> f32 {
+fn fuelBurned(g: Gas, dt: f32, tau: f32) -> f32 {
   let yO2 = Y_O2_AIR * (1.0 - g.z) - S_O2 * (g.z - g.fuel);
-  return min(g.fuel, max(yO2, 0.0) / S_O2) * (1.0 - exp(-dt / P.fire2.y));
+  return min(g.fuel, max(yO2, 0.0) / S_O2) * (1.0 - exp(-dt / tau));
 }
 // The fuel the bed gives off into a cell in dt, per unit of the cell's mass: the rate that releases the chosen heat,
 // spread over the bed's surface in proportion to its mask (the mask's area as measured last step; before that, its
@@ -932,7 +960,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     g.fuel = (g.fuel + a) / (1.0 + a);
     g.soot = g.soot / (1.0 + a);
     // Burning: the fuel burned heats the gas (less the share radiated away) and leaves soot at the fuel's yield.
-    let burned = fuelBurned(g, dt);
+    let burned = fuelBurned(g, dt, mixTime(strainRate(vel, c)));
     hrr[cellIndex(c)] = burned * HEAT * RHO_T / (T_AMB + g.rise) / dt;
     g.fuel -= burned;
     g.rise = min(g.rise + heatRise(burned), 2200.0);
@@ -960,14 +988,7 @@ ${SIM_COMMON}
 @group(0) @binding(1) var vel: texture_3d<f32>;
 @group(0) @binding(2) var src: texture_3d<f32>;
 @group(0) @binding(3) var dst: texture_storage_3d<rgba16float, write>;
-const C_S = ${wf(SMAGORINSKY)};
 const SC_T = ${wf(SCHMIDT_T)};
-
-fn vc(c0: vec3<i32>) -> vec3<f32> {
-  let c = clamp(c0, vec3<i32>(0), nCells() - 1);
-  let a = textureLoad(vel, c, 0);
-  return 0.5 * vec3<f32>(a.x + textureLoad(vel, c + X, 0).x, a.y + textureLoad(vel, c + Y, 0).y, a.z + textureLoad(vel, c + Z, 0).z);
-}
 fn at(c: vec3<i32>) -> vec4<f32> { return textureLoad(src, clamp(c, vec3<i32>(0), nCells() - 1), 0); }
 
 @compute @workgroup_size(4, 4, 4)
@@ -975,15 +996,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let c = vec3<i32>(id);
   if (any(c >= nCells())) { return; }
   let dx = P.grid.x;
-  // The resolved strain rate, |S| = sqrt(2 S_ij S_ij), from central differences of the cell-centred velocity.
-  let gx = (vc(c + X) - vc(c - X)) / (2.0 * dx);
-  let gy = (vc(c + Y) - vc(c - Y)) / (2.0 * dx);
-  let gz = (vc(c + Z) - vc(c - Z)) / (2.0 * dx);
-  let sxy = 0.5 * (gy.x + gx.y);
-  let sxz = 0.5 * (gz.x + gx.z);
-  let syz = 0.5 * (gz.y + gy.z);
-  let s2 = gx.x * gx.x + gy.y * gy.y + gz.z * gz.z + 2.0 * (sxy * sxy + sxz * sxz + syz * syz);
-  let d = (C_S * dx) * (C_S * dx) * sqrt(2.0 * s2) / SC_T;
+  let d = (C_S * dx) * (C_S * dx) * strainRate(vel, c) / SC_T;
   let k = min(d * P.grid.y / (dx * dx), 0.15);
   let phi = at(c);
   let lap = at(c + X) + at(c - X) + at(c + Y) + at(c - Y) + at(c + Z) + at(c - Z) - 6.0 * phi;

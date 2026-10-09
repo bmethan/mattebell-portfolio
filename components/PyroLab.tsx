@@ -4,7 +4,7 @@
 // at once (choosing it is the visitor's go-ahead).
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { PyroEngine, type PyroStatus } from './pyro/engine'
-import { PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, SOURCE_LOOKS, type PyroState, type SourceType } from './pyro/params'
+import { PRESETS, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, SOURCE_LOOKS, type PyroState, type SourceType } from './pyro/params'
 import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
 import { citeAuthors } from './lookdev/citations'
 import { Group, Pill, Range, Tabs } from './lab/ui'
@@ -58,7 +58,11 @@ const TECH_NOTES: [string, string][] = [
     'Upres',
     'A smoke source’s density also runs on a grid twice as fine, in the manner of wavelet turbulence (Kim, Thürey, James and Gross): carried by the solver’s velocity plus turbulence too fine for the coarse grid, the curl of a noise, so it stays divergence free, read at the texture coordinates the detail layers carry with the flow (its eddies travel with the smoke and fade where the flow has stretched them), and as strong as the local flow times 2^(−5/6), the share of the next band of eddies in Kolmogorov’s spectrum. The camera sees this finer smoke; the lighting still comes from the coarse grid. It takes the place of the rendered detail for smoke, and the Solver tab turns it off. A fire keeps the rendered detail: its soot and temperature come from the combustion on the coarse grid.',
   ],
-  ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
+  ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none. And the collision ball, when there is one (see Interaction).'],
+  [
+    'Interaction',
+    'Drag to stir the gas, move the source along the floor, or move a solid ball through the flow; the arrow keys do the same. The ball is a solid in the solver: the pressure solve treats its cells as walls at every multigrid level (a cell is solid when its centre is inside it, so the coarse levels see it too), and the faces around it move with its velocity, so a moving ball pushes the gas and the gas flows around it. It casts soft shadows from the sun on the floor and the smoke, hides its share of the sky (its view factor from the floor, (r/d)² cos θ), and is lit by the fire’s shadowed light. Each starting point sets a source, its look and the wind, and starts again.',
+  ],
   [
     'Rendering',
     'Each pixel marches through the volume and integrates each step in closed form, in photometric units (cd/m²), each colour channel on its own. Sunlight reaches every point through the optical depth toward the sun, recomputed each frame on a half-resolution grid; multiple-scattering octaves stand in for light bouncing inside the smoke; the sky lights it from above through the smoke overhead; the floor takes its shadow and the fire’s light. Between cells the smoke and soot are sampled with a cubic B-spline (eight trilinear fetches placed so the hardware’s blend gives the spline’s weights, after Sigg and Hadwiger), smooth where trilinear interpolation creases at every cell face; the Shading tab switches back to trilinear, which renders in about two thirds of the time. Each frame starts its march at a blue-noise offset stepped by the golden ratio, and frames accumulate: each blends into a running history, first clamped to the range of the new frame’s neighbourhood so what moves is not smeared behind it, which averages the sampling noise away. A paused frame keeps accumulating until it settles.',
@@ -129,6 +133,8 @@ export default function PyroLab() {
   const [mode, setMode] = useState<'starting' | 'live' | 'fallback'>(() => (PyroEngine.detect() ? 'starting' : 'fallback'))
   const [paused, setPaused] = useState(false)
   const [tab, setTab] = useState<PyroTab>('source')
+  // What a drag on the image does: stir the gas, move the source along the floor, or move the collision ball.
+  const [tool, setTool] = useState<'stir' | 'source' | 'ball'>('stir')
   const [renderer, setRenderer] = useState('')
   const tabsId = useId()
   const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
@@ -216,6 +222,14 @@ export default function PyroLab() {
   }, [])
 
   // A new source brings the look it reads best with (see SOURCE_LOOKS).
+  const applyPreset = (state: Partial<PyroState>) => {
+    update(state)
+    engineRef.current?.restart()
+  }
+  const pickTool = (t: 'stir' | 'source' | 'ball') => {
+    setTool(t)
+    if (t === 'ball' && !pyro.ball) update({ ball: true })
+  }
   const pickSource = (t: SourceType) => {
     if (t !== pyro.sourceType) update({ sourceType: t, ...SOURCE_LOOKS[t] })
   }
@@ -231,11 +245,26 @@ export default function PyroLab() {
 
   // Stirring: a mouse or pen stirs at once; a finger must first travel sideways (a vertical swipe scrolls).
   const drag = useRef<{ id: number; x: number; y: number; t: number; live: boolean } | null>(null)
+  // Moving the source or the ball: to the point under the pointer.
+  const moveTo = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    const x = ((e.clientX - r.left) / r.width) * 2 - 1
+    const y = 1 - ((e.clientY - r.top) / r.height) * 2
+    const engine = engineRef.current
+    if (!engine) return
+    if (tool === 'ball') engine.ballTo(x, y)
+    else {
+      const sx = engine.sourceTo(x, y)
+      if (sx !== null) setPyro(p => ({ ...p, srcX: sx }))
+    }
+  }
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return
-    const live = e.pointerType !== 'touch'
+    const moving = tool !== 'stir'
+    const live = moving || e.pointerType !== 'touch'
     drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp, live }
     if (live) e.currentTarget.setPointerCapture(e.pointerId)
+    if (moving) moveTo(e)
   }
   const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const d = drag.current
@@ -250,6 +279,10 @@ export default function PyroLab() {
       }
       d.live = true
       e.currentTarget.setPointerCapture(e.pointerId)
+    }
+    if (tool !== 'stir') {
+      moveTo(e)
+      return
     }
     const r = e.currentTarget.getBoundingClientRect()
     const x = ((e.clientX - r.left) / r.width) * 2 - 1
@@ -268,7 +301,11 @@ export default function PyroLab() {
     const p = push[e.key]
     if (!p) return
     e.preventDefault()
-    engineRef.current?.stirAt(0, 0, p[0], p[1], 33)
+    if (tool === 'ball') engineRef.current?.nudgeBall(p[0] * 2, p[1] * 2)
+    else if (tool === 'source') {
+      const sx = Math.max(-2, Math.min(2, pyro.srcX + p[0] * 2))
+      update({ srcX: sx })
+    } else engineRef.current?.stirAt(0, 0, p[0], p[1], 33)
   }
 
   const dims = status?.dims ?? RESOLUTIONS[pyro.resolution].dims
@@ -285,8 +322,16 @@ export default function PyroLab() {
       </div>
 
       <p className="lab-howto">
-        <span className="lab-howto-pointer">Drag across the image</span>
-        <span className="lab-howto-touch">Swipe sideways on the image</span> to stir the fire
+        {tool === 'stir' ? (
+          <>
+            <span className="lab-howto-pointer">Drag across the image</span>
+            <span className="lab-howto-touch">Swipe sideways on the image</span> to stir the {pyro.sourceType === 'fire' ? 'fire' : 'smoke'}
+          </>
+        ) : tool === 'source' ? (
+          <>Drag along the floor to move the {pyro.sourceType === 'fire' ? 'fire' : 'smoke'}</>
+        ) : (
+          <>Drag the ball through the {pyro.sourceType === 'fire' ? 'flames' : 'smoke'}</>
+        )}
         <span aria-hidden="true"> · </span>
         <span className="sr-only">. </span>Every control below is live
       </p>
@@ -300,8 +345,14 @@ export default function PyroLab() {
             tabIndex={0}
             role="application"
             aria-roledescription="fire and smoke simulation"
-            aria-label="Live fire and smoke simulation. Drag, or use the arrow keys, to stir it."
-            className="lab-canvas"
+            aria-label={
+              tool === 'stir'
+                ? 'Live fire and smoke simulation. Drag, or use the arrow keys, to stir it.'
+                : tool === 'source'
+                  ? 'Live fire and smoke simulation. Drag, or use the left and right arrow keys, to move the source.'
+                  : 'Live fire and smoke simulation. Drag, or use the arrow keys, to move the ball.'
+            }
+            className={`lab-canvas${tool === 'stir' ? '' : ' lab-canvas-move'}`}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={endDrag}
@@ -348,15 +399,49 @@ export default function PyroLab() {
               onClick={() => {
                 setPyro(PYRO_DEFAULTS)
                 engineRef.current?.setState(PYRO_DEFAULTS)
+                setTool('stir')
               }}
             >
               Reset controls
             </Pill>
           </div>
+          <div className="lab-row">
+            <Group label="Drag to">
+              <Pill on={tool === 'stir'} onClick={() => pickTool('stir')}>
+                Stir
+              </Pill>
+              <Pill on={tool === 'source'} onClick={() => pickTool('source')}>
+                {pyro.sourceType === 'fire' ? 'Move the fire' : 'Move the smoke'}
+              </Pill>
+              <Pill on={tool === 'ball'} onClick={() => pickTool('ball')}>
+                Move the ball
+              </Pill>
+            </Group>
+            {pyro.ball && (
+              <Pill
+                on={false}
+                onClick={() => {
+                  update({ ball: false })
+                  if (tool === 'ball') setTool('stir')
+                }}
+              >
+                Remove the ball
+              </Pill>
+            )}
+          </div>
           <Tabs id={tabsId} label="Pyro controls" tabs={PYRO_TABS} tab={tab} onTab={setTab} />
           <div className="lab-panel" role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`}>
             {tab === 'source' && (
               <>
+                <div className="lab-row">
+                  <Group label="Start from">
+                    {PRESETS.map(p => (
+                      <Pill key={p.id} on={false} onClick={() => applyPreset(p.state)}>
+                        {p.label}
+                      </Pill>
+                    ))}
+                  </Group>
+                </div>
                 <div className="lab-row">
                   <Group label="Type">
                     <Pill on={pyro.sourceType === 'smoke'} onClick={() => pickSource('smoke')}>
@@ -383,7 +468,13 @@ export default function PyroLab() {
                 )}
                 <div className="lab-row">
                   <Slider label="Noise" min={0} max={1} step={0.05} value={pyro.srcNoise} onChange={v => update({ srcNoise: v })} />
+                  <Slider label="Position" min={-2} max={2} step={0.05} value={pyro.srcX} unit=" m" onChange={v => update({ srcX: v })} />
                 </div>
+                {pyro.ball && (
+                  <div className="lab-row">
+                    <Slider label="Ball radius" min={0.1} max={0.4} step={0.01} value={pyro.ballRadius} unit=" m" onChange={v => update({ ballRadius: v })} />
+                  </div>
+                )}
               </>
             )}
             {tab === 'forces' && (

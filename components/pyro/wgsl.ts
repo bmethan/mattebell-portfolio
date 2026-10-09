@@ -29,8 +29,14 @@ struct Params {
   detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B
   fire: vec4<f32>,      // source is a fire bed (0 or 1), fuel it gives off (kg/s), soot yield (kg/kg), radiant fraction
   fire2: vec4<f32>,     // expansion (1 = physical), mixing time (s), the bed's nominal area (m2), unused
+  ball: vec4<f32>,      // the collision ball's centre (m), radius (m; 0 = none)
+  ballVel: vec4<f32>,   // its velocity (m/s), unused
 }
 @group(0) @binding(0) var<uniform> P: Params;
+
+// The collision ball: a solid sphere. A cell (or a face) is solid when its centre is inside it.
+fn solidAt(w: vec3<f32>) -> bool { return P.ball.w > 0.0 && distance(w, P.ball.xyz) < P.ball.w; }
+fn cellSolid(c: vec3<i32>) -> bool { return solidAt(P.origin.xyz + (vec3<f32>(c) + 0.5) * P.grid.x); }
 
 // Scalars, at each cell. A smoke source: x smoke density, y the temperature rise over ambient (K). A fire: quantities
 // per unit volume, because the solver mixes by volume (interpolating, and mixing finer than the grid) while
@@ -407,6 +413,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     wz = (wz + stir(w).z) * keep;
     v.z = clamp(wz, -vmax, vmax);
   }
+  // Faces inside the collision ball move with it.
+  if (P.ball.w > 0.0) {
+    if (solidAt(worldOf(vec3<f32>(f.x, f.y + 0.5, f.z + 0.5)))) { v.x = P.ballVel.x; }
+    if (solidAt(worldOf(vec3<f32>(f.x + 0.5, f.y, f.z + 0.5)))) { v.y = P.ballVel.y; }
+    if (solidAt(worldOf(vec3<f32>(f.x + 0.5, f.y + 0.5, f.z)))) { v.z = P.ballVel.z; }
+  }
   textureStore(velOut, c, vec4<f32>(v, 0.0));
 }
 `
@@ -425,9 +437,27 @@ ${SIM_COMMON}
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let c = vec3<i32>(id);
   if (any(c >= nCells())) { return; }
+  if (cellSolid(c)) {
+    rhs[cellIndex(c)] = 0.0;
+    return;
+  }
   let a = textureLoad(vel, c, 0);
-  let v0 = select(a.y, 0.0, c.y == 0);
-  let div = ((textureLoad(vel, c + X, 0).x - a.x) + (textureLoad(vel, c + Y, 0).y - v0) + (textureLoad(vel, c + Z, 0).z - a.z)) / P.grid.x;
+  var x0 = a.x;
+  var x1 = textureLoad(vel, c + X, 0).x;
+  var y0 = select(a.y, 0.0, c.y == 0);
+  var y1 = textureLoad(vel, c + Y, 0).y;
+  var z0 = a.z;
+  var z1 = textureLoad(vel, c + Z, 0).z;
+  // A face against the collision ball moves with it.
+  if (P.ball.w > 0.0) {
+    if (cellSolid(c - X)) { x0 = P.ballVel.x; }
+    if (cellSolid(c + X)) { x1 = P.ballVel.x; }
+    if (cellSolid(c - Y)) { y0 = P.ballVel.y; }
+    if (cellSolid(c + Y)) { y1 = P.ballVel.y; }
+    if (cellSolid(c - Z)) { z0 = P.ballVel.z; }
+    if (cellSolid(c + Z)) { z1 = P.ballVel.z; }
+  }
+  let div = ((x1 - x0) + (y1 - y0) + (z1 - z0)) / P.grid.x;
   // Burning gas expands. At constant pressure, gas heated by dT in dt grows in volume at (dT / dt) / T, so where
   // fuel burns the projection makes the flow diverge at that rate (the low-Mach-number limit); elsewhere the flow is
   // incompressible.
@@ -462,16 +492,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = i32(cellIndex(c));
   let sy = n.x;
   let sz = n.x * n.y;
+  if (cellSolid(c)) {
+    p[i] = 0.0;
+    return;
+  }
+  // Each neighbour inside the domain counts unless it is solid (the collision ball: no flow through its faces); past
+  // an open side or the top, p = 0 counts; below the floor nothing does.
   var sum = 0.0;
-  var cnt = 4.0; // x and z neighbours: inside, or p = 0 just outside
-  if (c.x > 0) { sum += p[i - 1]; }
-  if (c.x < n.x - 1) { sum += p[i + 1]; }
-  if (c.z > 0) { sum += p[i - sz]; }
-  if (c.z < n.z - 1) { sum += p[i + sz]; }
-  if (c.y > 0) { sum += p[i - sy]; cnt += 1.0; }
-  cnt += 1.0;
-  if (c.y < n.y - 1) { sum += p[i + sy]; }
-  let pn = (sum + rhs[i] * P.grid.x * P.grid.x) / cnt;
+  var cnt = 0.0;
+  if (c.x > 0) { if (!cellSolid(c - X)) { sum += p[i - 1]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.x < n.x - 1) { if (!cellSolid(c + X)) { sum += p[i + 1]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z > 0) { if (!cellSolid(c - Z)) { sum += p[i - sz]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z < n.z - 1) { if (!cellSolid(c + Z)) { sum += p[i + sz]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.y > 0 && !cellSolid(c - Y)) { sum += p[i - sy]; cnt += 1.0; }
+  if (c.y < n.y - 1) { if (!cellSolid(c + Y)) { sum += p[i + sy]; cnt += 1.0; } } else { cnt += 1.0; }
+  let pn = (sum + rhs[i] * P.grid.x * P.grid.x) / max(cnt, 1.0);
   p[i] = mix(p[i], pn, P.decay.z);
 }
 `
@@ -489,6 +524,15 @@ struct Level {
 @group(0) @binding(0) var<uniform> L: Level;
 fn nL() -> vec3<i32> { return vec3<i32>(L.n.xyz); }
 fn at(c: vec3<i32>, n: vec3<i32>) -> i32 { return c.x + n.x * (c.y + n.y * c.z); }
+// The collision ball (centre, radius; radius 0 = none) and the grid's origin and finest cell size: a cell of any level
+// is solid when its centre is inside the ball, so the coarse levels see it too.
+struct Ball { s: vec4<f32>, o: vec4<f32> }
+@group(0) @binding(5) var<uniform> B: Ball;
+fn solidL(c: vec3<i32>) -> bool {
+  if (B.s.w <= 0.0) { return false; }
+  let w = B.o.xyz + (vec3<f32>(c) + 0.5) * sqrt(L.h.x);
+  return distance(w, B.s.xyz) < B.s.w;
+}
 `
 
 export const MG_SMOOTH = /* wgsl */ `
@@ -496,23 +540,35 @@ ${MG_COMMON}
 @group(0) @binding(1) var<storage, read> g: array<f32>;
 @group(0) @binding(2) var<storage, read_write> x: array<f32>;
 
+// The 7-point operator's neighbour sum and count at a fluid cell: a neighbour inside the domain counts unless solid;
+// past an open side or the top, p = 0 counts; below the floor nothing does.
+fn gather(c: vec3<i32>, n: vec3<i32>) -> vec2<f32> {
+  let i = at(c, n);
+  let sy = n.x;
+  let sz = n.x * n.y;
+  var sum = 0.0;
+  var cnt = 0.0;
+  if (c.x > 0) { if (!solidL(c - vec3<i32>(1, 0, 0))) { sum += x[i - 1]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.x < n.x - 1) { if (!solidL(c + vec3<i32>(1, 0, 0))) { sum += x[i + 1]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z > 0) { if (!solidL(c - vec3<i32>(0, 0, 1))) { sum += x[i - sz]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z < n.z - 1) { if (!solidL(c + vec3<i32>(0, 0, 1))) { sum += x[i + sz]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.y > 0 && !solidL(c - vec3<i32>(0, 1, 0))) { sum += x[i - sy]; cnt += 1.0; }
+  if (c.y < n.y - 1) { if (!solidL(c + vec3<i32>(0, 1, 0))) { sum += x[i + sy]; cnt += 1.0; } } else { cnt += 1.0; }
+  return vec2<f32>(sum, cnt);
+}
+
 @compute @workgroup_size(16, 4, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = nL();
   let c = vec3<i32>(i32(2u * id.x + ((id.y + id.z + L.n.w) & 1u)), i32(id.y), i32(id.z));
   if (any(c >= n)) { return; }
   let i = at(c, n);
-  let sy = n.x;
-  let sz = n.x * n.y;
-  var sum = 0.0;
-  var cnt = 5.0; // the x and z sides and the top, inside or open
-  if (c.x > 0) { sum += x[i - 1]; }
-  if (c.x < n.x - 1) { sum += x[i + 1]; }
-  if (c.z > 0) { sum += x[i - sz]; }
-  if (c.z < n.z - 1) { sum += x[i + sz]; }
-  if (c.y < n.y - 1) { sum += x[i + sy]; }
-  if (c.y > 0) { sum += x[i - sy]; cnt += 1.0; }
-  x[i] = mix(x[i], (sum + g[i] * L.h.x) / cnt, L.h.y);
+  if (solidL(c)) {
+    x[i] = 0.0;
+    return;
+  }
+  let s = gather(c, n);
+  x[i] = mix(x[i], (s.x + g[i] * L.h.x) / max(s.y, 1.0), L.h.y);
 }
 `
 
@@ -522,23 +578,35 @@ ${MG_COMMON}
 @group(0) @binding(2) var<storage, read> x: array<f32>;
 @group(0) @binding(3) var<storage, read_write> r: array<f32>;
 
+// The 7-point operator's neighbour sum and count at a fluid cell: a neighbour inside the domain counts unless solid;
+// past an open side or the top, p = 0 counts; below the floor nothing does.
+fn gather(c: vec3<i32>, n: vec3<i32>) -> vec2<f32> {
+  let i = at(c, n);
+  let sy = n.x;
+  let sz = n.x * n.y;
+  var sum = 0.0;
+  var cnt = 0.0;
+  if (c.x > 0) { if (!solidL(c - vec3<i32>(1, 0, 0))) { sum += x[i - 1]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.x < n.x - 1) { if (!solidL(c + vec3<i32>(1, 0, 0))) { sum += x[i + 1]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z > 0) { if (!solidL(c - vec3<i32>(0, 0, 1))) { sum += x[i - sz]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z < n.z - 1) { if (!solidL(c + vec3<i32>(0, 0, 1))) { sum += x[i + sz]; cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.y > 0 && !solidL(c - vec3<i32>(0, 1, 0))) { sum += x[i - sy]; cnt += 1.0; }
+  if (c.y < n.y - 1) { if (!solidL(c + vec3<i32>(0, 1, 0))) { sum += x[i + sy]; cnt += 1.0; } } else { cnt += 1.0; }
+  return vec2<f32>(sum, cnt);
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = nL();
   let c = vec3<i32>(id);
   if (any(c >= n)) { return; }
   let i = at(c, n);
-  let sy = n.x;
-  let sz = n.x * n.y;
-  var sum = 0.0;
-  var cnt = 5.0;
-  if (c.x > 0) { sum += x[i - 1]; }
-  if (c.x < n.x - 1) { sum += x[i + 1]; }
-  if (c.z > 0) { sum += x[i - sz]; }
-  if (c.z < n.z - 1) { sum += x[i + sz]; }
-  if (c.y < n.y - 1) { sum += x[i + sy]; }
-  if (c.y > 0) { sum += x[i - sy]; cnt += 1.0; }
-  r[i] = g[i] - (cnt * x[i] - sum) / L.h.x;
+  if (solidL(c)) {
+    r[i] = 0.0;
+    return;
+  }
+  let s = gather(c, n);
+  r[i] = g[i] - (s.y * x[i] - s.x) / L.h.x;
 }
 `
 
@@ -614,6 +682,16 @@ fn pAt(c: vec3<i32>) -> f32 {
   if (any(c < vec3<i32>(0)) || any(c >= nCells())) { return 0.0; }
   return p[cellIndex(c)];
 }
+// A face between a solid cell (the collision ball) and any other moves with the ball.
+fn ballFaces(c: vec3<i32>, v0: vec3<f32>) -> vec3<f32> {
+  var v = v0;
+  if (P.ball.w > 0.0) {
+    if (cellSolid(c) || cellSolid(c - X)) { v.x = P.ballVel.x; }
+    if (cellSolid(c) || cellSolid(c - Y)) { v.y = P.ballVel.y; }
+    if (cellSolid(c) || cellSolid(c - Z)) { v.z = P.ballVel.z; }
+  }
+  return v;
+}
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -627,6 +705,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.y == 0u) { v.y = 0.0; } else { v.y -= k * (pAt(c) - pAt(c - Y)); }
   }
   if (id.x < n.x && id.y < n.y) { v.z -= k * (pAt(c) - pAt(c - Z)); }
+  v = ballFaces(c, v);
   textureStore(velOut, c, vec4<f32>(v, 0.0));
 }
 `
@@ -663,6 +742,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (id.y == 0u) {
     proj.y = 0.0;
     refl.y = 0.0;
+  }
+  if (P.ball.w > 0.0) {
+    if (cellSolid(c) || cellSolid(c - X)) { proj.x = P.ballVel.x; refl.x = P.ballVel.x; }
+    if (cellSolid(c) || cellSolid(c - Y)) { proj.y = P.ballVel.y; refl.y = P.ballVel.y; }
+    if (cellSolid(c) || cellSolid(c - Z)) { proj.z = P.ballVel.z; refl.z = P.ballVel.z; }
   }
   textureStore(velOut, c, vec4<f32>(proj, 0.0));
   textureStore(velRefl, c, vec4<f32>(refl, 0.0));
@@ -858,6 +942,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     phi.x = max(phi.x, P.srcProps.x * m);
     phi.y = max(phi.y, P.srcProps.y * m);
   }
+  if (cellSolid(c)) {
+    phi = vec4<f32>(0.0);
+    if (P.fire.x > 0.5) { hrr[cellIndex(c)] = 0.0; }
+  }
   textureStore(dst, c, phi);
 }
 `
@@ -955,6 +1043,27 @@ fn edgeFade(uvw: vec3<f32>) -> f32 {
   return smoothstep(0.0, 0.05, ex) * smoothstep(0.0, 0.2, ez) * (1.0 - smoothstep(0.8, 1.0, uvw.y));
 }
 fn uvwOf(w: vec3<f32>) -> vec3<f32> { return (w - P.origin.xyz) / (vec3<f32>(P.dims.xyz) * P.grid.x); }
+// Where a ray (unit direction) first meets the collision ball, or 1e9.
+fn ballHit(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+  if (P.ball.w <= 0.0) { return 1e9; }
+  let oc = ro - P.ball.xyz;
+  let b = dot(oc, rd);
+  let h = b * b - (dot(oc, oc) - P.ball.w * P.ball.w);
+  if (h < 0.0) { return 1e9; }
+  let t = -b - sqrt(h);
+  return select(1e9, t, t > 0.0);
+}
+const BALL_ALBEDO = 0.45;
+// How much sunlight the collision ball lets past to a point: 0 in its shadow, with a soft edge a few millimetres wide
+// plus the sun's own width at that distance (it spans half a degree).
+fn ballSun(w: vec3<f32>, sun: vec3<f32>) -> f32 {
+  if (P.ball.w <= 0.0) { return 1.0; }
+  let tb = P.ball.xyz - w;
+  let along = dot(tb, sun);
+  if (along <= 0.0) { return 1.0; }
+  let soft = 0.004 + 0.0046 * along;
+  return smoothstep(P.ball.w - soft, P.ball.w + soft, length(tb - sun * along));
+}
 `
 
 // 9. Light: optical depth (at 550 nm) from each point of a half-resolution lattice toward the sun, and straight up
@@ -981,6 +1090,7 @@ fn fireIrradiance(w: vec3<f32>) -> f32 {
     if (lum <= 0.0) { continue; }
     let d = fireSums[4u + 2u * b].xyz - w;
     let r2 = dot(d, d);
+    if (ballHit(w, d / max(sqrt(r2), 1e-6)) < sqrt(r2)) { continue; }
     var tau = 0.0;
     for (var i = 0; i < 12; i++) { tau += density(w + d * ((f32(i) + 0.5) / 12.0)); }
     e += lum * exp(-tau * sqrt(r2) / 12.0) / (r2 + BAND_R2);
@@ -988,8 +1098,10 @@ fn fireIrradiance(w: vec3<f32>) -> f32 {
   return 0.001 * e;
 }
 
-fn depth(w: vec3<f32>, d: vec3<f32>, ds: f32) -> f32 {
+fn depth(w: vec3<f32>, d: vec3<f32>, ds: f32, ball: bool) -> f32 {
   let te = boxHit(w, d, P.origin.xyz, domainHi()).y;
+  // (The collision ball's own shadows the renderer works out exactly, rather than at this lattice's resolution.)
+  if (ball && ballHit(w, d) < te) { return 30.0; }
   var tau = 0.0;
   var t = 0.5 * ds;
   for (var i = 0; i < 256; i++) {
@@ -1020,8 +1132,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   }
   // Every cell gets its depths, smoke or not: the floor's shadow and sky lookups land in empty cells too.
-  let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x);
-  let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x);
+  let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x, false);
+  let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x, false);
   textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w)));
 }
 `
@@ -1265,7 +1377,10 @@ fn subgridKelvin(w: vec3<f32>, uvw: vec3<f32>, rot: mat3x3<f32>) -> f32 {
 
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
-  let ndc = vec2<f32>(fc.x / R.size.x * 2.0 - 1.0, 1.0 - fc.y / R.size.y * 2.0);
+  // Each frame's rays pass through a different point of their pixel (the R2 sequence), which the accumulation turns
+  // into antialiasing (of the ball's outline, the floor's shadows and the flames' edges).
+  let sub = fract(vec2<f32>(0.7548777, 0.5698403) * R.camRight.w + 0.5) - 0.5;
+  let ndc = vec2<f32>((fc.x + sub.x) / R.size.x * 2.0 - 1.0, 1.0 - (fc.y + sub.y) / R.size.y * 2.0);
   let tanY = R.camPos.w;
   let rd = normalize(R.camFwd.xyz + R.camRight.xyz * ndc.x * tanY * R.camFwd.w + R.camUp.xyz * ndc.y * tanY);
   let ro = R.camPos.xyz;
@@ -1274,7 +1389,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 
   let tFloor = select(1e9, -ro.y / rd.y, rd.y < -1e-5);
   let box = boxHit(ro, rd, P.origin.xyz, domainHi());
-  let tEnd = min(box.y, tFloor);
+  let tBall = ballHit(ro, rd);
+  let tEnd = min(min(box.y, tFloor), tBall);
   let sun = R.sunDir.xyz;
   let g = R.sunDir.w;
   let cosT = dot(rd, sun);
@@ -1319,7 +1435,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let L = textureSampleLevel(light, samp, uvw, 0.0);
         let tauS = L.x * ch;
-        let lsun = exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2;
+        let lsun = (exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2) * ballSun(w, sun);
         // The sky as a uniform dome over open ground (radiance E / pi), half of it seen by an isotropic scatterer.
         let amb = R.skyCol.xyz * INV_2PI * exp(-0.5 * L.y * ch);
         // The fire's light, shadowed by the soot on the way (from the light volume, in kilolux).
@@ -1343,7 +1459,17 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     }
   }
 
-  if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
+  if (tBall < tFloor && tBall < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
+    // The collision ball: matte grey, lit by the sun and the sky through the smoke (the light volume just outside its
+    // surface) and by the fire's shadowed light, turned onto the surface toward the fire's centre.
+    let ph = ro + rd * tBall;
+    let nb = normalize(ph - P.ball.xyz);
+    let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
+    let toFire = fireLight[1].xyz - ph;
+    let fireE = fireColour * 1000.0 * lb.w * max(dot(nb, toFire), 0.0) / max(length(toFire), 1e-3);
+    let E = R.sunCol.xyz * max(dot(nb, sun), 0.0) * exp(-lb.x * ch) + R.skyCol.xyz * (0.5 + 0.5 * nb.y) * exp(-0.5 * lb.y * ch) + fireE;
+    col += T * BALL_ALBEDO * INV_PI * E;
+  } else if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     let pf = ro + rd * tFloor;
     let fade = exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w));
     // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
@@ -1352,6 +1478,14 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     if (sb.y > max(sb.x, 0.0)) {
       let pe = pf + sun * max(sb.x, 0.0) + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0);
       shadow = exp(-textureSampleLevel(light, samp, uvwOf(pe), 0.0).x * ch);
+    }
+    // And the collision ball's; it also hides its share of the sky, its view factor from the floor, (r / d)^2 cos.
+    shadow *= ballSun(pf, sun);
+    var ballSky = 1.0;
+    if (P.ball.w > 0.0) {
+      let tb = P.ball.xyz - pf;
+      let d2 = dot(tb, tb);
+      ballSky = 1.0 - P.ball.w * P.ball.w / d2 * max(tb.y, 0.0) / sqrt(d2);
     }
     var skyVis = vec3<f32>(1.0);
     let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
@@ -1371,7 +1505,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       fireLux += lum * max(d.y, 0.0) / (sqrt(r2) * r2);
     }
     let fireE = fireColour * fireLux;
-    let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis + fireE;
+    let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis * ballSky + fireE;
     col += T * R.floorCol.xyz * INV_PI * E * fade;
   }
 
@@ -1517,6 +1651,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let top = smoothstep(0.7, 1.0, gF.y / n.y);
   d = max(d, 0.0) * exp(-(P.decay.y + 2.5 * top) * P.grid.y);
   d = max(d, P.srcProps.x * sourceMask(w));
+  if (solidAt(P.origin.xyz + gF * 0.5 * P.grid.x)) { d = 0.0; }
   textureStore(dst, c, vec4<f32>(d, 0.0, 0.0, 0.0));
 }
 `

@@ -33,6 +33,7 @@ export interface PyroState {
   srcTemp: number // K above ambient (smoke source)
   srcSpeed: number // m/s, upward (smoke source)
   srcNoise: number // 0..1
+  srcX: number // m along the floor from the middle
   heatRelease: number // kW (fire source): the bed gives off the fuel that releases this much heat burning
   // Forces
   buoyancy: number // 1 = physical, g (T - T_ambient) / T_ambient
@@ -60,6 +61,9 @@ export interface PyroState {
   tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
   upres: boolean // a smoke source's density also on a grid twice as fine (wavelet turbulence)
   upresStrength: number // its turbulence, 1 = Kolmogorov's next band
+  // Interaction
+  ball: boolean // a solid ball in the flow, dragged by the visitor
+  ballRadius: number // m
   // Upres detail
   detail: number // 0 = off
   detailScale: number // m, the largest noise feature
@@ -78,6 +82,7 @@ export const PYRO_DEFAULTS: PyroState = {
   srcTemp: 70,
   srcSpeed: 0.45,
   srcNoise: 0.8,
+  srcX: 0,
   heatRelease: 80,
   buoyancy: 1,
   vorticity: 0.35,
@@ -102,6 +107,8 @@ export const PYRO_DEFAULTS: PyroState = {
   tricubic: true,
   upres: true,
   upresStrength: 1,
+  ball: false,
+  ballRadius: 0.22,
   detail: 1,
   detailScale: 0.05,
 }
@@ -112,3 +119,15 @@ export const SOURCE_LOOKS: Record<SourceType, Partial<PyroState>> = {
   smoke: { sunEV: 13, skyEV: 11, exposure: 11, whiteBalance: 6500, albedo: 0.6, turbulence: 2, vorticity: 0.25 },
   fire: { sunEV: 2, skyEV: 1, exposure: 7, whiteBalance: 5500, albedo: 0.25, turbulence: 1, vorticity: 0.35 },
 }
+
+// Starting points: each sets the source, its look and the wind, and the lab restarts from it.
+const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, sootYield: FUEL.sootYield, radiantFraction: FUEL.radiantFraction }
+const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3 }
+export const PRESETS: { id: string; label: string; state: Partial<PyroState> }[] = [
+  { id: 'campfire', label: 'Campfire', state: { ...FIRE_START, heatRelease: 80, srcRadius: 0.3, srcX: 0, wind: 0 } },
+  { id: 'bonfire', label: 'Bonfire', state: { ...FIRE_START, heatRelease: 200, srcRadius: 0.4, srcX: 0, wind: 0 } },
+  { id: 'fire-wind', label: 'Fire in wind', state: { ...FIRE_START, heatRelease: 100, srcRadius: 0.3, srcX: -1.2, wind: 1.5 } },
+  { id: 'sooty', label: 'Sooty fire', state: { ...FIRE_START, heatRelease: 120, srcRadius: 0.3, srcX: 0, wind: 0, sootYield: 0.08 } },
+  { id: 'plume', label: 'Smoke plume', state: { ...SMOKE_START, srcX: 0, wind: 0 } },
+  { id: 'smoke-wind', label: 'Smoke in wind', state: { ...SMOKE_START, srcX: -1.4, wind: 1.2 } },
+]

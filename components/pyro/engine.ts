@@ -268,7 +268,7 @@ export class PyroEngine {
   private simBuf: GPUBuffer
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
-  private simData = new ArrayBuffer(224)
+  private simData = new ArrayBuffer(256)
   private renderData = new Float32Array(56)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
@@ -281,6 +281,12 @@ export class PyroEngine {
   private histIndex = 0
   private taaCount = 0
   private renderFrame = 0
+  // The collision ball: its centre and velocity (from the visitor's drags, easing to rest), and its uniform for the
+  // pressure solve's levels.
+  private ballPos: Vec3 = [0.85, 0.55, 0]
+  private ballVel: Vec3 = [0, 0, 0]
+  private ballDragAt = 0
+  private ballBuf: GPUBuffer
   // Wavelet-turbulence upres for a smoke source: its two textures (twice the grid's resolution), made when first
   // needed; the pass's bind group and uniform; the render bind group that reads it; and whether it must refill from
   // the coarse density on its next step.
@@ -364,6 +370,7 @@ export class PyroEngine {
     this.blueTex = d.createTexture({ size: [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
     d.queue.writeTexture({ texture: this.blueTex }, blueNoise(), { bytesPerRow: BLUE_NOISE_SIZE }, [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE])
     this.taaBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
+    this.ballBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.whenReady = this.build(prebuilt)
@@ -447,6 +454,12 @@ export class PyroEngine {
       rs.push(storage(count))
     })
     const coarsest = dims.length - 1
+    // Smoothing and residuals also see the collision ball (binding 5).
+    const withBall = (pipe: GPUComputePipeline, resources: GPUBindingResource[]) =>
+      d.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: [...resources.map((resource, binding) => ({ binding, resource })), { binding: 5, resource: { buffer: this.ballBuf } }],
+      })
     const levelUniform = (l: number, colour: number) => {
       const b = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true })
       const m = dims[l]
@@ -463,8 +476,8 @@ export class PyroEngine {
       const u1 = levelUniform(l, 1)
       return {
         n: m,
-        smooth: [group(p.mgSmooth, [{ buffer: u0 }, { buffer: gs[l] }, { buffer: xs[l] }]), group(p.mgSmooth, [{ buffer: u1 }, { buffer: gs[l] }, { buffer: xs[l] }])],
-        residual: l < coarsest ? group(p.mgResidual, [{ buffer: u0 }, { buffer: gs[l] }, { buffer: xs[l] }, { buffer: rs[l] }]) : null,
+        smooth: [withBall(p.mgSmooth, [{ buffer: u0 }, { buffer: gs[l] }, { buffer: xs[l] }]), withBall(p.mgSmooth, [{ buffer: u1 }, { buffer: gs[l] }, { buffer: xs[l] }])],
+        residual: l < coarsest ? withBall(p.mgResidual, [{ buffer: u0 }, { buffer: gs[l] }, { buffer: xs[l] }, { buffer: rs[l] }]) : null,
         restrictTo: l > 0 ? group(p.mgRestrict, [{ buffer: u0 }, { buffer: rs[l - 1] }, { buffer: gs[l] }, { buffer: xs[l] }]) : null,
         prolongFrom: l > 0 ? group(p.mgProlong, [{ buffer: u0 }, { buffer: xs[l] }, { buffer: xs[l - 1] }]) : null,
       }
@@ -616,6 +629,76 @@ export class PyroEngine {
   // A drag on the image: ndc (x, y in -1..1, y up) and how far it moved (ndc units) in dtMs. The stir pushes the
   // air, at the drag's speed in the plane facing the camera, around the point where the pointer's ray passes
   // closest to the plume's axis (the vertical through the source).
+  // The ray through a point of the frame (ndc, -1 to 1).
+  private rayAt(x: number, y: number): { o: Vec3; dir: Vec3 } {
+    const c = this.cam
+    const dir = norm([
+      c.fwd[0] + c.right[0] * x * c.tanY * c.aspect + c.up[0] * y * c.tanY,
+      c.fwd[1] + c.right[1] * x * c.tanY * c.aspect + c.up[1] * y * c.tanY,
+      c.fwd[2] + c.right[2] * x * c.tanY * c.aspect + c.up[2] * y * c.tanY,
+    ])
+    return { o: c.pos, dir }
+  }
+
+  // Moves the source along the floor to under the pointer; returns its new x (m), or null off the floor.
+  sourceTo(x: number, y: number): number | null {
+    if (!this.grids) return null
+    const { o, dir } = this.rayAt(x, y)
+    if (dir[1] > -1e-4) return null
+    const t = -o[1] / dir[1]
+    const half = DOMAIN_WIDTH / 2 - this.state.srcRadius - 0.15
+    const sx = Math.max(-half, Math.min(half, o[0] + dir[0] * t))
+    this.setState({ srcX: sx })
+    return sx
+  }
+
+  // Moves the collision ball to under the pointer, on the plane through the domain's middle, and gives it the
+  // velocity of the move, so it pushes the gas.
+  ballTo(x: number, y: number) {
+    if (!this.grids) return
+    const { o, dir } = this.rayAt(x, y)
+    if (Math.abs(dir[2]) < 1e-4) return
+    const t = -o[2] / dir[2]
+    const r = this.state.ballRadius
+    const [nx, ny] = this.grids.n
+    const height = (ny * DOMAIN_WIDTH) / nx
+    const half = DOMAIN_WIDTH / 2 - r - 0.05
+    const next: Vec3 = [Math.max(-half, Math.min(half, o[0] + dir[0] * t)), Math.max(r, Math.min(height - r - 0.1, o[1] + dir[1] * t)), 0]
+    const now = performance.now()
+    const secs = Math.max((now - this.ballDragAt) / 1000, 1 / 120)
+    // A drag that has just begun has no speed yet; otherwise the move's, up to 6 m/s.
+    let vel: Vec3 = [0, 0, 0]
+    if (now - this.ballDragAt < 250) {
+      vel = next.map((v, i) => (v - this.ballPos[i]) / secs) as Vec3
+      const speed = Math.hypot(...vel)
+      if (speed > 6) vel = vel.map(v => (v * 6) / speed) as Vec3
+    }
+    this.ballVel = vel
+    this.ballPos = next
+    this.ballDragAt = now
+    this.lightDirty = true
+    this.needsRender = true
+    this.taaCount = 0
+    this.kick()
+  }
+
+  // Moves the ball by (dx, dy) metres in the frame's plane, as a drag would (the arrow keys).
+  nudgeBall(dx: number, dy: number) {
+    if (!this.grids) return
+    const r = this.state.ballRadius
+    const [nx, ny] = this.grids.n
+    const height = (ny * DOMAIN_WIDTH) / nx
+    const half = DOMAIN_WIDTH / 2 - r - 0.05
+    const next: Vec3 = [Math.max(-half, Math.min(half, this.ballPos[0] + dx)), Math.max(r, Math.min(height - r - 0.1, this.ballPos[1] + dy)), 0]
+    this.ballVel = next.map((v, i) => (v - this.ballPos[i]) / 0.1) as Vec3
+    this.ballPos = next
+    this.ballDragAt = performance.now()
+    this.lightDirty = true
+    this.needsRender = true
+    this.taaCount = 0
+    this.kick()
+  }
+
   stirAt(x: number, y: number, dxNdc: number, dyNdc: number, dtMs: number) {
     if (!this.grids) return
     const c = this.cam
@@ -822,7 +905,7 @@ export class PyroEngine {
     u.set([nx, ny, nz, this.frame], 0)
     f.set([dx, SIM_DT, this.simTime, 0], 4)
     // A smoke source's dome rests on the floor (it is 2.5 times wider than tall); a fire's bed is a disc on the floor.
-    f.set([0, s.srcRadius / 2.5 + dx, 0, s.srcRadius], 8)
+    f.set([s.srcX, s.srcRadius / 2.5 + dx, 0, s.srcRadius], 8)
     f.set([s.srcDensity, s.srcTemp, s.srcSpeed, s.srcNoise], 12)
     // Buoyancy: g (T - T_ambient) / T_ambient per kelvin of temperature rise, times the control (1 = physical).
     // Turbulence: m/s2 for a smoke source; for a fire, the turbulence model (physics.ts) times the control.
@@ -846,7 +929,13 @@ export class PyroEngine {
     f.set([fire ? 1 : 0, fire ? (s.heatRelease * 1000) / FUEL.heatPerFuel : 0, s.sootYield, s.radiantFraction], 48)
     const bed = Math.PI * s.srcRadius ** 2 * (1 - 0.5 * s.srcNoise)
     f.set([s.expansion, Math.sqrt((2 * dx) / G), bed, 0], 52)
+    // The collision ball, easing to rest once the visitor lets go.
+    if (performance.now() - this.ballDragAt > 120) this.ballVel = this.ballVel.map(v => v * 0.6) as Vec3
+    const radius = s.ball ? s.ballRadius : 0
+    f.set([...this.ballPos, radius], 56)
+    f.set([...this.ballVel, 0], 60)
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
+    this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx]))
   }
 
   private writeRender() {

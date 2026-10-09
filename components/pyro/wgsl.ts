@@ -1,4 +1,5 @@
 import { BB_MAX_K, BB_MIN_K } from './blackbody'
+import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
 // WGSL for the pyro lab: a gas solver on a staggered (MAC) grid, as production FX solvers lay it out, and a
 // volume renderer for it.
@@ -14,10 +15,10 @@ import { BB_MAX_K, BB_MIN_K } from './blackbody'
 export const SIM_COMMON = /* wgsl */ `
 struct Params {
   dims: vec4<u32>,      // nx, ny, nz, frame
-  grid: vec4<f32>,      // dx (m), dt (s), time (s), ambient temperature
+  grid: vec4<f32>,      // dx (m), dt (s), time (s), unused
   src: vec4<f32>,       // source centre (m), radius (m)
-  srcProps: vec4<f32>,  // density, temperature, upward speed (m/s), noise (0..1)
-  forces: vec4<f32>,    // buoyancy (m/s2 per unit temperature), weight (m/s2 per unit density), vorticity, turbulence (m/s2)
+  srcProps: vec4<f32>,  // smoke density, smoke temperature rise (K), upward speed (m/s), noise (0..1)
+  forces: vec4<f32>,    // buoyancy (m/s2 per K of temperature rise), unused, vorticity, turbulence (m/s2)
   forces2: vec4<f32>,   // turbulence scale (m), wind x (m/s), wind z (m/s), drag (1/s)
   decay: vec4<f32>,     // cooling (1/s), dissipation (1/s), SOR relaxation, speed limit (m/s)
   stirO: vec4<f32>,     // stir centre (m), radius (m)
@@ -25,10 +26,65 @@ struct Params {
   stirR: vec4<f32>,     // unused xyz, MacCormack on (0 or 1)
   origin: vec4<f32>,    // domain min corner (m)
   detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B
-  fire: vec4<f32>,      // source is fuel (0 or 1), source fuel, burn rate (1/s), heat released per unit of fuel
-  fire2: vec4<f32>,     // expansion (1/s at full flame), soot per unit of fuel, flame decay (1/s), ignition temperature
+  fire: vec4<f32>,      // source is a fire bed (0 or 1), fuel it gives off (kg/s), soot yield (kg/kg), radiant fraction
+  fire2: vec4<f32>,     // expansion (1 = physical), mixing time (s), the bed's nominal area (m2), unused
 }
 @group(0) @binding(0) var<uniform> P: Params;
+
+// Scalars, at each cell. A smoke source: x smoke density, y the temperature rise over ambient (K). A fire: quantities
+// per unit volume, because the solver mixes by volume (interpolating, and mixing finer than the grid) while
+// temperature and mass fractions mix by mass, and hot gas is light: kept as they are, a volume of 1300 K gas mixing
+// with a volume of 293 K air would come out at 796 K instead of 478 K, and a fire's plume would stay far too hot.
+// So y is the density deficit, 1 - rho / rho_ambient (0 in ambient air), and x, z, w are partial densities relative
+// to ambient air's: of soot (g per kg), of the gas that came from the fuel bed (the mixture fraction times the relative
+// density) and of the fuel still unburned. gasOf() turns them back into a temperature and mass fractions.
+const T_AMB = ${wf(T_AMBIENT)}; // K
+const RHO_T = ${wf(RHO_T)}; // air density times temperature, kg K / m3
+const Y_O2_AIR = ${wf(Y_O2_AIR)};
+const S_O2 = ${wf(FUEL.oxygenPerFuel)}; // kg of oxygen burning a kg of fuel takes
+const HEAT = ${wf(FUEL.heatPerFuel)}; // J per kg of fuel burned
+const CP = ${wf(CP)}; // J / (kg K)
+const SOOT_G = 1000.0; // soot is kept in g per kg (fp16 keeps more of its precision there)
+
+struct Gas {
+  rise: f32, // temperature over ambient, K
+  z: f32, // mixture fraction
+  fuel: f32, // unburned fuel, mass fraction
+  soot: f32, // g per kg
+}
+fn gasOf(s: vec4<f32>) -> Gas {
+  let r = max(1.0 - s.y, 0.1); // rho / rho_ambient = T_ambient / T
+  return Gas(T_AMB * max(s.y, 0.0) / r, max(s.z, 0.0) / r, max(s.w, 0.0) / r, max(s.x, 0.0) / r);
+}
+fn storeGas(g: Gas) -> vec4<f32> {
+  let r = T_AMB / (T_AMB + g.rise);
+  return vec4<f32>(g.soot * r, 1.0 - r, g.z * r, g.fuel * r);
+}
+// The temperature rise over ambient (K), from either source's scalars.
+fn riseOf(s: vec4<f32>) -> f32 {
+  if (P.fire.x > 0.5) { return T_AMB * max(s.y, 0.0) / max(1.0 - s.y, 0.1); }
+  return s.y;
+}
+
+// Fast chemistry, mixing-limited (the eddy dissipation concept, as NIST's Fire Dynamics Simulator uses it): in each
+// cell, fuel burns with the oxygen mixed in with it as fast as turbulence mixes them, at min(Y_fuel, Y_O2 / s) /
+// tau_mix. The oxygen is what the air brought (the mixture fraction says how much of the gas is air) less what burning
+// has used. Returns the mass fraction of fuel burned in dt.
+fn fuelBurned(g: Gas, dt: f32) -> f32 {
+  let yO2 = Y_O2_AIR * (1.0 - g.z) - S_O2 * (g.z - g.fuel);
+  return min(g.fuel, max(yO2, 0.0) / S_O2) * (1.0 - exp(-dt / P.fire2.y));
+}
+// The fuel the bed gives off into a cell in dt, per unit of the cell's mass: the rate that releases the chosen heat,
+// spread over the bed's surface in proportion to its mask (the mask's area as measured last step; before that, its
+// nominal area), into the bottom layer of cells.
+fn fuelAdded(g: Gas, w: vec3<f32>, measuredArea: f32, dt: f32) -> f32 {
+  let m = bedMask(w);
+  if (m <= 0.0) { return 0.0; }
+  let area = select(P.fire2.z, measuredArea, measuredArea > 1e-6);
+  return P.fire.y * m / area * dt / (RHO_T / (T_AMB + g.rise) * P.grid.x);
+}
+// The temperature rise from burning that much fuel, net of the share radiated away.
+fn heatRise(burned: f32) -> f32 { return burned * HEAT * (1.0 - P.fire.w) / CP; }
 
 const X = vec3<i32>(1, 0, 0);
 const Y = vec3<i32>(0, 1, 0);
@@ -78,6 +134,19 @@ fn sourceMask(w: vec3<f32>) -> f32 {
   return m * mix(1.0, smoothstep(0.35, 0.75, n), P.srcProps.w);
 }
 
+// A fire's bed: a disc on the floor that gives off fuel vapour through its surface (into the bottom layer of cells), as
+// a pool fire or a burning bed of wood does and as FDS models one, with the same drifting noise as a smoke source.
+// Fuel given off inside a volume would have the air the plume draws in sweep straight through it, so the fire would
+// burn lean, without a flame's fuel-rich core.
+fn bedMask(w: vec3<f32>) -> f32 {
+  if (w.y > P.grid.x) { return 0.0; }
+  let r = P.src.w;
+  let m = 1.0 - smoothstep(r - 2.0 * P.grid.x, r, length(w.xz - P.src.xz));
+  if (m <= 0.0) { return 0.0; }
+  let n = fbm(w * 3.5 + vec3<f32>(0.9, -2.8, 0.7) * P.grid.z);
+  return m * mix(1.0, smoothstep(0.35, 0.75, n), P.srcProps.w);
+}
+
 // Staggered velocity, trilinear on each component's own lattice, clamped to that component's range.
 fn velDims() -> vec3<f32> { return nF() + 1.0; }
 fn comp(t: texture_3d<f32>, s: sampler, tc: vec3<f32>, hi: vec3<f32>) -> vec4<f32> {
@@ -117,12 +186,15 @@ fn inDomain(g: vec3<f32>) -> bool {
 }
 `
 
-// 1. Advect the velocity by itself (semi-Lagrangian, RK2 backtrace).
+// 1. Advect the velocity by itself: semi-Lagrangian with an RK2 backtrace through the flow field, DIR 1 tracing back (the
+// forward step), -1 tracing forward (MacCormack's reverse step, below).
 export const ADVECT_VEL = /* wgsl */ `
 ${SIM_COMMON}
+override DIR: f32 = 1.0;
 @group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var velSrc: texture_3d<f32>;
-@group(0) @binding(3) var velDst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(2) var flow: texture_3d<f32>;
+@group(0) @binding(3) var velSrc: texture_3d<f32>;
+@group(0) @binding(4) var velDst: texture_storage_3d<rgba16float, write>;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -131,15 +203,67 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let f = vec3<f32>(id);
   var o = vec3<f32>(0.0);
   if (id.y < n.y && id.z < n.z) {
-    o.x = uAt(velSrc, samp, backtrace(velSrc, samp, vec3<f32>(f.x, f.y + 0.5, f.z + 0.5), 1.0));
+    o.x = uAt(velSrc, samp, backtrace(flow, samp, vec3<f32>(f.x, f.y + 0.5, f.z + 0.5), DIR));
   }
   if (id.x < n.x && id.z < n.z && id.y > 0u) {
-    o.y = vAt(velSrc, samp, backtrace(velSrc, samp, vec3<f32>(f.x + 0.5, f.y, f.z + 0.5), 1.0));
+    o.y = vAt(velSrc, samp, backtrace(flow, samp, vec3<f32>(f.x + 0.5, f.y, f.z + 0.5), DIR));
   }
   if (id.x < n.x && id.y < n.y) {
-    o.z = wAt(velSrc, samp, backtrace(velSrc, samp, vec3<f32>(f.x + 0.5, f.y + 0.5, f.z), 1.0));
+    o.z = wAt(velSrc, samp, backtrace(flow, samp, vec3<f32>(f.x + 0.5, f.y + 0.5, f.z), DIR));
   }
   textureStore(velDst, vec3<i32>(id), vec4<f32>(o, 0.0));
+}
+`
+
+// 1b. Modified MacCormack for the velocity (Selle et al. 2008), as for the scalars: the forward result plus half the
+// round-trip error, each component clamped to the values on its own lattice that the forward step interpolated
+// between. Semi-Lagrangian alone damps the eddies that draw air into a plume, so a fire's plume would mix too
+// slowly with the air around it: too hot, and its flame too tall.
+export const VEL_COMBINE = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var v0: texture_3d<f32>;
+@group(0) @binding(3) var v1: texture_3d<f32>;
+@group(0) @binding(4) var v2: texture_3d<f32>;
+@group(0) @binding(5) var dst: texture_storage_3d<rgba16float, write>;
+
+// The value clamped to the range of component k of v0 at the 8 lattice points around tc (that lattice's texel
+// coordinates; hi its last texel).
+fn clampFoot(tc: vec3<f32>, hi: vec3<i32>, k: i32, value: f32) -> f32 {
+  let b = vec3<i32>(floor(clamp(tc, vec3<f32>(0.0), vec3<f32>(hi))));
+  var lo = 1e9;
+  var up = -1e9;
+  for (var j = 0; j < 8; j++) {
+    let q = textureLoad(v0, min(b + vec3<i32>(j & 1, (j >> 1) & 1, (j >> 2) & 1), hi), 0)[k];
+    lo = min(lo, q);
+    up = max(up, q);
+  }
+  return clamp(value, lo, up);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = P.dims.xyz;
+  if (id.x > n.x || id.y > n.y || id.z > n.z) { return; }
+  let c = vec3<i32>(id);
+  let ni = vec3<i32>(n);
+  let f = vec3<f32>(id);
+  let a1 = textureLoad(v1, c, 0).xyz;
+  let corrected = a1 + 0.5 * (textureLoad(v0, c, 0).xyz - textureLoad(v2, c, 0).xyz);
+  var o = vec3<f32>(0.0);
+  if (id.y < n.y && id.z < n.z) {
+    let g = backtrace(v0, samp, vec3<f32>(f.x, f.y + 0.5, f.z + 0.5), 1.0);
+    o.x = clampFoot(vec3<f32>(g.x, g.y - 0.5, g.z - 0.5), vec3<i32>(ni.x, ni.y - 1, ni.z - 1), 0, corrected.x);
+  }
+  if (id.x < n.x && id.z < n.z && id.y > 0u) {
+    let g = backtrace(v0, samp, vec3<f32>(f.x + 0.5, f.y, f.z + 0.5), 1.0);
+    o.y = clampFoot(vec3<f32>(g.x - 0.5, g.y, g.z - 0.5), vec3<i32>(ni.x - 1, ni.y, ni.z - 1), 1, corrected.y);
+  }
+  if (id.x < n.x && id.y < n.y) {
+    let g = backtrace(v0, samp, vec3<f32>(f.x + 0.5, f.y + 0.5, f.z), 1.0);
+    o.z = clampFoot(vec3<f32>(g.x - 0.5, g.y - 0.5, g.z), vec3<i32>(ni.x - 1, ni.y - 1, ni.z), 2, corrected.z);
+  }
+  textureStore(dst, c, vec4<f32>(o, 0.0));
 }
 `
 
@@ -167,8 +291,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
-// 3. Forces on each face: vorticity confinement (Fedkiw, Stam and Jensen 2001), buoyancy from temperature and
-// weight from density, curl-noise turbulence where there is smoke, wind, the source's upward push, the visitor's
+// 3. Forces on each face: vorticity confinement (Fedkiw, Stam and Jensen 2001), buoyancy from temperature,
+// curl-noise turbulence where there is smoke, wind, the source's upward push, the visitor's
 // stir, and drag. The floor face stays at rest.
 export const FORCES = /* wgsl */ `
 ${SIM_COMMON}
@@ -220,8 +344,11 @@ fn curlZ(q: vec3<f32>) -> f32 {
 fn noiseSpace(w: vec3<f32>) -> vec3<f32> {
   return (w - vec3<f32>(0.0, TURB_RISE * P.grid.z, 0.0)) / max(P.forces2.x, 0.01);
 }
-// Turbulence acts where there is smoke or flame.
-fn turbMask(a: vec4<f32>, b: vec4<f32>) -> f32 { return clamp(1.5 * (max(a.x, a.w) + max(b.x, b.w)), 0.0, 1.0); }
+// Turbulence acts where there is smoke, or, in a fire, hot gas.
+fn turbMask(a: vec4<f32>, b: vec4<f32>) -> f32 {
+  let s = 0.5 * (a + b);
+  return clamp(select(3.0 * s.x, riseOf(s) / 300.0, P.fire.x > 0.5), 0.0, 1.0);
+}
 
 // The stir: a velocity change along the visitor's drag, falling off from where the pointer's ray passes the plume.
 fn stir(w: vec3<f32>) -> vec3<f32> {
@@ -259,13 +386,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       let w = worldOf(vec3<f32>(f.x + 0.5, f.y, f.z + 0.5));
       let s0 = cellScal(c - Y);
       let s1 = cellScal(c);
-      let d = 0.5 * (s0.x + s1.x);
-      let temp = 0.5 * (s0.y + s1.y);
-      var a = 0.5 * (confine(c - Y).y + confine(c).y) + P.forces.x * (temp - P.grid.w) - P.forces.y * d;
+      // Buoyancy: gas hotter than the air around it is lighter, and rises at g (T - T_ambient) / T_ambient.
+      var a = 0.5 * (confine(c - Y).y + confine(c).y) + P.forces.x * 0.5 * (riseOf(s0) + riseOf(s1));
       a += P.forces.w * turbMask(s0, s1) * curlY(noiseSpace(w));
       var vy = v.y + a * dt;
       vy -= vy * windT;
-      vy = mix(vy, P.srcProps.z, sourceMask(w));
+      // A smoke source pushes its smoke out; a fire bed only gives off fuel, and buoyancy does the rest.
+      if (P.fire.x < 0.5) { vy = mix(vy, P.srcProps.z, sourceMask(w)); }
       vy = (vy + stir(w).y) * keep;
       v.y = clamp(vy, -vmax, vmax);
     }
@@ -290,6 +417,8 @@ ${SIM_COMMON}
 @group(0) @binding(1) var vel: texture_3d<f32>;
 @group(0) @binding(2) var<storage, read_write> rhs: array<f32>;
 @group(0) @binding(3) var scal: texture_3d<f32>;
+@group(0) @binding(4) var<storage, read> fireSums: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> hrr: array<f32>;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -298,8 +427,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let a = textureLoad(vel, c, 0);
   let v0 = select(a.y, 0.0, c.y == 0);
   let div = ((textureLoad(vel, c + X, 0).x - a.x) + (textureLoad(vel, c + Y, 0).y - v0) + (textureLoad(vel, c + Z, 0).z - a.z)) / P.grid.x;
-  // Burning gas expands: the projection makes the divergence equal this source instead of 0 where there is flame.
-  let expansion = P.fire2.x * textureLoad(scal, c, 0).w;
+  // Burning gas expands. At constant pressure, gas heated by dT in dt grows in volume at (dT / dt) / T, so where
+  // fuel burns the projection makes the flow diverge at that rate (the low-Mach-number limit); elsewhere the flow is
+  // incompressible.
+  var expansion = 0.0;
+  if (P.fire.x > 0.5) {
+    // (The heat released last step, which is what the gas here is still taking up.)
+    let g = gasOf(textureLoad(scal, c, 0));
+    let heating = hrr[cellIndex(c)] * (1.0 - P.fire.w) / (RHO_T / (T_AMB + g.rise) * CP);
+    expansion = P.fire2.x * heating / (T_AMB + g.rise);
+    // The bed's fuel vapour takes up room too: its blowing velocity, a few centimetres a second.
+    expansion += fuelAdded(g, worldOf(vec3<f32>(id) + 0.5), fireSums[2].x, P.grid.y) / P.grid.y;
+  }
   rhs[cellIndex(c)] = -(div - expansion) / P.grid.y;
 }
 `
@@ -621,7 +760,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 `
 
 // 8. Modified MacCormack (Selle et al. 2008): the forward result plus half the round-trip error, clamped to the
-// values the forward step interpolated between; then dissipation, cooling and the source.
+// values the forward step interpolated between; then dissipation, cooling, the source and, in a fire, combustion.
 export const COMBINE = /* wgsl */ `
 ${SIM_COMMON}
 @group(0) @binding(1) var samp: sampler;
@@ -630,6 +769,8 @@ ${SIM_COMMON}
 @group(0) @binding(4) var s1: texture_3d<f32>;
 @group(0) @binding(5) var s2: texture_3d<f32>;
 @group(0) @binding(6) var dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(7) var<storage, read> fireSums: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> hrr: array<f32>; // heat release rate, W/m3
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -656,31 +797,70 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // Near the open top the smoke disperses faster, so it thins out before the boundary instead of being cut there.
   let top = smoothstep(0.7, 1.0, (f32(id.y) + 0.5) / f32(n.y));
   phi.x = max(phi.x, 0.0) * exp(-(P.decay.y + 2.5 * top) * dt);
-  phi.y = P.grid.w + (max(phi.y, P.grid.w) - P.grid.w) * exp(-P.decay.x * dt);
-  phi.z = max(phi.z, 0.0);
-  // Combustion, with a reaction coordinate (after Nguyen et al. 2002): the fuel field is the fraction of the reaction
-  // left, 1 as gas leaves the source, falling at the burn rate (per second) once it is hotter than the ignition
-  // temperature; what burns releases heat (the buoyancy). Soot survives as smoke where the flame burns out, so it is
-  // released as the reaction runs down (weighted toward its end), not where the flame is bright. The flame field is
-  // the reaction left where it burns: it sets the radiating temperature and the expansion, and fades once the
-  // reaction has run out.
+  phi.y = max(phi.y, 0.0) * exp(-P.decay.x * dt); // a temperature rise, or a fire's density deficit
   let m = sourceMask(worldOf(vec3<f32>(id) + 0.5));
-  phi.w = max(phi.w, 0.0) * exp(-P.fire2.z * dt);
-  if (phi.z > 0.0 && phi.y > P.fire2.w) {
-    let burned = min(phi.z, P.fire.z * dt);
-    phi.z -= burned;
-    phi.y += P.fire.w * burned;
-    let spent = 1.0 - phi.z;
-    phi.x += P.fire2.y * burned * 3.0 * spent * spent;
-    phi.w = max(phi.w, phi.z);
-  }
   if (P.fire.x > 0.5) {
-    phi.z = max(phi.z, P.fire.y * m);
+    // Fuel vapour from the bed mixes in by mass (and its volume pushes out through the pressure solve).
+    var g = gasOf(phi);
+    g.z = min(g.z, 1.0);
+    g.fuel = min(g.fuel, g.z);
+    let a = fuelAdded(g, worldOf(vec3<f32>(id) + 0.5), fireSums[2].x, dt);
+    g.z = (g.z + a) / (1.0 + a);
+    g.fuel = (g.fuel + a) / (1.0 + a);
+    g.soot = g.soot / (1.0 + a);
+    // Burning: the fuel burned heats the gas (less the share radiated away) and leaves soot at the fuel's yield.
+    let burned = fuelBurned(g, dt);
+    hrr[cellIndex(c)] = burned * HEAT * RHO_T / (T_AMB + g.rise) / dt;
+    g.fuel -= burned;
+    g.rise = min(g.rise + heatRise(burned), 2200.0);
+    g.soot += SOOT_G * P.fire.z * burned;
+    phi = storeGas(g);
   } else {
     phi.x = max(phi.x, P.srcProps.x * m);
+    phi.y = max(phi.y, P.srcProps.y * m);
   }
-  phi.y = max(phi.y, P.srcProps.y * m);
   textureStore(dst, c, phi);
+}
+`
+
+// 8b. Subgrid mixing, as large-eddy simulations model it: motion finer than the grid mixes the scalars at the eddy
+// diffusivity D = (C_s dx)^2 |S| / Sc_t, Smagorinsky's eddy viscosity (|S| the resolved strain rate) over a
+// turbulent Schmidt number. The velocity, advected semi-Lagrangian, already loses more to its own scheme than an
+// eddy viscosity would take; the scalars, advected with the sharper MacCormack, need the model, or a fire's fuel rises
+// in an unmixed column far past the flame's height. One explicit step, well inside its stability limit.
+export const DIFFUSE = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var vel: texture_3d<f32>;
+@group(0) @binding(2) var src: texture_3d<f32>;
+@group(0) @binding(3) var dst: texture_storage_3d<rgba16float, write>;
+const C_S = ${wf(SMAGORINSKY)};
+const SC_T = ${wf(SCHMIDT_T)};
+
+fn vc(c0: vec3<i32>) -> vec3<f32> {
+  let c = clamp(c0, vec3<i32>(0), nCells() - 1);
+  let a = textureLoad(vel, c, 0);
+  return 0.5 * vec3<f32>(a.x + textureLoad(vel, c + X, 0).x, a.y + textureLoad(vel, c + Y, 0).y, a.z + textureLoad(vel, c + Z, 0).z);
+}
+fn at(c: vec3<i32>) -> vec4<f32> { return textureLoad(src, clamp(c, vec3<i32>(0), nCells() - 1), 0); }
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let dx = P.grid.x;
+  // The resolved strain rate, |S| = sqrt(2 S_ij S_ij), from central differences of the cell-centred velocity.
+  let gx = (vc(c + X) - vc(c - X)) / (2.0 * dx);
+  let gy = (vc(c + Y) - vc(c - Y)) / (2.0 * dx);
+  let gz = (vc(c + Z) - vc(c - Z)) / (2.0 * dx);
+  let sxy = 0.5 * (gy.x + gx.y);
+  let sxz = 0.5 * (gz.x + gx.z);
+  let syz = 0.5 * (gz.y + gy.z);
+  let s2 = gx.x * gx.x + gy.y * gy.y + gz.z * gz.z + 2.0 * (sxy * sxy + sxz * sxz + syz * syz);
+  let d = (C_S * dx) * (C_S * dx) * sqrt(2.0 * s2) / SC_T;
+  let k = min(d * P.grid.y / (dx * dx), 0.15);
+  let phi = at(c);
+  let lap = at(c + X) + at(c - X) + at(c + Y) + at(c - Y) + at(c + Z) + at(c - Z) - 6.0 * phi;
+  textureStore(dst, c, phi + k * lap);
 }
 `
 
@@ -689,17 +869,32 @@ struct RParams {
   camPos: vec4<f32>,   // position (m), tan of half the vertical field of view
   camFwd: vec4<f32>,   // forward, aspect (width / height)
   camRight: vec4<f32>, // right, frame number
-  camUp: vec4<f32>,    // up, exposure (stops)
+  camUp: vec4<f32>,    // up, exposure (1 / the luminance in cd/m2 that the camera maps to white)
   sunDir: vec4<f32>,   // toward the sun, phase anisotropy g
-  sunCol: vec4<f32>,   // sun colour x intensity, extinction per unit density (1/m)
-  skyCol: vec4<f32>,   // sky colour x intensity, single-scattering albedo
+  sunCol: vec4<f32>,   // the sun's illuminance (lux) by colour, a smoke source's extinction per unit density (1/m)
+  skyCol: vec4<f32>,   // the sky's illuminance on open ground (lux) by colour, single-scattering albedo
   floorCol: vec4<f32>, // floor albedo, radius (m) over which the floor fades to black
-  size: vec4<f32>,     // render target width, height
+  size: vec4<f32>,     // render target width, height, simulation time (s), subgrid flame temperature (1 = the model)
   detail: vec4<f32>,   // weight of detail layer A, of layer B, amount, 1 / (8 x detail scale in m)
-  fire: vec4<f32>,     // flame intensity, kelvins per unit of temperature (peak flame K - 300), flame contrast (1 = physical), unused
-  shape: vec4<f32>,    // flame tongues: amount (0 = off), unused, unused, simulation time (s)
+  fire: vec4<f32>,     // source is a fire (0 or 1), extinction in red and in blue relative to green, flame eddies' rise (m/s)
+  wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear Rec.709; wind (m/s) in the first row's w
+  wb1: vec4<f32>,
+  wb2: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> R: RParams;
+
+const INV_PI = 0.31830989;
+const INV_2PI = 0.15915494;
+const INV_4PI = 0.07957747;
+const SOOT_KE = ${wf(SOOT_EXTINCTION)}; // m2 per kg of soot, at 550 nm
+
+// Extinction at the reference (green) wavelength, 1/m: a fire's soot by its mass per volume (its partial density), a
+// smoke source's smoke by its density. Red and blue scale by chroma().
+fn sigmaOf(s: vec4<f32>) -> f32 {
+  if (R.fire.x > 0.5) { return SOOT_KE * (RHO_T / T_AMB) * max(s.x, 0.0) / SOOT_G; }
+  return R.sunCol.w * max(s.x, 0.0);
+}
+fn chroma() -> vec3<f32> { return vec3<f32>(R.fire.y, 1.0, R.fire.z); }
 
 // Entry and exit distances of a ray through an axis-aligned box.
 fn boxHit(o: vec3<f32>, d: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> vec2<f32> {
@@ -721,7 +916,8 @@ fn edgeFade(uvw: vec3<f32>) -> f32 {
 fn uvwOf(w: vec3<f32>) -> vec3<f32> { return (w - P.origin.xyz) / (vec3<f32>(P.dims.xyz) * P.grid.x); }
 `
 
-// 9. Light: optical depth from each point of a half-resolution lattice toward the sun, and straight up (the sky).
+// 9. Light: optical depth (at 550 nm) from each point of a half-resolution lattice toward the sun, and straight up
+// (the sky).
 export const LIGHT = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
@@ -729,7 +925,7 @@ ${RENDER_COMMON}
 @group(0) @binding(3) var scal: texture_3d<f32>;
 @group(0) @binding(4) var lightOut: texture_storage_3d<rgba16float, write>;
 
-fn density(w: vec3<f32>) -> f32 { return textureSampleLevel(scal, samp, uvwOf(w), 0.0).x; }
+fn density(w: vec3<f32>) -> f32 { return sigmaOf(textureSampleLevel(scal, samp, uvwOf(w), 0.0)); }
 
 fn depth(w: vec3<f32>, d: vec3<f32>, ds: f32) -> f32 {
   let te = boxHit(w, d, P.origin.xyz, domainHi()).y;
@@ -740,7 +936,7 @@ fn depth(w: vec3<f32>, d: vec3<f32>, ds: f32) -> f32 {
     tau += density(w + d * t);
     t += ds;
   }
-  return tau * ds * R.sunCol.w;
+  return tau * ds;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -749,7 +945,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (any(id >= ld)) { return; }
   let ext = vec3<f32>(P.dims.xyz) * P.grid.x;
   let w = P.origin.xyz + (vec3<f32>(id) + 0.5) / vec3<f32>(ld) * ext;
-  // Occupancy: the largest density or flame in this cell's block of the grid, plus its neighbours' (one cell each way),
+  // Occupancy: the largest smoke or soot in this cell's block of the grid, plus its neighbours' (one cell each way),
   // so a march can stride through empty space without stepping over the edge of the smoke.
   let n = nCells();
   let b = vec3<i32>(id) * 2;
@@ -758,7 +954,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var y = -1; y <= 2; y++) {
       for (var x = -1; x <= 2; x++) {
         let q = textureLoad(scal, clamp(b + vec3<i32>(x, y, z), vec3<i32>(0), n - 1), 0);
-        occ = max(occ, max(q.x, q.w));
+        occ = max(occ, q.x);
       }
     }
   }
@@ -769,68 +965,72 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
-// Flame emission: blackbody colour and brightness (from the table in blackbody.ts) at the flame's radiating
-// temperature, which follows the reaction coordinate (the flame field): the peak flame temperature where the reaction
-// is fresh, at the base, cooling toward the tips as it runs out (a temperature profile along the reaction, after
-// Nguyen et al. 2002). The advected temperature drives buoyancy. The table holds true relative brightness; the
-// contrast exponent compresses it (1 = physical).
+// Blackbody radiance from the table in blackbody.ts: Planck's law through the CIE colour matching functions, as linear
+// Rec.709 in cd/m2. Below the table's range a blackbody is too dim to matter (at 500 K a billionth as bright as at
+// 1000 K, itself a dull red glow).
 function fireCommon(bbBinding: number) {
   return /* wgsl */ `
 @group(0) @binding(${bbBinding}) var<storage, read> bb: array<vec4<f32>>;
 const BB_MIN_K = ${BB_MIN_K}.0;
 const BB_MAX_K = ${BB_MAX_K}.0;
-fn blackbody(kelvin: f32) -> vec3<f32> {
+fn planck(kelvin: f32) -> vec3<f32> {
+  if (kelvin <= BB_MIN_K) { return vec3<f32>(0.0); }
   let n = arrayLength(&bb);
-  let x = clamp((kelvin - BB_MIN_K) / (BB_MAX_K - BB_MIN_K), 0.0, 1.0) * f32(n - 1u);
+  let x = min((kelvin - BB_MIN_K) / (BB_MAX_K - BB_MIN_K), 1.0) * f32(n - 1u);
   let i = u32(floor(x));
   let j = min(i + 1u, n - 1u);
-  let c = mix(bb[i], bb[j], x - f32(i));
-  // Contrast: keep the colour, raise the luminance to the exponent.
-  let lum = max(c.w, 1e-12);
-  return c.xyz / lum * pow(lum, R.fire.z);
-}
-fn emission(s: vec4<f32>) -> vec3<f32> {
-  if (s.w <= 1e-3 || R.fire.x <= 0.0) { return vec3<f32>(0.0); }
-  // The glowing soot stays near the peak temperature through most of the flame and cools over the last of the
-  // reaction (the last 40%), so the flame is bright up to its tips rather than only at its base.
-  let x = 1.0 - min(clamp(s.w, 0.0, 1.0) / 0.4, 1.0);
-  let kelvin = 300.0 + (1.0 - x * x) * R.fire.y;
-  return R.fire.x * blackbody(kelvin) * smoothstep(0.0, 0.08, s.w);
+  return mix(bb[i].xyz, bb[j].xyz, x - f32(i));
 }
 `
 }
 
-// 9b. The fire's light, for the smoke and the floor: its total emitted intensity and its brightness-weighted centre,
-// summed on the GPU each step (per workgroup, then across workgroups) and lit as a point light from there.
+// 9b. Sums over the grid, each step, per workgroup and then across workgroups: the fire's light, for the smoke and
+// the floor (its total emitted intensity, from soot too thin to hide itself, and its brightness-weighted centre, lit
+// as a point light from there); the fire bed's area (its mask's integral, which spreads the fuel); and the heat
+// release rate.
 export const FIRE_SUM = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
 ${fireCommon(3)}
 @group(0) @binding(2) var scal: texture_3d<f32>;
 @group(0) @binding(4) var<storage, read_write> partial: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> hrr: array<f32>;
 var<workgroup> sumE: array<vec4<f32>, 64>;
 var<workgroup> sumP: array<vec4<f32>, 64>;
+var<workgroup> sumB: array<vec4<f32>, 64>;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
   let c = vec3<i32>(id);
+  let vol = P.grid.x * P.grid.x * P.grid.x;
   var e = vec3<f32>(0.0);
-  if (all(c < nCells())) { e = emission(textureLoad(scal, c, 0)); }
+  var b = vec4<f32>(0.0);
+  if (all(c < nCells()) && P.fire.x > 0.5) {
+    let s = textureLoad(scal, c, 0);
+    // Emission per unit volume (cd/m3): what the soot absorbs times the blackbody radiance at its temperature.
+    let g = gasOf(s);
+    e = (1.0 - R.skyCol.w) * sigmaOf(s) * chroma() * planck(T_AMB + g.rise);
+    let bed = bedMask(worldOf(vec3<f32>(id) + 0.5)) * P.grid.x * P.grid.x;
+    b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
+  }
   let lum = dot(e, vec3<f32>(0.2126, 0.7152, 0.0722));
   sumE[li] = vec4<f32>(e, lum);
   sumP[li] = vec4<f32>(worldOf(vec3<f32>(id) + 0.5) * lum, 0.0);
+  sumB[li] = b;
   workgroupBarrier();
   for (var st = 32u; st > 0u; st = st >> 1u) {
     if (li < st) {
       sumE[li] += sumE[li + st];
       sumP[li] += sumP[li + st];
+      sumB[li] += sumB[li + st];
     }
     workgroupBarrier();
   }
   if (li == 0u) {
     let k = wid.x + nw.x * (wid.y + nw.y * wid.z);
-    partial[2u * k] = sumE[0];
-    partial[2u * k + 1u] = sumP[0];
+    partial[3u * k] = sumE[0];
+    partial[3u * k + 1u] = sumP[0];
+    partial[3u * k + 2u] = sumB[0];
   }
 }
 `
@@ -838,39 +1038,48 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
 export const FIRE_SUM_TOTAL = /* wgsl */ `
 @group(0) @binding(0) var<uniform> C: vec4<u32>; // x: number of partial sums
 @group(0) @binding(1) var<storage, read> partial: array<vec4<f32>>;
+// The emitted intensity summed over cells, per unit of cell volume (rgb, and its luminance); the centre; the bed's
+// area (m2) and the heat release rate (W).
 @group(0) @binding(2) var<storage, read_write> result: array<vec4<f32>>;
 var<workgroup> sE: array<vec4<f32>, 256>;
 var<workgroup> sP: array<vec4<f32>, 256>;
+var<workgroup> sB: array<vec4<f32>, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) li: u32) {
   var e = vec4<f32>(0.0);
   var p = vec4<f32>(0.0);
+  var b = vec4<f32>(0.0);
   for (var k = li; k < C.x; k += 256u) {
-    e += partial[2u * k];
-    p += partial[2u * k + 1u];
+    e += partial[3u * k];
+    p += partial[3u * k + 1u];
+    b += partial[3u * k + 2u];
   }
   sE[li] = e;
   sP[li] = p;
+  sB[li] = b;
   workgroupBarrier();
   for (var st = 128u; st > 0u; st = st >> 1u) {
     if (li < st) {
       sE[li] += sE[li + st];
       sP[li] += sP[li + st];
+      sB[li] += sB[li + st];
     }
     workgroupBarrier();
   }
   if (li == 0u) {
     result[0] = sE[0];
     result[1] = vec4<f32>(sP[0].xyz / max(sE[0].w, 1e-9), 0.0);
+    result[2] = sB[0];
   }
 }
 `
 
-// 10. The image: march each camera ray through the volume (Hillaire's integration of each step,
-// T (1 - exp(-sigma dt)) S), lit by the sun through the light volume with Wrenninge's multiple-scattering
-// octaves (a = b = c = 1/2, which conserves energy) and Henyey-Greenstein phase, and by the sky through the
-// optical depth above; then a floor that catches the smoke's shadow, fading to black; ACES tone mapping.
+// 10. The image, in photometric units: march each camera ray through the volume (Hillaire's integration of each
+// step, T (1 - exp(-sigma dt)) S), lit by the sun through the light volume with Wrenninge's multiple-scattering
+// octaves (a = b = c = 1/2, which conserves energy) and Henyey-Greenstein phase, by the sky through the optical depth
+// above, and by the fire; hot soot glows at its blackbody radiance; then a floor that catches the smoke's shadow,
+// fading to black; and a camera with a white balance, an exposure and ACES tone mapping.
 export const RENDER = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
@@ -922,28 +1131,34 @@ fn detail(w: vec3<f32>, uvw: vec3<f32>) -> f32 {
   return (na * wa + nb * wb) / max(sqrt(R.detail.x * R.detail.x + R.detail.y * R.detail.y), 1e-3);
 }
 
-// Flame tongues. The flame field is smooth at the grid's scale, but a flame's glowing zone is thin and sharp-edged:
-// tongues with dark gaps between them, whose tips break away as the flame runs out. A noise taller than it is wide,
-// rising with the flames and churning as it rises, offsets the flame value, and a narrow threshold on the result
-// carves the tongues (the noise also varies the brightness within them). The noise is not carried by the flow (the
-// updraft stretches anything it carries into streaks within a fraction of a second) but warped by a second noise, so
-// the tongues bend and split. The offset scales with the flame, so faint flame is never lifted into bright pockets,
-// and reaches into the dense flame at the base, so the fuel bed breaks into separate flames too.
-const TONGUE_TILE = 1.4; // m across the noise tile: tongues about 18 cm wide, 40 cm tall at the largest
-const TONGUE_RISE = 1.5; // m/s
-const TONGUE_EDGE = 0.3; // the flame value where a tongue's edge begins (it is fully lit 0.25 above)
-fn flameShape(w: vec3<f32>, f: f32, rot: mat3x3<f32>) -> f32 {
-  let t = R.shape.w;
-  let k = 1.0 / TONGUE_TILE;
-  var p = vec3<f32>(w.x * k, (w.y - TONGUE_RISE * t) * 0.45 * k, w.z * k + 0.35 * t);
+// Subgrid temperature. A flame's temperature varies on scales far finer than the grid (thin hot sheets, cooler gaps
+// between them), and a blackbody's brightness climbs so steeply with temperature that a flame looks nothing like its
+// cell-averaged temperature: the mean of the emission is not the emission at the mean temperature (the
+// turbulence-radiation interaction). The fluctuation's size comes from the resolved field, as in LES subgrid-variance
+// models (Pierce and Moin 1998): its standard deviation is a constant times the cell size times the temperature
+// gradient, so it is large at a flame's edges and nothing in uniform gas. Only its shape is synthesised: a noise
+// taller than it is wide (the updraft stretches the flame's sheets), rising with the flames' eddies, drifting with
+// the wind and churning as it rises, warped by a second noise so the sheets bend and split. It is not carried by the
+// flow, which would stretch it into streaks within a fraction of a second.
+const FLAME_TILE = 1.4; // m across the noise tile: the largest sheets about 18 cm wide, 40 cm tall
+const SGS_C = 0.4; // the gradient model's constant (the square root of the variance model's, about 0.16)
+fn riseAt(uvw: vec3<f32>) -> f32 { return riseOf(textureSampleLevel(scal, samp, uvw, 0.0)); }
+fn subgridKelvin(w: vec3<f32>, uvw: vec3<f32>, rot: mat3x3<f32>) -> f32 {
+  let e = 1.0 / vec3<f32>(P.dims.xyz);
+  let gx = riseAt(uvw + vec3<f32>(e.x, 0.0, 0.0)) - riseAt(uvw - vec3<f32>(e.x, 0.0, 0.0));
+  let gy = riseAt(uvw + vec3<f32>(0.0, e.y, 0.0)) - riseAt(uvw - vec3<f32>(0.0, e.y, 0.0));
+  let gz = riseAt(uvw + vec3<f32>(0.0, 0.0, e.z)) - riseAt(uvw - vec3<f32>(0.0, 0.0, e.z));
+  // dx |grad T| is half the central difference.
+  let sd = R.size.w * SGS_C * 0.5 * length(vec3<f32>(gx, gy, gz));
+  let t = R.size.z;
+  let k = 1.0 / FLAME_TILE;
+  var p = (w - vec3<f32>(R.wb0.w, R.fire.w, 0.0) * t) * vec3<f32>(k, 0.45 * k, k) + vec3<f32>(0.0, 0.0, 0.35 * t);
   let warp = textureSampleLevel(noiseTex, noiseSamp, rot * (0.5 * p) + vec3<f32>(0.11, 0.53, 0.29), 0.0).yz - 0.5;
   p.x += 0.9 * warp.x;
   p.z += 0.9 * warp.y;
   let n = textureSampleLevel(noiseTex, noiseSamp, rot * p, 0.0).x;
-  // The fbm's values cluster about its middle (a standard deviation of about 0.2): stretched to about -1 to 1.
-  let v = clamp((n - 0.5) * 4.0, -1.0, 1.0);
-  let level = f + R.shape.x * v * (smoothstep(0.0, 0.3, f) + 0.8 * f);
-  return smoothstep(TONGUE_EDGE, TONGUE_EDGE + 0.25, level) * (1.0 + R.shape.x * v);
+  // The fbm's values cluster about its middle (a standard deviation of about 0.2): scaled to about unit variance.
+  return sd * clamp((n - 0.5) * 5.0, -2.5, 2.5);
 }
 
 // Stephen Hill's fit of the ACES RRT and sRGB ODT (rows of the input and output matrices).
@@ -976,11 +1191,13 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let ph1 = hg(cosT, 0.5 * g);
   let ph2 = hg(cosT, 0.25 * g);
   let albedo = R.skyCol.w;
-  let sigScale = R.sunCol.w;
+  let ch = chroma();
+  let rot = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
   let fireVolume = P.grid.x * P.grid.x * P.grid.x; // each cell's emission counts over its volume
 
+  // Radiance in cd/m2, per colour channel (soot dims blue more than red, so transmittance is a colour too).
   var col = vec3<f32>(0.0);
-  var T = 1.0;
+  var T = vec3<f32>(1.0);
   if (box.y > max(box.x, 0.0) && box.x < tFloor) {
     let t0 = max(box.x, 0.0);
     let ds = 0.45 * P.grid.x;
@@ -997,62 +1214,68 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       t += ds;
       let fade = edgeFade(uvw);
       let s4 = textureSampleLevel(scal, samp, uvw, 0.0);
-      var d = s4.x * fade;
-      var flame = s4.w * fade;
-      if (d > 1e-4 || flame > 1e-3) {
+      var sig = sigmaOf(s4) * fade;
+      if (sig > 1e-3) {
         // Upres detail: strongest in thin smoke (the edges and wisps), a third as strong in the dense core, and fading
         // out in the faintest haze, where fine noise reads as grain.
-        var f = 1.0;
         if (R.detail.z > 0.0) {
-          let thin = 1.0 - smoothstep(0.02, 0.4, d);
-          let faint = smoothstep(0.0, 0.1, d);
-          f = clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
-        }
-        d *= f;
-        var tongues = 1.0;
-        if (flame > 1e-3 && R.shape.x > 0.0) {
-          tongues = flameShape(w, flame, mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6));
+          let thin = 1.0 - smoothstep(0.2, 4.0, sig);
+          let faint = smoothstep(0.0, 1.0, sig);
+          sig *= clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
         }
         let L = textureSampleLevel(light, samp, uvw, 0.0);
-        let tau = L.x;
-        let lsun = exp(-tau) * ph0 + 0.5 * exp(-0.5 * tau) * ph1 + 0.25 * exp(-0.25 * tau) * ph2;
-        let amb = R.skyCol.xyz * exp(-0.5 * L.y);
-        // The fire as a point light at its brightness-weighted centre (softened over its size): I / (4 pi r^2).
+        let tauS = L.x * ch;
+        let lsun = exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2;
+        // The sky as a uniform dome over open ground (radiance E / pi), half of it seen by an isotropic scatterer.
+        let amb = R.skyCol.xyz * INV_2PI * exp(-0.5 * L.y * ch);
+        // The fire as a point light at its brightness-weighted centre (softened over its size): E = I / r^2.
         let toFire = fireLight[1].xyz - w;
-        let fireE = fireLight[0].xyz * fireVolume / (12.566371 * (dot(toFire, toFire) + FIRE_R2));
-        let S = albedo * (R.sunCol.xyz * lsun + amb + fireE);
-        let Ts = exp(-d * sigScale * ds);
-        col += T * ((1.0 - Ts) * S + emission(vec4<f32>(s4.xyz, flame)) * tongues * ds);
+        let fireE = fireLight[0].xyz * fireVolume / (dot(toFire, toFire) + FIRE_R2);
+        // Light scattered toward the camera per unit of extinction, cd/m2: the phase function is hg / (4 pi).
+        let S = albedo * (R.sunCol.xyz * INV_4PI * lsun + amb + fireE * INV_4PI);
+        // Emission (Kirchhoff's law): what the soot absorbs, it emits at the blackbody radiance of its temperature.
+        var B = vec3<f32>(0.0);
+        let rise = riseOf(s4);
+        if (R.fire.x > 0.5 && rise > 400.0) {
+          var kelvin = T_AMB + rise;
+          if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(w, uvw, rot)); }
+          B = (1.0 - albedo) * planck(kelvin);
+        }
+        // Integrated exactly over the step for constant properties (Hillaire 2015).
+        let Ts = exp(-sig * ch * ds);
+        col += T * (1.0 - Ts) * (S + B);
         T *= Ts;
-        if (T < 0.004) { break; }
+        if (max(T.x, max(T.y, T.z)) < 0.004) { break; }
       }
     }
   }
 
-  if (tFloor < 1e8 && T > 0.004) {
+  if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     let pf = ro + rd * tFloor;
     let fade = exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w));
     // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
     let sb = boxHit(pf, sun, P.origin.xyz, domainHi());
-    var shadow = 1.0;
+    var shadow = vec3<f32>(1.0);
     if (sb.y > max(sb.x, 0.0)) {
       let pe = pf + sun * max(sb.x, 0.0) + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0);
-      shadow = exp(-textureSampleLevel(light, samp, uvwOf(pe), 0.0).x);
+      shadow = exp(-textureSampleLevel(light, samp, uvwOf(pe), 0.0).x * ch);
     }
-    var skyVis = 1.0;
+    var skyVis = vec3<f32>(1.0);
     let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
     if (all(uv.xz >= vec2<f32>(0.0)) && all(uv.xz <= vec2<f32>(1.0))) {
-      skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y);
+      skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y * ch);
     }
-    // The fire's light on the floor: Lambertian, I cos / r^2 / pi.
+    // Illuminance on the floor (lux): the sun, the sky and the fire (I cos / r^2), seen as Lambertian radiance E / pi.
     let toFire = fireLight[1].xyz - pf;
     let r2 = dot(toFire, toFire) + FIRE_R2;
-    let fireE = fireLight[0].xyz * fireVolume * max(toFire.y, 0.0) / (sqrt(r2) * r2 * 3.14159265);
-    let lf = R.floorCol.xyz * (R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis + fireE);
-    col += T * lf * fade;
+    let fireE = fireLight[0].xyz * fireVolume * max(toFire.y, 0.0) / (sqrt(r2) * r2);
+    let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis + fireE;
+    col += T * R.floorCol.xyz * INV_PI * E * fade;
   }
 
-  let mapped = srgb(aces(col * exp2(R.camUp.w)));
+  // The camera: white balance, exposure (the luminance it maps to white), then the tone curve.
+  let balanced = vec3<f32>(dot(R.wb0.xyz, col), dot(R.wb1.xyz, col), dot(R.wb2.xyz, col));
+  let mapped = srgb(aces(max(balanced, vec3<f32>(0.0)) * R.camUp.w));
   return vec4<f32>(mapped + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0);
 }
 `

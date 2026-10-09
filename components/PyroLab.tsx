@@ -24,7 +24,7 @@ const PYRO_TABS = [
 const TECH_NOTES: [string, string][] = [
   [
     'Solver',
-    'Air and smoke on a staggered grid, the layout production solvers use: velocity on the cell faces, density and temperature at the cell centres. Each step, 30 per simulated second, advects the velocity (semi-Lagrangian, with a second-order backtrace), adds the forces, then makes the flow incompressible with a pressure solve and projection.',
+    'Air, smoke and fire on a staggered grid, the layout production solvers use: velocity on the cell faces, everything else at the cell centres. Each step, 30 per simulated second, advects the velocity, adds the forces, then projects the flow with a pressure solve: incompressible, except where burning gas expands.',
   ],
   [
     'Pressure',
@@ -32,19 +32,23 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Advection',
-    'Density and temperature move with Modified MacCormack: a forward and a backward semi-Lagrangian step, half the round-trip error added back, then clamped to the values the forward step read, so detail survives without new extremes. Semi-Lagrangian alone is the softer, more diffusive choice.',
+    'Velocity and scalars move with Modified MacCormack: a forward and a backward semi-Lagrangian step, half the round-trip error added back, then clamped to the values the forward step read, so detail survives without new extremes. Semi-Lagrangian alone is the softer, more diffusive choice.',
   ],
   [
     'Forces',
-    'Buoyancy from temperature; vorticity confinement, which restores the small swirls a coarse grid smooths away; divergence-free turbulence from the curl of a noise potential, where there is smoke or flame, which rises with the plume and churns as it rises (held still, it would push the gas the same way at the same places, and the updraft would draw those pushes out into steady vertical streaks); wind; and the source’s upward push. Hot air cools and smoke dissipates at the rates in the Forces tab.',
+    'Buoyancy at its physical strength: gas hotter than the air around it rises at g (T − T₀) / T₀. Vorticity confinement, which restores the small swirls a coarse grid smooths away. Divergence-free turbulence from the curl of a noise potential, rising with the plume and churning as it rises (held still, the updraft would draw its pushes out into steady vertical streaks): for a smoke source its strength is the Turbulence control, in m/s²; for a fire it is a turbulence model, calibrated against measurements (see Validation). Wind, and a smoke source’s push. Cooling and dissipation default to 0: the plume cools by mixing with the air it draws in.',
   ],
   [
     'Combustion',
-    'A fire source emits fuel instead of smoke, tracked as a reaction coordinate: the share of the reaction still to come, 1 as the gas leaves the source, running down at the burn rate while the gas is hotter than its ignition point. As it burns it releases heat, which drives the buoyancy, and soot, mostly toward the end of the reaction, where a flame turns to smoke. Burning gas expands: where there is flame, the pressure solve makes the flow diverge by the expansion rate instead of not at all, which gives flames their outward push and flicker.',
+    'The fire follows the fast-chemistry model of NIST’s Fire Dynamics Simulator (FDS), the standard tool of fire-safety engineering. The bed is a disc on the floor that gives off wood gas (Douglas-fir volatiles, C3.4H6.2O2.5) through its surface at the rate that releases the chosen heat, as FDS models a burning surface, the vapour pushing out at its own small blowing speed. Two fields track it: the mixture fraction, the share of the gas that came from the fuel, and the fuel still unburned. In each cell, fuel burns with the oxygen mixed in with it as fast as turbulence mixes them (the eddy dissipation concept, with FDS’s buoyant mixing time, √(2Δx / g)), so the flame sits where fuel meets air, a sheet around a fuel-rich core, and its height comes out of the simulation rather than a control. Burning a kilogram of the fuel takes 1.36 kg of oxygen and releases 17.8 MJ (13.1 MJ per kilogram of oxygen, Huggett’s constant); 30% of the heat is radiated away and the rest heats the gas, and 1.5% of the fuel’s mass becomes soot, wood’s measured yield. Heated gas expands at (dT/dt) / T, which the pressure solve turns into the flame’s outward push.',
+  ],
+  [
+    'Mixing',
+    'Two corrections make a coarse grid mix the way gas does. A fire’s fields are kept per unit volume (the density deficit and partial densities) rather than as a temperature and mass fractions, because the solver mixes by volume and gas mixes by mass: equal volumes of 1300 K gas and 293 K air make 478 K, not the 796 K an average of temperatures gives. Without this the plume stayed three times too hot. And mixing finer than the grid, as large-eddy simulations model it: Smagorinsky’s eddy diffusivity over a turbulent Schmidt number (0.2 and 0.5, FDS’s values), on the scalars.',
   ],
   [
     'Flames',
-    'Flames emit light at the blackbody colour and brightness of their temperature: Planck\u2019s law integrated against the CIE colour matching functions. The radiating temperature follows the reaction: the flame\u2019s peak (2100 K by default) through most of the flame, cooling over the last of the reaction toward the tips, which gives the yellow-to-orange-to-red of a real flame. The grid is too coarse for a flame\u2019s thin, sharp-edged tongues, so the renderer carves them: a noise taller than it is wide, rising with the flames and churning as it rises, offsets the flame, and a narrow threshold cuts tongues with dark gaps between them (Flame detail sets how deeply). The noise is not carried by the flow, which would stretch it into streaks within a fraction of a second. Real flames span a huge range of brightness, a 2000 K core about 60 times brighter than a 1500 K edge; the contrast control compresses it, 1 being physical. The fire also lights the smoke and the floor, as a point light at its brightness-weighted centre carrying its total emitted light, summed on the GPU every step; the smoke does not shadow that light.',
+    'Nothing glows but soot. Hot soot emits what it absorbs times the blackbody radiance of its temperature (Kirchhoff’s law), so a flame’s colour and brightness follow from the simulated temperature and soot alone: Planck’s law through the CIE colour matching functions, in absolute units (a blackbody at 2042 K comes out at 600,000 cd/m², the old definition of the candle). The soot’s extinction is the measured 8.7 m²/g of flame smoke and its albedo 0.25, and it absorbs blue more than red (as 1/λ), so it reddens what shines through it. Below about 1000 K its glow is too faint to see, which is where the visible flame ends. A cell’s temperature is an average, and a blackbody’s glow climbs so steeply with temperature that the average glow is far from the glow at the average temperature (the turbulence-radiation interaction), so the renderer adds the temperature fluctuation finer than the grid: its size from the resolved temperature gradient, as large-eddy simulations model a subgrid variance (Pierce and Moin), only its shape from a noise that rises with the flames and churns (Flame detail scales it; 0 renders the cell averages). The fire lights the smoke and the floor as a point light at its brightness-weighted centre, carrying its total emitted light, summed on the GPU every step; the smoke does not shadow that light.',
   ],
   [
     'Detail',
@@ -53,15 +57,19 @@ const TECH_NOTES: [string, string][] = [
   ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
   [
     'Rendering',
-    'Each pixel marches through the volume and integrates the light over each step in closed form. Sunlight reaches every point through the smoke’s optical depth toward the sun, recomputed each frame on a half-resolution grid. Multiple-scattering octaves stand in for light bouncing inside the smoke, the sky lights it from above through the smoke overhead, and the floor takes its shadow.',
+    'Each pixel marches through the volume and integrates each step in closed form, in photometric units (cd/m²), each colour channel on its own. Sunlight reaches every point through the optical depth toward the sun, recomputed each frame on a half-resolution grid; multiple-scattering octaves stand in for light bouncing inside the smoke; the sky lights it from above through the smoke overhead; the floor takes its shadow and the fire’s light.',
   ],
   [
-    'Display',
-    'ACES filmic tone mapping through a fitted curve (the lookdev lab applies the full ACES 2.0 transform; the fit keeps the per-pixel cost small).',
+    'Camera',
+    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then ACES filmic tone mapping through a fitted curve. The fire is shot at dusk at EV 7, so its brightest flames saturate to yellow-white, as they do in photographs.',
+  ],
+  [
+    'Validation',
+    'The fire was checked against fire-science measurements, on a uniform 0.6 m bed (the renderer plays no part). At this grid the solver resolves too little of the turbulence that mixes air into a plume (with none, the plume stays three to four times too hot), so the fire’s turbulence is a model: eddies of the fire’s own velocity, u² / l with u = 1.9 Q^(1/5) m/s (McCaffrey’s velocity scale), times one constant, calibrated on an 80 kW fire against McCaffrey’s measured centreline temperatures, as FDS calibrates its mixing constant against flame heights. With that one constant, the time-averaged centreline temperature over the intermittent flame comes within 25% of McCaffrey’s measurements at 40, 80 and 150 kW, and over the plume above it within 40% (cooler than measured for the small fire, close for the large one); in the continuous flame the simulation runs 10 to 60% hotter than McCaffrey’s thermocouples, which he estimated read about 20% low there. The fire puffs at 1.6 to 2.0 Hz, against 1.9 Hz from Cetegen and Ahmed’s correlation for this bed. Semi-Lagrangian advection does not conserve mass exactly: 9 to 16% of the fuel the bed gives off is lost before it burns, so an 80 kW setting releases about 70 kW.',
   ],
   [
     'Limits',
-    'A real-time study rather than a production simulation: the grid is coarse (at most 200 × 80 × 40 cells over a box 4.8 m wide), velocity is stored at half precision, and a GPU that cannot keep up runs the simulation in slow motion rather than taking longer, less stable steps. Production pyro adds sparse and adaptive grids, far larger multigrid solves, collisions and combustion.',
+    'A real-time study rather than a production simulation: the grid is coarse (at most 200 × 80 × 40 cells over a box 4.8 m wide), velocity is stored at half precision, the pressure solve treats the gas as one density (FDS solves for a variable one), and a GPU that cannot keep up runs the simulation in slow motion. The chemistry is infinitely fast (no ignition, extinction or smouldering), soot forms at a fixed yield rather than forming and burning out within the flame, and the fire’s light is unshadowed. Production pyro adds sparse and adaptive grids, far larger solves and collisions.',
   ],
 ]
 
@@ -358,15 +366,17 @@ export default function PyroLab() {
                 <div className="lab-row">
                   <Slider label="Radius" min={0.08} max={0.4} step={0.01} value={pyro.srcRadius} unit=" m" onChange={v => update({ srcRadius: v })} />
                   {pyro.sourceType === 'fire' ? (
-                    <Slider label="Fuel" min={0.2} max={2} step={0.05} value={pyro.srcFuel} onChange={v => update({ srcFuel: v })} />
+                    <Slider label="Heat release" min={10} max={200} step={5} value={pyro.heatRelease} digits={0} unit=" kW" onChange={v => update({ heatRelease: v })} />
                   ) : (
                     <Slider label="Density" min={0.2} max={2} step={0.05} value={pyro.srcDensity} onChange={v => update({ srcDensity: v })} />
                   )}
                 </div>
-                <div className="lab-row">
-                  <Slider label="Temperature" min={0.2} max={2} step={0.05} value={pyro.srcTemp} onChange={v => update({ srcTemp: v })} />
-                  <Slider label="Speed" min={0} max={2} step={0.05} value={pyro.srcSpeed} unit=" m/s" onChange={v => update({ srcSpeed: v })} />
-                </div>
+                {pyro.sourceType === 'smoke' && (
+                  <div className="lab-row">
+                    <Slider label="Temperature" min={10} max={300} step={5} value={pyro.srcTemp} digits={0} unit=" K" onChange={v => update({ srcTemp: v })} />
+                    <Slider label="Speed" min={0} max={2} step={0.05} value={pyro.srcSpeed} unit=" m/s" onChange={v => update({ srcSpeed: v })} />
+                  </div>
+                )}
                 <div className="lab-row">
                   <Slider label="Noise" min={0} max={1} step={0.05} value={pyro.srcNoise} onChange={v => update({ srcNoise: v })} />
                 </div>
@@ -375,7 +385,7 @@ export default function PyroLab() {
             {tab === 'forces' && (
               <>
                 <div className="lab-row">
-                  <Slider label="Buoyancy" min={0} max={5} step={0.1} value={pyro.buoyancy} digits={1} onChange={v => update({ buoyancy: v })} />
+                  <Slider label="Buoyancy" min={0} max={2} step={0.05} value={pyro.buoyancy} onChange={v => update({ buoyancy: v })} />
                   <Slider label="Vorticity" min={0} max={1} step={0.01} value={pyro.vorticity} onChange={v => update({ vorticity: v })} />
                 </div>
                 <div className="lab-row">
@@ -389,29 +399,26 @@ export default function PyroLab() {
                   <Slider label="Cooling" min={0} max={2} step={0.05} value={pyro.cooling} unit=" /s" onChange={v => update({ cooling: v })} />
                   <Slider label="Dissipation" min={0} max={0.5} step={0.01} value={pyro.dissipation} unit=" /s" onChange={v => update({ dissipation: v })} />
                 </div>
+                <p className="lab-note">
+                  {pyro.sourceType === 'fire'
+                    ? 'Buoyancy 1 is physical, Turbulence 1 the calibrated turbulence model, Cooling and Dissipation 0 physical.'
+                    : 'Turbulence in m/s². Buoyancy 1 is physical.'}
+                </p>
               </>
             )}
             {tab === 'fire' && (
               <>
                 <div className="lab-row">
-                  <Slider label="Burn rate" min={0.2} max={3} step={0.05} value={pyro.burnRate} unit=" /s" onChange={v => update({ burnRate: v })} />
-                  <Slider label="Heat" min={0} max={4} step={0.05} value={pyro.heat} onChange={v => update({ heat: v })} />
+                  <Slider label="Soot yield" min={0} max={0.1} step={0.001} value={pyro.sootYield} digits={3} unit=" kg/kg" onChange={v => update({ sootYield: v })} />
+                  <Slider label="Radiant fraction" min={0.1} max={0.5} step={0.01} value={pyro.radiantFraction} onChange={v => update({ radiantFraction: v })} />
                 </div>
                 <div className="lab-row">
-                  <Slider label="Expansion" min={0} max={4} step={0.05} value={pyro.expansion} unit=" /s" onChange={v => update({ expansion: v })} />
-                  <Slider label="Soot" min={0} max={1.5} step={0.05} value={pyro.soot} onChange={v => update({ soot: v })} />
-                </div>
-                <div className="lab-row">
-                  <Slider label="Flame intensity" min={0} max={4} step={0.05} value={pyro.flameIntensity} onChange={v => update({ flameIntensity: v })} />
-                  <Slider label="Flame temperature" min={1200} max={2600} step={10} value={pyro.flameKelvin} digits={0} unit=" K" onChange={v => update({ flameKelvin: v })} />
-                </div>
-                <div className="lab-row">
-                  <Slider label="Flame contrast" min={0.2} max={1} step={0.05} value={pyro.flameContrast} onChange={v => update({ flameContrast: v })} />
-                  <Slider label="Flame detail" min={0} max={1} step={0.05} value={pyro.flameDetail} onChange={v => update({ flameDetail: v })} />
+                  <Slider label="Expansion" min={0} max={1.5} step={0.05} value={pyro.expansion} onChange={v => update({ expansion: v })} />
+                  <Slider label="Flame detail" min={0} max={2} step={0.05} value={pyro.flameDetail} onChange={v => update({ flameDetail: v })} />
                 </div>
                 <p className="lab-note">
                   {pyro.sourceType === 'fire'
-                    ? 'Flame temperature: the gas at its hottest, where burning a full measure of fuel takes it. Flame contrast 1 is physical blackbody brightness. Flame detail 0 shows the simulated flame without its tongues.'
+                    ? 'Wood burns with a soot yield of 0.015 and radiates 0.3 of its heat. Expansion and buoyancy 1 are physical. Flame detail 0 shows the flame at the grid\u2019s resolution.'
                     : 'These act on a fire source: choose Fire under Source.'}
                 </p>
               </>
@@ -419,7 +426,9 @@ export default function PyroLab() {
             {tab === 'shading' && (
               <>
                 <div className="lab-row">
-                  <Slider label="Smoke density" min={2} max={60} step={1} value={pyro.densityScale} digits={0} unit=" /m" onChange={v => update({ densityScale: v })} />
+                  {pyro.sourceType === 'smoke' && (
+                    <Slider label="Smoke density" min={2} max={60} step={1} value={pyro.densityScale} digits={0} unit=" /m" onChange={v => update({ densityScale: v })} />
+                  )}
                   <Slider label="Albedo" min={0.1} max={1} step={0.01} value={pyro.albedo} onChange={v => update({ albedo: v })} />
                   <Slider label="Anisotropy" min={-0.5} max={0.9} step={0.01} value={pyro.anisotropy} onChange={v => update({ anisotropy: v })} />
                 </div>
@@ -428,15 +437,21 @@ export default function PyroLab() {
                   <Slider label="Light elevation" min={5} max={85} step={1} value={pyro.lightEl} digits={0} unit={'°'} onChange={v => update({ lightEl: v })} />
                 </div>
                 <div className="lab-row">
-                  <Slider label="Sun" min={0} max={8} step={0.1} value={pyro.sunIntensity} digits={1} onChange={v => update({ sunIntensity: v })} />
-                  <Slider label="Sky" min={0} max={2} step={0.05} value={pyro.skyIntensity} onChange={v => update({ skyIntensity: v })} />
-                  <Slider label="Exposure" min={-3} max={3} step={0.1} value={pyro.exposure} digits={1} unit=" EV" onChange={v => update({ exposure: v })} />
+                  <Slider label="Sun" min={-4} max={16} step={0.5} value={pyro.sunEV} digits={1} unit=" EV" onChange={v => update({ sunEV: v })} />
+                  <Slider label="Sky" min={-4} max={14} step={0.5} value={pyro.skyEV} digits={1} unit=" EV" onChange={v => update({ skyEV: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Exposure" min={-2} max={16} step={0.25} value={pyro.exposure} digits={2} unit=" EV" onChange={v => update({ exposure: v })} />
+                  <Slider label="White balance" min={2000} max={10000} step={100} value={pyro.whiteBalance} digits={0} unit=" K" onChange={v => update({ whiteBalance: v })} />
                 </div>
                 <div className="lab-row">
                   <Slider label="Detail" min={0} max={1.5} step={0.05} value={pyro.detail} onChange={v => update({ detail: v })} />
                   <Slider label="Detail scale" min={0.02} max={0.2} step={0.005} value={pyro.detailScale} digits={3} unit=" m" onChange={v => update({ detailScale: v })} />
                 </div>
-                <p className="lab-note">Pause the simulation to relight a frozen frame: shading changes redraw at once.</p>
+                <p className="lab-note">
+                  Light as a meter reads it: the sun and sky are incident readings (2.5 × 2^EV lux), the exposure is the camera’s EV at ISO 100.
+                  Pause the simulation to relight a frozen frame: shading changes redraw at once.
+                </p>
               </>
             )}
             {tab === 'solver' && (

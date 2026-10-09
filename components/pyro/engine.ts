@@ -35,6 +35,10 @@ const STIR_RADIUS = 0.3 // m
 const DETAIL_PERIOD = 1 // s of simulation between resets of each upres layer (half a period apart); the plume stretches them fast
 const NOISE_SIZE = 64 // texels along each side of the tileable detail noise
 const TAA_WEIGHT = 0.2 // the current frame's share of the accumulated image while simulating
+// Spatiotemporal blue noise for the march's offsets: 64 x 64 x 16, made by void and cluster with Wolfe et al.'s energy
+// (tools/stbn_gen.py) and served as a file.
+const STBN_SLICES = 16
+const STBN_URL = '/pyro/stbn-64x64x16.bin'
 const TAA_SETTLE = 24 // frames a paused image accumulates (a running average) before it stops redrawing
 // The sun's and the sky's colours, each scaled to unit luminance (the EV controls set the illuminance).
 const unitLum = (c: Vec3): Vec3 => c.map(v => v / (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])) as Vec3
@@ -442,8 +446,23 @@ export class PyroEngine {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
     })
-    this.blueTex = d.createTexture({ size: [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
-    d.queue.writeTexture({ texture: this.blueTex }, blueNoise(), { bytesPerRow: BLUE_NOISE_SIZE }, [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE])
+    // The march's offsets: spatiotemporal blue noise, a slice a frame. Until the mask has loaded, the 2D blue noise
+    // stepped by the golden ratio from slice to slice, as the renderer began.
+    this.blueTex = d.createTexture({ size: [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE, STBN_SLICES], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    const tile = blueNoise()
+    const slices = new Uint8Array(BLUE_NOISE_SIZE * BLUE_NOISE_SIZE * STBN_SLICES)
+    for (let k = 0; k < STBN_SLICES; k++)
+      for (let i = 0; i < tile.length; i++) slices[k * tile.length + i] = Math.floor((((tile[i] + 0.5) / 256 + k * 0.61803399) % 1) * 256)
+    d.queue.writeTexture({ texture: this.blueTex }, slices, { bytesPerRow: BLUE_NOISE_SIZE, rowsPerImage: BLUE_NOISE_SIZE }, [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE, STBN_SLICES])
+    void fetch(STBN_URL)
+      .then(r => (r.ok ? r.arrayBuffer() : null))
+      .then(buf => {
+        if (!buf || buf.byteLength !== slices.length || this.disposed) return
+        d.queue.writeTexture({ texture: this.blueTex }, new Uint8Array(buf), { bytesPerRow: BLUE_NOISE_SIZE, rowsPerImage: BLUE_NOISE_SIZE }, [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE, STBN_SLICES])
+        this.needsRender = true
+        this.taaCount = 0
+      })
+      .catch(() => {})
     this.taaBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
     this.ballBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
@@ -661,7 +680,7 @@ export class PyroEngine {
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView(), this.dummy3d.createView(), v(flame)]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)]),
       },
     }
     this.resetSkin()
@@ -1231,7 +1250,7 @@ export class PyroEngine {
       const render = d.createBindGroup({
         layout: p.render.getBindGroupLayout(0),
         entries: [
-          ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView(), v(tex[0]), v(g.flame)]),
+          ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView({ dimension: '2d-array' }), v(tex[0]), v(g.flame)]),
           { binding: 31, resource: { buffer: g.skin } },
         ],
       })

@@ -1792,7 +1792,7 @@ ${RENDER_COMMON}
 @group(0) @binding(8) var noiseSamp: sampler;
 ${fireCommon(9)}
 @group(0) @binding(10) var<storage, read> fireLight: array<vec4<f32>>;
-@group(0) @binding(11) var blueTex: texture_2d<f32>;
+@group(0) @binding(11) var blueTex: texture_2d_array<f32>; // spatiotemporal blue noise, a slice a frame
 @group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
 
@@ -1964,11 +1964,13 @@ fn scalSmooth(uvw: vec3<f32>) -> vec4<f32> {
   return mix(x0, x1, g1.z);
 }
 
-// Where in its first step each pixel's march starts: blue noise in space (fine-grained, no clumps), stepped by the
-// golden ratio each frame, so the temporal accumulation averages the sampling error away within a few frames.
+// Where in its first step each pixel's march starts: spatiotemporal blue noise (Wolfe et al. 2022), a slice a frame,
+// so each frame's offsets are blue noise in space (fine-grained, no clumps) and each pixel's offsets over frames are
+// blue noise in time too, which the temporal accumulation averages away faster than blue noise stepped by the golden
+// ratio (what it began as, and what it still uses until the mask has loaded).
 fn jitterAt(p: vec2<f32>, frame: f32) -> f32 {
-  let b = textureLoad(blueTex, vec2<i32>(p) & vec2<i32>(63), 0).x;
-  return fract(b + frame * 0.61803399);
+  let layers = i32(textureNumLayers(blueTex));
+  return textureLoad(blueTex, vec2<i32>(p) & vec2<i32>(63), i32(frame) % layers, 0).x;
 }
 
 // Upres detail at a point: the noise at each layer's advected coordinates, cross-faded, with the contrast that mixing

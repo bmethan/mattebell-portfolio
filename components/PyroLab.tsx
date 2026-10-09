@@ -4,7 +4,7 @@
 // at once (choosing it is the visitor's go-ahead).
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { PyroEngine, type PyroStatus } from './pyro/engine'
-import { PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroState } from './pyro/params'
+import { PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, SOURCE_LOOKS, type PyroState, type SourceType } from './pyro/params'
 import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
 import { citeAuthors } from './lookdev/citations'
 import { Group, Pill, Range, Tabs } from './lab/ui'
@@ -12,10 +12,11 @@ import { Group, Pill, Range, Tabs } from './lab/ui'
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
 const noSubscribe = () => () => {}
 
-type PyroTab = 'source' | 'forces' | 'shading' | 'solver'
+type PyroTab = 'source' | 'forces' | 'fire' | 'shading' | 'solver'
 const PYRO_TABS = [
   { id: 'source', label: 'Source' },
   { id: 'forces', label: 'Forces' },
+  { id: 'fire', label: 'Fire' },
   { id: 'shading', label: 'Shading' },
   { id: 'solver', label: 'Solver' },
 ] as const
@@ -36,6 +37,14 @@ const TECH_NOTES: [string, string][] = [
   [
     'Forces',
     'Buoyancy from temperature; vorticity confinement, which restores the small swirls a coarse grid smooths away; divergence-free turbulence from the curl of a noise potential, only where there is smoke; wind; and the source’s upward push. Hot air cools and smoke dissipates at the rates in the Forces tab.',
+  ],
+  [
+    'Combustion',
+    'A fire source emits fuel instead of smoke, tracked as a reaction coordinate: the share of the reaction still to come, 1 as the gas leaves the source, running down at the burn rate while the gas is hotter than its ignition point. As it burns it releases heat, which drives the buoyancy, and soot, mostly toward the end of the reaction, where a flame turns to smoke. Burning gas expands: where there is flame, the pressure solve makes the flow diverge by the expansion rate instead of not at all, which gives flames their outward push and flicker.',
+  ],
+  [
+    'Flames',
+    'Flames emit light at the blackbody colour and brightness of their temperature: Planck\u2019s law integrated against the CIE colour matching functions. The radiating temperature follows the reaction, at the flame\u2019s peak (1900 K by default) where it is fresh at the base, cooling toward the tips as it runs out, which gives the yellow-to-orange-to-red of a real flame. Real flames span a huge range of brightness, a 2000 K core about 60 times brighter than a 1500 K edge; the contrast control compresses it, 1 being physical. The fire also lights the smoke and the floor, as a point light at its brightness-weighted centre carrying its total emitted light, summed on the GPU every step; the smoke does not shadow that light.',
   ],
   [
     'Detail',
@@ -194,6 +203,10 @@ export default function PyroLab() {
     }
   }, [])
 
+  // A new source brings the look it reads best with (see SOURCE_LOOKS).
+  const pickSource = (t: SourceType) => {
+    if (t !== pyro.sourceType) update({ sourceType: t, ...SOURCE_LOOKS[t] })
+  }
   const update = (patch: Partial<PyroState>) => {
     setPyro(p => ({ ...p, ...patch }))
     if (patch.resolution && engineRef.current) engineRef.current.autoResolution = false
@@ -252,30 +265,30 @@ export default function PyroLab() {
   return (
     <div>
       <div style={{ marginBottom: 20 }}>
-        <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em', marginBottom: 12 }}>Smoke, simulated live</h2>
+        <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em', marginBottom: 12 }}>Fire and smoke, simulated live</h2>
         <p style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.8, maxWidth: 640 }}>
-          A 3D smoke solver running on your GPU, built the way production FX tools are: buoyancy, vorticity, turbulence
-          and a pressure solve every step, lit with physically based volume rendering.
+          A 3D fire and smoke solver running on your GPU, built the way production FX tools are: combustion, buoyancy,
+          vorticity, turbulence and a pressure solve every step, lit with physically based volume rendering.
         </p>
       </div>
 
       <p className="lab-howto">
         <span className="lab-howto-pointer">Drag across the image</span>
-        <span className="lab-howto-touch">Swipe sideways on the image</span> to stir the smoke
+        <span className="lab-howto-touch">Swipe sideways on the image</span> to stir the fire
         <span aria-hidden="true"> · </span>
         <span className="sr-only">. </span>Every control below is live
       </p>
 
       <div ref={frameRef} className="lab-frame">
         {mode === 'fallback' ? (
-          <PyroStill alt="A column of smoke rising from a source on the floor, lit from the front left, rendered by the pyro lab's solver" />
+          <PyroStill alt="A fire burning on the floor, its flames yellow at the base and red at the tips, its smoke rising, rendered by the pyro lab's solver" />
         ) : (
           <canvas
             ref={canvasRef}
             tabIndex={0}
             role="application"
-            aria-roledescription="smoke simulation"
-            aria-label="Live smoke simulation. Drag, or use the arrow keys, to stir the smoke."
+            aria-roledescription="fire and smoke simulation"
+            aria-label="Live fire and smoke simulation. Drag, or use the arrow keys, to stir it."
             className="lab-canvas"
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
@@ -294,7 +307,7 @@ export default function PyroLab() {
             ? 'Still frame. The live solver needs WebGPU, which this browser does not offer.'
             : mode === 'starting'
               ? 'Starting the solver'
-              : `Smoke  ${dims.join(' × ')}`}
+              : `${pyro.sourceType === 'fire' ? 'Fire' : 'Smoke'}  ${dims.join(' × ')}`}
         </div>
         {mode === 'live' && status && (
           <div className="lab-hud lab-hud-right">
@@ -333,8 +346,22 @@ export default function PyroLab() {
             {tab === 'source' && (
               <>
                 <div className="lab-row">
+                  <Group label="Type">
+                    <Pill on={pyro.sourceType === 'smoke'} onClick={() => pickSource('smoke')}>
+                      Smoke
+                    </Pill>
+                    <Pill on={pyro.sourceType === 'fire'} onClick={() => pickSource('fire')}>
+                      Fire
+                    </Pill>
+                  </Group>
+                </div>
+                <div className="lab-row">
                   <Slider label="Radius" min={0.08} max={0.4} step={0.01} value={pyro.srcRadius} unit=" m" onChange={v => update({ srcRadius: v })} />
-                  <Slider label="Density" min={0.2} max={2} step={0.05} value={pyro.srcDensity} onChange={v => update({ srcDensity: v })} />
+                  {pyro.sourceType === 'fire' ? (
+                    <Slider label="Fuel" min={0.2} max={2} step={0.05} value={pyro.srcFuel} onChange={v => update({ srcFuel: v })} />
+                  ) : (
+                    <Slider label="Density" min={0.2} max={2} step={0.05} value={pyro.srcDensity} onChange={v => update({ srcDensity: v })} />
+                  )}
                 </div>
                 <div className="lab-row">
                   <Slider label="Temperature" min={0.2} max={2} step={0.05} value={pyro.srcTemp} onChange={v => update({ srcTemp: v })} />
@@ -362,6 +389,28 @@ export default function PyroLab() {
                   <Slider label="Cooling" min={0} max={2} step={0.05} value={pyro.cooling} unit=" /s" onChange={v => update({ cooling: v })} />
                   <Slider label="Dissipation" min={0} max={0.5} step={0.01} value={pyro.dissipation} unit=" /s" onChange={v => update({ dissipation: v })} />
                 </div>
+              </>
+            )}
+            {tab === 'fire' && (
+              <>
+                <div className="lab-row">
+                  <Slider label="Burn rate" min={0.2} max={3} step={0.05} value={pyro.burnRate} unit=" /s" onChange={v => update({ burnRate: v })} />
+                  <Slider label="Heat" min={0} max={4} step={0.05} value={pyro.heat} onChange={v => update({ heat: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Expansion" min={0} max={4} step={0.05} value={pyro.expansion} unit=" /s" onChange={v => update({ expansion: v })} />
+                  <Slider label="Soot" min={0} max={1.5} step={0.05} value={pyro.soot} onChange={v => update({ soot: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Flame intensity" min={0} max={4} step={0.05} value={pyro.flameIntensity} onChange={v => update({ flameIntensity: v })} />
+                  <Slider label="Flame temperature" min={1200} max={2600} step={10} value={pyro.flameKelvin} digits={0} unit=" K" onChange={v => update({ flameKelvin: v })} />
+                  <Slider label="Flame contrast" min={0.2} max={1} step={0.05} value={pyro.flameContrast} onChange={v => update({ flameContrast: v })} />
+                </div>
+                <p className="lab-note">
+                  {pyro.sourceType === 'fire'
+                    ? 'Flame temperature: the gas at its hottest, where burning a full measure of fuel takes it. Flame contrast 1 is physical blackbody brightness.'
+                    : 'These act on a fire source: choose Fire under Source.'}
+                </p>
               </>
             )}
             {tab === 'shading' && (

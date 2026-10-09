@@ -1,7 +1,8 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, COMBINE, CURL, DIVERGENCE, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, COMBINE, CURL, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { blackbodyTable } from './blackbody'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 
 export const SIM_DT = 1 / 30
@@ -26,8 +27,10 @@ const AUTO_RES_MIN_RATE = 18
 const MAX_RENDER_PIXELS = 900_000
 const STATUS_MS = 250
 const STIR_RADIUS = 0.3 // m
-const DETAIL_PERIOD = 2.4 // s of simulation between resets of each upres layer (half a period apart)
+const DETAIL_PERIOD = 1.6 // s of simulation between resets of each upres layer (half a period apart); flames stretch them fast
 const NOISE_SIZE = 64 // texels along each side of the tileable detail noise
+const FLAME_DECAY = 3 // 1/s: how fast the flame field fades once nothing burns
+const IGNITION = 0.3 // temperature above ambient at which fuel burns
 
 export interface PyroStatus {
   ready: boolean
@@ -49,6 +52,8 @@ const norm = (a: Vec3): Vec3 => {
 }
 
 interface Pipes {
+  fireSum: GPUComputePipeline
+  fireTotal: GPUComputePipeline
   noiseGen: GPUComputePipeline
   advDetail: GPUComputePipeline
   mgSmooth: GPUComputePipeline
@@ -99,6 +104,8 @@ interface Grids {
     advBwd: GPUBindGroup
     combine: GPUBindGroup
     advDetail: GPUBindGroup
+    fireSum: GPUBindGroup
+    fireTotal: GPUBindGroup
     light: GPUBindGroup
     render: GPUBindGroup
   }
@@ -127,7 +134,9 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
   const compute = (code: string, constants?: Record<string, number>) =>
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
-  const [noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render] = await Promise.all([
+    compute(FIRE_SUM),
+    compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
     compute(ADVECT_DETAIL),
     compute(MG_SMOOTH),
@@ -151,7 +160,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render }
 }
 
 export function prewarmPyro() {
@@ -223,8 +232,9 @@ export class PyroEngine {
   private simBuf: GPUBuffer
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
-  private simData = new ArrayBuffer(192)
-  private renderData = new Float32Array(40)
+  private simData = new ArrayBuffer(224)
+  private renderData = new Float32Array(44)
+  private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
   private noiseSampler: GPUSampler
   private pipes: Pipes | null = null
@@ -288,6 +298,9 @@ export class PyroEngine {
       return b
     }) as [GPUBuffer, GPUBuffer]
     this.sampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' })
+    const bb = blackbodyTable()
+    this.bbBuf = d.createBuffer({ size: bb.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+    d.queue.writeBuffer(this.bbBuf, 0, bb)
     this.noiseSampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' })
     this.noiseTex = d.createTexture({
       size: [NOISE_SIZE, NOISE_SIZE, NOISE_SIZE],
@@ -395,6 +408,14 @@ export class PyroEngine {
         prolongFrom: l > 0 ? group(p.mgProlong, [{ buffer: u0 }, { buffer: xs[l] }, { buffer: xs[l - 1] }]) : null,
       }
     })
+    // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
+    const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
+    const firePartial = storage(groups * 8)
+    const fireLight = storage(8)
+    const fireCount = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true })
+    new Uint32Array(fireCount.getMappedRange()).set([groups, 0, 0, 0])
+    fireCount.unmap()
+    buffers.push(fireCount)
     const P = { buffer: this.simBuf }
     const R = { buffer: this.renderBuf }
     const s = this.sampler
@@ -412,15 +433,17 @@ export class PyroEngine {
         advectVel: group(p.advectVel, [P, s, v(vel[0]), v(vel[1])]),
         curl: group(p.curl, [P, v(vel[1]), v(curl)]),
         forces: group(p.forces, [P, v(vel[1]), v(scal[0]), v(curl), v(vel[0])]),
-        divergence: group(p.divergence, [P, v(vel[0]), { buffer: div }]),
+        divergence: group(p.divergence, [P, v(vel[0]), { buffer: div }, v(scal[0])]),
         sor: [0, 1].map(k => group(p.sor, [P, { buffer: this.parityBufs[k] }, { buffer: div }, { buffer: pressure }])) as [GPUBindGroup, GPUBindGroup],
         project: group(p.project, [P, v(vel[0]), { buffer: pressure }, v(vel[1])]),
         advFwd: group(p.advFwd, [P, s, v(vel[0]), v(scal[0]), v(scal[1])]),
         advBwd: group(p.advBwd, [P, s, v(vel[0]), v(scal[1]), v(scal[2])]),
         combine: group(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
+        fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }]),
+        fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light)]),
-        render: group(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler]),
+        render: group(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }]),
       },
     }
     this.simTime = 0
@@ -627,6 +650,11 @@ export class PyroEngine {
     enc.copyTextureToTexture({ texture: g.scal[3] }, { texture: g.scal[0] }, [nx, ny, nz])
     enc.copyTextureToTexture({ texture: g.detA[1] }, { texture: g.detA[0] }, [nx, ny, nz])
     enc.copyTextureToTexture({ texture: g.detB[1] }, { texture: g.detB[0] }, [nx, ny, nz])
+    // The fire's light from the new scalars (zero without flames).
+    pass = enc.beginComputePass()
+    run(pass, p.fireSum, g.bg.fireSum, cc)
+    run(pass, p.fireTotal, g.bg.fireTotal, [1, 1, 1])
+    pass.end()
     this.device.queue.submit([enc.finish()])
     this.simTime += SIM_DT
     this.frame++
@@ -688,7 +716,8 @@ export class PyroEngine {
     const f = new Float32Array(this.simData)
     u.set([nx, ny, nz, this.frame], 0)
     f.set([dx, SIM_DT, this.simTime, 0], 4)
-    f.set([0, s.srcRadius + dx, 0, s.srcRadius], 8)
+    // The source rests on the floor (a fire's dome is 1.6 times wider than tall).
+    f.set([0, (s.sourceType === 'fire' ? s.srcRadius / 1.6 : s.srcRadius) + dx, 0, s.srcRadius], 8)
     f.set([s.srcDensity, s.srcTemp, s.srcSpeed, s.srcNoise], 12)
     f.set([s.buoyancy, 0, s.vorticity, s.turbulence], 16)
     f.set([s.turbScale, s.wind, 0, 0.05], 20)
@@ -702,6 +731,8 @@ export class PyroEngine {
     const t0 = this.simTime / DETAIL_PERIOD
     const t1 = (this.simTime + SIM_DT) / DETAIL_PERIOD
     f.set([Math.floor(t1) > Math.floor(t0) ? 1 : 0, Math.floor(t1 + 0.5) > Math.floor(t0 + 0.5) ? 1 : 0, 0, 0], 44)
+    f.set([s.sourceType === 'fire' ? 1 : 0, s.srcFuel, s.burnRate, s.heat], 48)
+    f.set([s.expansion, s.soot, FLAME_DECAY, IGNITION], 52)
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
   }
 
@@ -728,6 +759,7 @@ export class PyroEngine {
     const ageA = (this.simTime / DETAIL_PERIOD) % 1
     const ageB = (this.simTime / DETAIL_PERIOD + 0.5) % 1
     r.set([1 - Math.abs(2 * ageA - 1), 1 - Math.abs(2 * ageB - 1), s.detail, 1 / (8 * s.detailScale)], 36)
+    r.set([s.sourceType === 'fire' ? s.flameIntensity : 0, s.flameKelvin - 300, s.flameContrast, 0], 40)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
@@ -842,6 +874,10 @@ export class PyroEngine {
     timed('advectBack', one(p.advBwd, g.bg.advBwd, cc))
     timed('combine', one(p.combine, g.bg.combine, cc))
     timed('detail', one(p.advDetail, g.bg.advDetail, cc))
+    timed('fireLight', pass => {
+      one(p.fireSum, g.bg.fireSum, cc)(pass)
+      one(p.fireTotal, g.bg.fireTotal, [1, 1, 1])(pass)
+    })
     enc.copyTextureToTexture({ texture: g.scal[3] }, { texture: g.scal[0] }, [nx, ny, nz])
     timed('light', one(p.light, g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
     const k = labels.length
@@ -911,6 +947,36 @@ export class PyroEngine {
     d.queue.submit([enc.finish()])
     const after = await readBack()
     return { before, after, bad }
+  }
+
+  // Development probe: the scalar fields (soot, temperature, reaction, flame) up the vertical line through the source.
+  async probeColumn(): Promise<number[][] | null> {
+    if (!this.grids) return null
+    const d = this.device
+    const [nx, ny, nz] = this.grids.n
+    const rowBytes = Math.ceil((nx * 8) / 256) * 256
+    const read = d.createBuffer({ size: rowBytes * ny * nz, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    enc.copyTextureToBuffer({ texture: this.grids.scal[0] }, { buffer: read, bytesPerRow: rowBytes, rowsPerImage: ny }, [nx, ny, nz])
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const u16 = new Uint16Array(read.getMappedRange())
+    const half = (h: number) => {
+      const e = (h >> 10) & 31
+      const f = h & 1023
+      const v = e === 0 ? f * 2 ** -24 : e === 31 ? Infinity : (1 + f / 1024) * 2 ** (e - 15)
+      return h & 0x8000 ? -v : v
+    }
+    const x = Math.floor(nx / 2)
+    const z = Math.floor(nz / 2)
+    const out: number[][] = []
+    for (let y = 0; y < ny; y++) {
+      const o = (z * ny * rowBytes + y * rowBytes) / 2 + x * 4
+      out.push([0, 1, 2, 3].map(k => +half(u16[o + k]).toFixed(3)))
+    }
+    read.unmap()
+    read.destroy()
+    return out
   }
 
   // For the lab's stills: the current frame drawn at an exact size, as an image file.

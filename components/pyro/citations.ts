@@ -270,6 +270,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1063/1.869832',
   },
   {
+    id: 'tricubic',
+    group: 'Rendering',
+    authors: 'Christian Sigg, Markus Hadwiger',
+    title: 'Fast Third-Order Texture Filtering',
+    venue: 'GPU Gems 2, chapter 20: a tricubic B-spline from eight trilinear fetches',
+    year: '2005',
+    url: 'https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-20-fast-third-order-texture-filtering',
+  },
+  {
     id: 'frostbite',
     group: 'Rendering',
     authors: 'Sébastien Hillaire',

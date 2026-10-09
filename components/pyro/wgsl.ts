@@ -917,7 +917,7 @@ struct RParams {
   detail: vec4<f32>,   // weight of detail layer A, of layer B, amount, 1 / (8 x detail scale in m)
   fire: vec4<f32>,     // source is a fire (0 or 1), extinction in red and in blue relative to green, flame eddies' rise (m/s)
   wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear Rec.709; wind (m/s) in the first row's w
-  wb1: vec4<f32>,
+  wb1: vec4<f32>,      // (w: sample the scalars tricubically, 0 or 1)
   wb2: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> R: RParams;
@@ -1152,7 +1152,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 // step, T (1 - exp(-sigma dt)) S), lit by the sun through the light volume with Wrenninge's multiple-scattering
 // octaves (a = b = c = 1/2, which conserves energy) and Henyey-Greenstein phase, by the sky through the optical depth
 // above, and by the fire; hot soot glows at its blackbody radiance; then a floor that catches the smoke's shadow,
-// fading to black; and a camera with a white balance, an exposure and ACES tone mapping.
+// fading to black. Written exposed, at high dynamic range, for the accumulation pass.
 export const RENDER = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
@@ -1165,6 +1165,7 @@ ${RENDER_COMMON}
 @group(0) @binding(8) var noiseSamp: sampler;
 ${fireCommon(9)}
 @group(0) @binding(10) var<storage, read> fireLight: array<vec4<f32>>;
+@group(0) @binding(11) var blueTex: texture_2d<f32>;
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -1176,15 +1177,43 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 fn hg(c: f32, g: f32) -> f32 {
   return (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
 }
-fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
-// Per-pixel, per-frame white noise for the march's start: interleaved gradient noise has a diagonal structure that
-// shows through bright flames.
+// The scalars between cells, tricubically: a cubic B-spline, smooth (its slope continuous) where trilinear
+// interpolation creases at every cell face, which shows as faceting in smooth smoke. Eight trilinear fetches, placed
+// so the hardware's blend gives the B-spline's weights (Sigg and Hadwiger 2005).
+fn scalSmooth(uvw: vec3<f32>) -> vec4<f32> {
+  if (R.wb1.w < 0.5) { return textureSampleLevel(scal, samp, uvw, 0.0); }
+  let n = vec3<f32>(textureDimensions(scal));
+  let c = uvw * n - 0.5;
+  let i = floor(c);
+  let f = c - i;
+  let f2 = f * f;
+  let f3 = f2 * f;
+  let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+  let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+  let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+  let w3 = f3 / 6.0;
+  let g0 = w0 + w1;
+  let g1 = w2 + w3;
+  let a = (i - 0.5 + w1 / g0) / n;
+  let b = (i + 1.5 + w3 / g1) / n;
+  let s000 = textureSampleLevel(scal, samp, vec3<f32>(a.x, a.y, a.z), 0.0);
+  let s100 = textureSampleLevel(scal, samp, vec3<f32>(b.x, a.y, a.z), 0.0);
+  let s010 = textureSampleLevel(scal, samp, vec3<f32>(a.x, b.y, a.z), 0.0);
+  let s110 = textureSampleLevel(scal, samp, vec3<f32>(b.x, b.y, a.z), 0.0);
+  let s001 = textureSampleLevel(scal, samp, vec3<f32>(a.x, a.y, b.z), 0.0);
+  let s101 = textureSampleLevel(scal, samp, vec3<f32>(b.x, a.y, b.z), 0.0);
+  let s011 = textureSampleLevel(scal, samp, vec3<f32>(a.x, b.y, b.z), 0.0);
+  let s111 = textureSampleLevel(scal, samp, vec3<f32>(b.x, b.y, b.z), 0.0);
+  let x0 = mix(mix(s000, s100, g1.x), mix(s010, s110, g1.x), g1.y);
+  let x1 = mix(mix(s001, s101, g1.x), mix(s011, s111, g1.x), g1.y);
+  return mix(x0, x1, g1.z);
+}
+
+// Where in its first step each pixel's march starts: blue noise in space (fine-grained, no clumps), stepped by the
+// golden ratio each frame, so the temporal accumulation averages the sampling error away within a few frames.
 fn jitterAt(p: vec2<f32>, frame: f32) -> f32 {
-  var h = (bitcast<u32>(i32(p.x)) * 0x8da6b343u) ^ (bitcast<u32>(i32(p.y)) * 0xd8163841u) ^ (u32(frame) * 0xcb1ab31fu);
-  h = (h ^ (h >> 16u)) * 0x7feb352du;
-  h = (h ^ (h >> 15u)) * 0x846ca68bu;
-  h = h ^ (h >> 16u);
-  return f32(h) * (1.0 / 4294967296.0);
+  let b = textureLoad(blueTex, vec2<i32>(p) & vec2<i32>(63), 0).x;
+  return fract(b + frame * 0.61803399);
 }
 
 // Upres detail at a point: the noise at each layer's advected coordinates, cross-faded, with the contrast that mixing
@@ -1233,17 +1262,6 @@ fn subgridKelvin(w: vec3<f32>, uvw: vec3<f32>, rot: mat3x3<f32>) -> f32 {
   return sd * clamp((n - 0.5) * 5.0, -2.5, 2.5);
 }
 
-// Stephen Hill's fit of the ACES RRT and sRGB ODT (rows of the input and output matrices).
-fn aces(c: vec3<f32>) -> vec3<f32> {
-  let a = vec3<f32>(dot(vec3<f32>(0.59719, 0.35458, 0.04823), c), dot(vec3<f32>(0.07600, 0.90834, 0.01566), c), dot(vec3<f32>(0.02840, 0.13383, 0.83777), c));
-  let b = (a * (a + 0.0245786) - 0.000090537) / (a * (0.983729 * a + 0.4329510) + 0.238081);
-  let o = vec3<f32>(dot(vec3<f32>(1.60475, -0.53108, -0.07367), b), dot(vec3<f32>(-0.10208, 1.10813, -0.00605), b), dot(vec3<f32>(-0.00327, -0.07276, 1.07602), b));
-  return clamp(o, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-fn srgb(c: vec3<f32>) -> vec3<f32> {
-  return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * c, c <= vec3<f32>(0.0031308));
-}
-
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let ndc = vec2<f32>(fc.x / R.size.x * 2.0 - 1.0, 1.0 - fc.y / R.size.y * 2.0);
@@ -1273,7 +1291,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   var T = vec3<f32>(1.0);
   if (box.y > max(box.x, 0.0) && box.x < tFloor) {
     let t0 = max(box.x, 0.0);
-    let ds = 0.45 * P.grid.x;
+    let ds = 0.65 * P.grid.x; // the temporal accumulation averages away the error of the longer step
     // Empty space (no smoke in a light cell's neighbourhood) is crossed in strides of a light cell.
     var t = t0 + jitter * ds;
     for (var i = 0; i < 2048; i++) {
@@ -1286,7 +1304,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       }
       t += ds;
       let fade = edgeFade(uvw);
-      let s4 = textureSampleLevel(scal, samp, uvw, 0.0);
+      let s4 = scalSmooth(uvw);
       var sig = sigmaOf(s4) * fade;
       if (sig > 1e-3) {
         // Upres detail: strongest in thin smoke (the edges and wisps), a third as strong in the dense core, and fading
@@ -1354,9 +1372,70 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     col += T * R.floorCol.xyz * INV_PI * E * fade;
   }
 
-  // The camera: white balance, exposure (the luminance it maps to white), then the tone curve.
-  let balanced = vec3<f32>(dot(R.wb0.xyz, col), dot(R.wb1.xyz, col), dot(R.wb2.xyz, col));
-  let mapped = srgb(aces(max(balanced, vec3<f32>(0.0)) * R.camUp.w));
-  return vec4<f32>(mapped + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0);
+  // Exposed (as a fraction of the luminance the camera maps to white), for the accumulation pass.
+  return vec4<f32>(col * R.camUp.w, 1.0);
+}
+`
+
+// 11. Temporal accumulation, then the camera. Each frame's march is blended into a running history, which averages
+// away the sampling noise; the history is first clamped to the range of the current frame's 3 x 3 neighbourhood (in a
+// luminance-compressed space, so a bright flame does not dominate), so what moves or flickers is not smeared behind
+// it. Then the white balance and ACES tone mapping, and a dither against banding.
+export const RESOLVE = /* wgsl */ `
+${SIM_COMMON}
+${RENDER_COMMON}
+@group(0) @binding(2) var current: texture_2d<f32>;
+@group(0) @binding(3) var history: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> T: vec4<f32>; // history valid (0 or 1), weight of the current frame
+
+struct Out {
+  @location(0) color: vec4<f32>,
+  @location(1) history: vec4<f32>,
+}
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
+fn lum(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
+fn squash(c: vec3<f32>) -> vec3<f32> { return c / (1.0 + lum(c)); }
+fn unsquash(c: vec3<f32>) -> vec3<f32> { return c / max(1.0 - lum(c), 1e-4); }
+// Stephen Hill's fit of the ACES RRT and sRGB ODT (rows of the input and output matrices).
+fn aces(c: vec3<f32>) -> vec3<f32> {
+  let a = vec3<f32>(dot(vec3<f32>(0.59719, 0.35458, 0.04823), c), dot(vec3<f32>(0.07600, 0.90834, 0.01566), c), dot(vec3<f32>(0.02840, 0.13383, 0.83777), c));
+  let b = (a * (a + 0.0245786) - 0.000090537) / (a * (0.983729 * a + 0.4329510) + 0.238081);
+  let o = vec3<f32>(dot(vec3<f32>(1.60475, -0.53108, -0.07367), b), dot(vec3<f32>(-0.10208, 1.10813, -0.00605), b), dot(vec3<f32>(-0.00327, -0.07276, 1.07602), b));
+  return clamp(o, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn srgb(c: vec3<f32>) -> vec3<f32> {
+  return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * c, c <= vec3<f32>(0.0031308));
+}
+
+@fragment
+fn fs(@builtin(position) fc: vec4<f32>) -> Out {
+  let p = vec2<i32>(fc.xy);
+  let last = vec2<i32>(textureDimensions(current)) - 1;
+  let cur = squash(max(textureLoad(current, p, 0).xyz, vec3<f32>(0.0)));
+  var lo = cur;
+  var hi = cur;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let q = squash(max(textureLoad(current, clamp(p + vec2<i32>(dx, dy), vec2<i32>(0), last), 0).xyz, vec3<f32>(0.0)));
+      lo = min(lo, q);
+      hi = max(hi, q);
+    }
+  }
+  var blended = cur;
+  if (T.x > 0.5) {
+    let h = clamp(squash(textureLoad(history, p, 0).xyz), lo, hi);
+    blended = mix(h, cur, T.y);
+  }
+  let c = unsquash(blended);
+  let balanced = vec3<f32>(dot(R.wb0.xyz, c), dot(R.wb1.xyz, c), dot(R.wb2.xyz, c));
+  let mapped = srgb(aces(max(balanced, vec3<f32>(0.0))));
+  return Out(vec4<f32>(mapped + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0), vec4<f32>(c, 1.0));
 }
 `

@@ -57,7 +57,7 @@ const TECH_NOTES: [string, string][] = [
   ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
   [
     'Rendering',
-    'Each pixel marches through the volume and integrates each step in closed form, in photometric units (cd/m²), each colour channel on its own. Sunlight reaches every point through the optical depth toward the sun, recomputed each frame on a half-resolution grid; multiple-scattering octaves stand in for light bouncing inside the smoke; the sky lights it from above through the smoke overhead; the floor takes its shadow and the fire’s light.',
+    'Each pixel marches through the volume and integrates each step in closed form, in photometric units (cd/m²), each colour channel on its own. Sunlight reaches every point through the optical depth toward the sun, recomputed each frame on a half-resolution grid; multiple-scattering octaves stand in for light bouncing inside the smoke; the sky lights it from above through the smoke overhead; the floor takes its shadow and the fire’s light. Between cells the smoke and soot are sampled with a cubic B-spline (eight trilinear fetches placed so the hardware’s blend gives the spline’s weights, after Sigg and Hadwiger), smooth where trilinear interpolation creases at every cell face; the Shading tab switches back to trilinear, which renders in about two thirds of the time. Each frame starts its march at a blue-noise offset stepped by the golden ratio, and frames accumulate: each blends into a running history, first clamped to the range of the new frame’s neighbourhood so what moves is not smeared behind it, which averages the sampling noise away. A paused frame keeps accumulating until it settles.',
   ],
   [
     'Camera',
@@ -443,6 +443,16 @@ export default function PyroLab() {
                 <div className="lab-row">
                   <Slider label="Exposure" min={-2} max={16} step={0.25} value={pyro.exposure} digits={2} unit=" EV" onChange={v => update({ exposure: v })} />
                   <Slider label="White balance" min={2000} max={10000} step={100} value={pyro.whiteBalance} digits={0} unit=" K" onChange={v => update({ whiteBalance: v })} />
+                </div>
+                <div className="lab-row">
+                  <Group label="Sampling">
+                    <Pill on={!pyro.tricubic} onClick={() => update({ tricubic: false })}>
+                      Trilinear
+                    </Pill>
+                    <Pill on={pyro.tricubic} onClick={() => update({ tricubic: true })}>
+                      Tricubic
+                    </Pill>
+                  </Group>
                 </div>
                 <div className="lab-row">
                   <Slider label="Detail" min={0} max={1.5} step={0.05} value={pyro.detail} onChange={v => update({ detail: v })} />

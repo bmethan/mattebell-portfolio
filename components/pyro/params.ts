@@ -57,6 +57,7 @@ export interface PyroState {
   skyEV: number // the sky's, on open ground
   exposure: number // the camera's EV100
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
+  tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
   // Upres detail
   detail: number // 0 = off
   detailScale: number // m, the largest noise feature
@@ -96,6 +97,7 @@ export const PYRO_DEFAULTS: PyroState = {
   skyEV: 1,
   exposure: 7,
   whiteBalance: 5500,
+  tricubic: true,
   detail: 1,
   detailScale: 0.05,
 }

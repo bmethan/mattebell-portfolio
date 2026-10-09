@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -18,7 +18,9 @@ const MG_PRE = 2
 const MG_POST = 2
 const MG_COARSE = 16
 // Red-black sweeps per step for each of its potentials (warm started).
-const IVOCK_SWEEPS = 2
+const IVOCK_SWEEPS = 1
+// BiMocq2's steps between re-initialisations.
+const BIMOCQ_REINIT = 16
 const MG_COARSE_OMEGA = 1.6
 const SPEED_LIMIT = 8 // m/s
 const FOV_Y = (32 * Math.PI) / 180
@@ -126,6 +128,9 @@ interface Pipes {
   ivockCurl: GPUComputePipeline
   ivockSmooth: GPUComputePipeline
   ivockApply: GPUComputePipeline
+  bimocqMaps: GPUComputePipeline
+  bimocqRecon: GPUComputePipeline
+  bimocqAccum: GPUComputePipeline
   diffuse: GPUComputePipeline
   light: GPUComputePipeline
   render: GPURenderPipeline
@@ -157,6 +162,24 @@ interface Grids {
   skinNext: GPUBuffer
   flame: GPUTexture // a fire's heat release rate per cell (MW/m3), for the renderer
   // IVOCK: the three components of the vector potential, each with its own finest multigrid level.
+  // BiMocq2: the maps (the backward one's current level, ping-ponged; its previous level; the forward one,
+  // ping-ponged), the accumulators, the snapshots, and an identity map to re-initialise from.
+  bimocq: {
+    x: [GPUBuffer, GPUBuffer]
+    y: [GPUBuffer, GPUBuffer]
+    xPrev: GPUBuffer
+    dCurr: [GPUTexture, GPUTexture]
+    dPrev: GPUTexture
+    zero: GPUTexture
+    identity: GPUBuffer
+    phiCurr: GPUTexture
+    phiPrev: GPUTexture
+    phiStar: GPUTexture
+    uniform: GPUBuffer
+    maps: [GPUBindGroup, GPUBindGroup]
+    recon: [GPUBindGroup, GPUBindGroup]
+    accum: [GPUBindGroup, GPUBindGroup]
+  }
   ivockRhs: GPUBuffer // its right-hand side, the vorticity lost, four floats a cell (readable for development checks)
   detA: [GPUTexture, GPUTexture]
   detB: [GPUTexture, GPUTexture]
@@ -221,7 +244,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, diffuse, light, upres, render, resolve] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, diffuse, light, upres, render, resolve] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -251,6 +274,9 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(IVOCK_CURL),
     compute(IVOCK_SMOOTH),
     compute(IVOCK_APPLY),
+    compute(BIMOCQ_MAPS),
+    compute(BIMOCQ_RECON),
+    compute(BIMOCQ_ACCUM),
     compute(DIFFUSE),
     compute(LIGHT),
     compute(UPRES),
@@ -267,7 +293,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, diffuse, light, upres, render, resolve }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, diffuse, light, upres, render, resolve }
 }
 
 export function prewarmPyro() {
@@ -354,6 +380,13 @@ export class PyroEngine {
   private renderFrame = 0
   // The wooden ball, as last read back for the HUD.
   private ballStatus: BallStatus | null = null
+  // BiMocq2: which map buffers are current, steps since the last re-initialisation, whether there is a previous
+  // level, and whether it must start afresh (a new grid, or switched on).
+  private bimocqParity = 0
+  private bimocqSteps = 0
+  private bimocqHasPrev = false
+  private bimocqReset = true
+  private bimocqWas = false
   private readingBall = false
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
@@ -590,6 +623,60 @@ export class PyroEngine {
     const ivockRhs = d.createBuffer({ size: cells * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     buffers.push(ivockRhs)
     const ivockPsi = storage(cells * 4)
+    // BiMocq2's buffers and bind groups (see 7a): parity k reads map k and writes map 1 - k.
+    const mapBuffer = () => {
+      const b = d.createBuffer({ size: cells * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+      buffers.push(b)
+      return b
+    }
+    const bx: [GPUBuffer, GPUBuffer] = [mapBuffer(), mapBuffer()]
+    const by: [GPUBuffer, GPUBuffer] = [mapBuffer(), mapBuffer()]
+    const xPrev = mapBuffer()
+
+    const identity = d.createBuffer({ size: cells * 16, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true })
+    {
+      const a = new Float32Array(identity.getMappedRange())
+      for (let z = 0; z < n[2]; z++)
+        for (let y = 0; y < n[1]; y++)
+          for (let x = 0; x < n[0]; x++) a.set([x + 0.5, y + 0.5, z + 0.5, 1], ((z * n[1] + y) * n[0] + x) * 4)
+      identity.unmap()
+    }
+    buffers.push(identity)
+    const snap = (store = false) =>
+      d.createTexture({
+        size: n,
+        dimension: '3d',
+        format: 'rgba16float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | (store ? GPUTextureUsage.STORAGE_BINDING : 0),
+      })
+    const phiCurr = snap()
+    const phiPrev = snap()
+    // The accumulators as textures (the rebuild reads them filtered), the current one ping-ponged; and zeros to clear
+    // them from.
+    const dCurr: [GPUTexture, GPUTexture] = [snap(true), snap(true)]
+    const dPrev = snap()
+    const zero = snap()
+    const phiStar = tex(n)
+    const bimocqUniform = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+    buffers.push(bimocqUniform)
+    const bimocq: Grids['bimocq'] = {
+      x: bx,
+      y: by,
+      xPrev,
+      dCurr,
+      dPrev,
+      zero,
+      identity,
+      phiCurr,
+      phiPrev,
+      phiStar,
+      uniform: bimocqUniform,
+      maps: [0, 1].map(k => group(p.bimocqMaps, [{ buffer: this.simBuf }, this.sampler, v(vel[0]), { buffer: bx[k] }, { buffer: bx[1 - k] }, { buffer: by[k] }, { buffer: by[1 - k] }])) as [GPUBindGroup, GPUBindGroup],
+      recon: [0, 1].map(k =>
+        group(p.bimocqRecon, [{ buffer: this.simBuf }, this.sampler, v(vel[0]), { buffer: bx[1 - k] }, { buffer: xPrev }, v(phiCurr), v(phiPrev), v(dCurr[k]), v(dPrev), v(scal[0]), v(scal[1]), v(phiStar), { buffer: bimocqUniform }]),
+      ) as [GPUBindGroup, GPUBindGroup],
+      accum: [0, 1].map(k => group(p.bimocqAccum, [{ buffer: this.simBuf }, this.sampler, v(scal[0]), v(phiStar), { buffer: by[1 - k] }, v(dCurr[k]), v(dCurr[1 - k])])) as [GPUBindGroup, GPUBindGroup],
+    }
     // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
     const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
     const firePartial = storage(groups * 12)
@@ -631,6 +718,7 @@ export class PyroEngine {
       skin,
       skinNext,
       flame,
+      bimocq,
       ivockRhs,
       detA,
       detB,
@@ -684,6 +772,7 @@ export class PyroEngine {
       },
     }
     this.resetSkin()
+    this.bimocqReset = true
     this.simTime = 0
     this.frame = 0
     this.lightDirty = true
@@ -948,6 +1037,10 @@ export class PyroEngine {
     const p = this.pipes!
     this.writeSim()
     const enc = this.device.createCommandEncoder()
+    // BiMocq2 starts afresh when it has just been switched on, or on a new grid.
+    const bimNow = this.bimocqOn()
+    if (bimNow) this.bimocqBegin(enc)
+    this.bimocqWas = bimNow
     // The wooden ball's skin heats (or cools) first, so this step's fire takes in its volatiles.
     if (this.ballBurning()) {
       const skinPass = enc.beginComputePass()
@@ -1008,8 +1101,14 @@ export class PyroEngine {
       run(pass, p.conserveSpread, g.bg.conserveSpread, cc)
       run(pass, p.conserveRatio, g.bg.conserveRatio, cc)
     }
-    run(pass, p.advFwd, g.bg.advFwd, cc)
-    if (this.state.advection === 'mac') run(pass, p.advBwd, g.bg.advBwd, cc)
+    const bim = this.bimocqOn()
+    if (bim) {
+      run(pass, p.bimocqMaps, g.bimocq.maps[this.bimocqParity], cc)
+      run(pass, p.bimocqRecon, g.bimocq.recon[this.bimocqParity], cc)
+    } else {
+      run(pass, p.advFwd, g.bg.advFwd, cc)
+      if (this.macScalars()) run(pass, p.advBwd, g.bg.advBwd, cc)
+    }
     run(pass, p.combine, g.bg.combine, cc)
     run(pass, p.diffuse, g.bg.diffuse, cc)
     // The upres grid refills from the coarse density whenever it starts (a new source, or switched on).
@@ -1024,6 +1123,7 @@ export class PyroEngine {
     pass.end()
     if (up) enc.copyTextureToTexture({ texture: up.tex[1] }, { texture: up.tex[0] }, [2 * nx, 2 * ny, 2 * nz])
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
+    if (bim) this.bimocqAfter(enc, cc)
     enc.copyTextureToTexture({ texture: g.detA[1] }, { texture: g.detA[0] }, [nx, ny, nz])
     enc.copyTextureToTexture({ texture: g.detB[1] }, { texture: g.detB[0] }, [nx, ny, nz])
     // The fire's light from the new scalars (zero without flames).
@@ -1096,6 +1196,63 @@ export class PyroEngine {
     for (let k = 0; k < count; k++) vcycle(0)
   }
 
+  // The scalars' scheme: BiMocq2 for a smoke source when chosen; a fire given it uses MacCormack.
+  private bimocqOn() {
+    return this.state.advection === 'bimocq' && this.state.sourceType === 'smoke'
+  }
+  private macScalars() {
+    return this.state.advection === 'mac' || (this.state.advection === 'bimocq' && !this.bimocqOn())
+  }
+
+  // BiMocq2 at the start of a step that uses it: afresh if need be (identity maps, the field as the snapshot, nothing
+  // accumulated, no previous level).
+  private bimocqBegin(enc: GPUCommandEncoder) {
+    const g = this.grids!
+    const b = g.bimocq
+    const [nx, ny, nz] = g.n
+    const bytes = nx * ny * nz * 16
+    if (!this.bimocqReset && this.bimocqWas) return
+    this.bimocqReset = false
+    this.bimocqParity = 0
+    this.bimocqSteps = 0
+    this.bimocqHasPrev = false
+    enc.copyBufferToBuffer(b.identity, 0, b.x[0], 0, bytes)
+    enc.copyBufferToBuffer(b.identity, 0, b.y[0], 0, bytes)
+    enc.copyTextureToTexture({ texture: b.zero }, { texture: b.dCurr[0] }, [nx, ny, nz])
+    enc.copyTextureToTexture({ texture: g.scal[0] }, { texture: b.phiCurr }, [nx, ny, nz])
+    this.device.queue.writeBuffer(b.uniform, 0, new Float32Array([0, 0, 0, 0]))
+  }
+
+  // BiMocq2 after the step's sources and mixing: what they changed, accumulated; the maps' parity flips; every
+  // BIMOCQ_REINIT steps a re-initialisation (the current level becomes the previous one, the field the snapshot).
+  private bimocqAfter(enc: GPUCommandEncoder, cc: Vec3) {
+    const g = this.grids!
+    const b = g.bimocq
+    const p = this.pipes!
+    const [nx, ny, nz] = g.n
+    const bytes = nx * ny * nz * 16
+    const pass = enc.beginComputePass()
+    pass.setPipeline(p.bimocqAccum)
+    pass.setBindGroup(0, b.accum[this.bimocqParity])
+    pass.dispatchWorkgroups(cc[0], cc[1], cc[2])
+    pass.end()
+    this.bimocqParity = 1 - this.bimocqParity
+    if (++this.bimocqSteps < BIMOCQ_REINIT) return
+    this.bimocqSteps = 0
+    const cur = this.bimocqParity
+    enc.copyBufferToBuffer(b.x[cur], 0, b.xPrev, 0, bytes)
+    enc.copyBufferToBuffer(b.identity, 0, b.x[cur], 0, bytes)
+    enc.copyBufferToBuffer(b.identity, 0, b.y[cur], 0, bytes)
+    enc.copyTextureToTexture({ texture: b.phiCurr }, { texture: b.phiPrev }, [nx, ny, nz])
+    enc.copyTextureToTexture({ texture: g.scal[0] }, { texture: b.phiCurr }, [nx, ny, nz])
+    enc.copyTextureToTexture({ texture: b.dCurr[cur] }, { texture: b.dPrev }, [nx, ny, nz])
+    enc.copyTextureToTexture({ texture: b.zero }, { texture: b.dCurr[cur] }, [nx, ny, nz])
+    if (!this.bimocqHasPrev) {
+      this.bimocqHasPrev = true
+      this.device.queue.writeBuffer(b.uniform, 0, new Float32Array([1, 0, 0, 0]))
+    }
+  }
+
   // IVOCK runs for a smoke source (see wgsl.ts), with MacCormack or semi-Lagrangian velocity.
   private ivockOn() {
     return this.state.ivock && this.state.velocity !== 'ar' && this.state.sourceType === 'smoke'
@@ -1142,7 +1299,7 @@ export class PyroEngine {
     const st = this.stir
     f.set([...(st ? st.centre : [0, 0, 0]), STIR_RADIUS], 28)
     f.set([...(st ? st.vel : [0, 0, 0]), st ? 1 : 0], 32)
-    f.set([0, 0, this.ivockOn() ? 1 : 0, s.advection === 'mac' ? 1 : 0], 36)
+    f.set([0, 0, this.ivockOn() ? 1 : 0, this.macScalars() ? 1 : 0], 36)
     f.set([(-nx * dx) / 2, 0, (-nz * dx) / 2, 0], 40)
     // Each upres layer resets when the simulation clock crosses its period (layer B half a period later).
     const t0 = this.simTime / DETAIL_PERIOD
@@ -1558,10 +1715,18 @@ export class PyroEngine {
         one(p.conserveRatio, g.bg.conserveRatio, cc)(pass)
       })
     }
-    timed('advectScalars', one(p.advFwd, g.bg.advFwd, cc))
-    timed('advectBack', one(p.advBwd, g.bg.advBwd, cc))
+    const bim = this.bimocqOn()
+    if (bim) {
+      this.bimocqBegin(enc)
+      timed('bimocq: maps', one(p.bimocqMaps, g.bimocq.maps[this.bimocqParity], cc))
+      timed('bimocq: rebuild', one(p.bimocqRecon, g.bimocq.recon[this.bimocqParity], cc))
+    } else {
+      timed('advectScalars', one(p.advFwd, g.bg.advFwd, cc))
+      timed('advectBack', one(p.advBwd, g.bg.advBwd, cc))
+    }
     timed('combine', one(p.combine, g.bg.combine, cc))
     timed('mixing', one(p.diffuse, g.bg.diffuse, cc))
+    if (bim) timed('bimocq: accumulate', one(p.bimocqAccum, g.bimocq.accum[this.bimocqParity], cc))
     if (this.upresActive()) {
       const up = this.ensureUpres()
       timed('upres', one(p.upres, up.group, [Math.ceil((2 * nx) / 4), Math.ceil((2 * ny) / 4), Math.ceil((2 * nz) / 4)]))

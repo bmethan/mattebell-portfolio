@@ -3,7 +3,7 @@
 import { FUEL } from './physics'
 
 export type PyroResolution = 'low' | 'medium' | 'high'
-export type Advection = 'sl' | 'mac'
+export type Advection = 'sl' | 'mac' | 'bimocq' // BiMocq2 for a smoke source; a fire then uses MacCormack
 export type VelocityScheme = 'ar' | 'mac' | 'sl'
 export type PressureSolver = 'mg' | 'sor'
 export type SourceType = 'smoke' | 'fire'
@@ -76,7 +76,7 @@ export interface PyroState {
 
 export const PYRO_DEFAULTS: PyroState = {
   resolution: 'medium',
-  advection: 'mac',
+  advection: 'bimocq',
   velocity: 'mac',
   pressure: 'mg',
   vcycles: 2,

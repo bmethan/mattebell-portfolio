@@ -413,7 +413,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // expands (its fire variant). It is then advected with the velocity's own scheme (with MacCormack's, when the velocity
 // uses it: paired with plain semi-Lagrangian vorticity, the correction ran away), and what the advected velocity's
 // curl falls short of it is the loss, dw. A vector potential with (-lap + 1 / l^2) psi = dw (three screened Poisson
-// solves, two red-black Gauss-Seidel sweeps of all three at once, warm started: the screening makes the equation
+// solves, one red-black Gauss-Seidel sweep of all three at once each step, warm started: the screening makes the equation
 // local, so it needs no multigrid) gives the velocity that restores it, curl psi, added before the forces and the projection. The
 // screening, l four cells, is this lab's: the loss advection causes is at small scales. Simplifications: vorticity and potential at cell centres rather than the paper's cell edges, and
 // psi = 0 past the open sides rather than its open-space values. Masked out within two cells of the floor, the open
@@ -1190,6 +1190,161 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let q = vec3<f32>(id) / vec3<f32>(n);
   // Three independent fbms, one per channel.
   textureStore(dst, vec3<i32>(id), vec4<f32>(fbm(q, 0u), fbm(q, 1u), fbm(q, 2u), 1.0));
+}
+`
+
+// 7a. BiMocq2 for a smoke source's density and temperature (Qu, Zhang, Gao, Jiang and Chen 2019). Semi-Lagrangian
+// advection re-samples last step's field every step and blurs it a little each time; instead the scalars are rebuilt
+// each step from snapshots taken at the last two re-initialisations, through maps of where the fluid has travelled
+// since: a backward map X (where the gas in each cell was at the last re-initialisation, advected with the flow) and a
+// forward map Y (where the gas that was in each cell then is now, integrated with RK3). What the step's sources and
+// mixing change is gathered back to the snapshot's frame through Y and accumulated, so it rides the same maps. The
+// reconstruction is the paper's two-level one (its Eq. 24): the mean of the estimate through both levels' maps and
+// the one through the current level's alone. It is clamped to the values one step's backtrace would interpolate
+// between, as MacCormack is. This lab's simplifications: the backward map's backtrace is the solver's RK2 (the paper's
+// dual-mesh characteristics need CFL below one), it re-initialises every few steps rather than on the paper's
+// distortion criterion, and without its error correction. Positions are in grid units, cell centres at i + 0.5.
+
+// The maps: a step of each. X: semi-Lagrangian, the map read where the cell's backtrace lands. Y: each reference
+// point moved on by the flow (RK3).
+export const BIMOCQ_MAPS = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var<storage, read> xIn: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> xOut: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> yIn: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> yOut: array<vec4<f32>>;
+
+// A map, trilinear between cell centres (clamped at the grid's edge); w is 0 if any corner has no past.
+fn mapAt(g: vec3<f32>) -> vec4<f32> {
+  let n = nCells();
+  let p = clamp(g - 0.5, vec3<f32>(0.0), vec3<f32>(n - 1));
+  let b = vec3<i32>(floor(p));
+  let f = p - vec3<f32>(b);
+  var v = vec3<f32>(0.0);
+  var ok = 1.0;
+  for (var k = 0; k < 8; k++) {
+    let o = vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+    let w = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1) * select(1.0 - f.z, f.z, o.z == 1);
+    let m = xIn[cellIndex(min(b + o, n - 1))];
+    v += w * m.xyz;
+    ok = min(ok, m.w);
+  }
+  return vec4<f32>(v, ok);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let i = cellIndex(c);
+  let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0);
+  // Gas that came from outside the domain has no past here: it maps outside (and reads as clean air).
+  xOut[i] = select(vec4<f32>(0.0), mapAt(g), inDomain(g));
+  let k = P.grid.y / P.grid.x;
+  let y = yIn[i].xyz;
+  let v1 = velAt(vel, samp, y);
+  let v2 = velAt(vel, samp, y + 0.5 * k * v1);
+  let v3 = velAt(vel, samp, y + 0.75 * k * v2);
+  yOut[i] = vec4<f32>(y + k * (2.0 * v1 + 3.0 * v2 + 4.0 * v3) / 9.0, 1.0);
+}
+`
+
+// The scalars rebuilt through the maps (Eq. 24), clamped; written for the sources to work on (and kept, so the
+// accumulation can tell what they changed).
+export const BIMOCQ_RECON = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var<storage, read> xCurr: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> xPrev: array<vec4<f32>>;
+@group(0) @binding(5) var phiCurr: texture_3d<f32>; // the snapshot at the last re-initialisation
+@group(0) @binding(6) var phiPrev: texture_3d<f32>; // and at the one before
+@group(0) @binding(7) var dCurr: texture_3d<f32>; // the changes accumulated since each
+@group(0) @binding(8) var dPrev: texture_3d<f32>;
+@group(0) @binding(9) var phiNow: texture_3d<f32>; // this step's field before advection (for the clamp)
+@group(0) @binding(10) var dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(11) var keep: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(12) var<uniform> B: vec4<f32>; // x: whether there is a previous level
+
+// The previous level's backward map between cell centres (clamped at the grid's edge); w is 0 if any corner has no
+// past.
+fn xPrevAt(g: vec3<f32>) -> vec4<f32> {
+  let n = nCells();
+  let p = clamp(g - 0.5, vec3<f32>(0.0), vec3<f32>(n - 1));
+  let b = vec3<i32>(floor(p));
+  let f = p - vec3<f32>(b);
+  var v = vec4<f32>(0.0);
+  var ok = 1.0;
+  for (var k = 0; k < 8; k++) {
+    let o = vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+    let w = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1) * select(1.0 - f.z, f.z, o.z == 1);
+    let m = xPrev[cellIndex(min(b + o, n - 1))];
+    v += w * m;
+    ok = min(ok, m.w);
+  }
+  v.w = ok;
+  return v;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  let n = nCells();
+  if (any(c >= n)) { return; }
+  let i = cellIndex(c);
+  var phi = vec4<f32>(0.0);
+  let x1 = xCurr[i];
+  if (x1.w > 0.5 && inDomain(x1.xyz)) {
+    let one = scalAt(phiCurr, samp, x1.xyz) + scalAt(dCurr, samp, x1.xyz);
+    phi = one;
+    if (B.x > 0.5) {
+      let x2 = xPrevAt(x1.xyz);
+      if (x2.w > 0.99 && inDomain(x2.xyz)) {
+        phi = 0.5 * (scalAt(phiPrev, samp, x2.xyz) + scalAt(dPrev, samp, x2.xyz)) + 0.5 * scalAt(phiCurr, samp, x1.xyz) + scalAt(dCurr, samp, x1.xyz);
+      }
+    }
+  }
+  // Clamped to the values one step's backtrace would interpolate between.
+  let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0);
+  if (inDomain(g)) {
+    let b = vec3<i32>(floor(clamp(g - 0.5, vec3<f32>(0.0), vec3<f32>(n - 1))));
+    var lo = vec4<f32>(1e9);
+    var hi = vec4<f32>(-1e9);
+    for (var k = 0; k < 8; k++) {
+      let q = textureLoad(phiNow, min(b + vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1), n - 1), 0);
+      lo = min(lo, q);
+      hi = max(hi, q);
+    }
+    phi = clamp(phi, lo, hi);
+  } else {
+    phi = vec4<f32>(0.0);
+  }
+  textureStore(dst, c, phi);
+  textureStore(keep, c, phi);
+}
+`
+
+// What this step's sources and mixing changed (the new field less the rebuilt one), gathered back to the snapshot's
+// frame at each reference point's present position (Y) and added to the accumulator (Eq. 17).
+export const BIMOCQ_ACCUM = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var phiNew: texture_3d<f32>;
+@group(0) @binding(3) var phiStar: texture_3d<f32>;
+@group(0) @binding(4) var<storage, read> y: array<vec4<f32>>;
+@group(0) @binding(5) var accIn: texture_3d<f32>;
+@group(0) @binding(6) var accOut: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  var a = textureLoad(accIn, c, 0);
+  let p = y[cellIndex(c)].xyz;
+  if (inDomain(p)) { a += scalAt(phiNew, samp, p) - scalAt(phiStar, samp, p); }
+  textureStore(accOut, c, a);
 }
 `
 

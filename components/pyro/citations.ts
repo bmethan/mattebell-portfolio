@@ -270,6 +270,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1063/1.869832',
   },
   {
+    id: 'wavelet-turbulence',
+    group: 'Rendering',
+    authors: 'Theodore Kim, Nils Thürey, Doug L. James, Markus Gross',
+    title: 'Wavelet Turbulence for Fluid Simulation',
+    venue: 'ACM Transactions on Graphics 27(3), SIGGRAPH 2008',
+    year: '2008',
+    url: 'https://doi.org/10.1145/1360612.1360649',
+  },
+  {
     id: 'tricubic',
     group: 'Rendering',
     authors: 'Christian Sigg, Markus Hadwiger',

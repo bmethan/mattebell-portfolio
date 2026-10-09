@@ -918,7 +918,7 @@ struct RParams {
   fire: vec4<f32>,     // source is a fire (0 or 1), extinction in red and in blue relative to green, flame eddies' rise (m/s)
   wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear Rec.709; wind (m/s) in the first row's w
   wb1: vec4<f32>,      // (w: sample the scalars tricubically, 0 or 1)
-  wb2: vec4<f32>,
+  wb2: vec4<f32>,      // (w: render the smoke from the upres grid, 0 or 1)
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -1166,6 +1166,7 @@ ${RENDER_COMMON}
 ${fireCommon(9)}
 @group(0) @binding(10) var<storage, read> fireLight: array<vec4<f32>>;
 @group(0) @binding(11) var blueTex: texture_2d<f32>;
+@group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -1306,10 +1307,12 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       let fade = edgeFade(uvw);
       let s4 = scalSmooth(uvw);
       var sig = sigmaOf(s4) * fade;
+      let upres = R.wb2.w > 0.5;
+      if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvw, 0.0).x, 0.0) * fade; }
       if (sig > 1e-3) {
-        // Upres detail: strongest in thin smoke (the edges and wisps), a third as strong in the dense core, and fading
-        // out in the faintest haze, where fine noise reads as grain.
-        if (R.detail.z > 0.0) {
+        // Upres detail (unless the wavelet-turbulence grid supplies it): strongest in thin smoke (the edges and wisps),
+        // a third as strong in the dense core, and fading out in the faintest haze, where fine noise reads as grain.
+        if (R.detail.z > 0.0 && !upres) {
           let thin = 1.0 - smoothstep(0.2, 4.0, sig);
           let faint = smoothstep(0.0, 1.0, sig);
           sig *= clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
@@ -1437,5 +1440,83 @@ fn fs(@builtin(position) fc: vec4<f32>) -> Out {
   let balanced = vec3<f32>(dot(R.wb0.xyz, c), dot(R.wb1.xyz, c), dot(R.wb2.xyz, c));
   let mapped = srgb(aces(max(balanced, vec3<f32>(0.0))));
   return Out(vec4<f32>(mapped + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0), vec4<f32>(c, 1.0));
+}
+`
+
+// 12. Wavelet-turbulence upres (after Kim, Thuerey, James and Gross 2008), for a smoke source: the smoke's density again
+// on a grid twice as fine, carried by the solver's velocity plus turbulence too fine for the coarse grid. That
+// turbulence is the curl of a noise (divergence free), read at the texture coordinates the detail layers carry with the
+// flow, so its eddies travel with the smoke and fade where the flow has stretched them, and is as strong as the local
+// flow, as eddies a band finer carry energy in proportion to the resolved flow's. Semi-Lagrangian: at half the cell
+// size it smears half as much. The renderer reads this density; the lighting still comes from the coarse grid.
+export const UPRES = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var src: texture_3d<f32>;
+@group(0) @binding(4) var dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(5) var detA: texture_3d<f32>;
+@group(0) @binding(6) var detB: texture_3d<f32>;
+@group(0) @binding(7) var noiseTex: texture_3d<f32>;
+@group(0) @binding(8) var noiseSamp: sampler;
+@group(0) @binding(9) var scal: texture_3d<f32>;
+struct Upres {
+  strength: f32, // the turbulence's speed per unit of the local flow's
+  k: f32, // 1/m: noise tiles per metre
+  wa: f32, // the detail layers' cross-fade weights
+  wb: f32,
+  init: f32, // 1: fill from the coarse density instead (when the upres starts)
+  p0: f32,
+  p1: f32,
+  p2: f32,
+}
+@group(0) @binding(10) var<uniform> U: Upres;
+
+const ROT = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
+// The curl of the noise's three channels as a vector potential, by central differences half a texel apart, scaled to
+// about unit size (the fbm's gradients run about 20 per tile).
+fn curlNoise(p: vec3<f32>) -> vec3<f32> {
+  let h = 0.5 / 64.0;
+  let q = ROT * p;
+  let ex = ROT * vec3<f32>(h, 0.0, 0.0);
+  let ey = ROT * vec3<f32>(0.0, h, 0.0);
+  let ez = ROT * vec3<f32>(0.0, 0.0, h);
+  let dx = textureSampleLevel(noiseTex, noiseSamp, q + ex, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ex, 0.0).xyz;
+  let dy = textureSampleLevel(noiseTex, noiseSamp, q + ey, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ey, 0.0).xyz;
+  let dz = textureSampleLevel(noiseTex, noiseSamp, q + ez, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ez, 0.0).xyz;
+  return vec3<f32>(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) / (2.0 * h * 20.0);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let nf = vec3<i32>(textureDimensions(dst));
+  let c = vec3<i32>(id);
+  if (any(c >= nf)) { return; }
+  let gF = vec3<f32>(id) + 0.5;
+  let g = 0.5 * gF; // coarse grid coordinates
+  let w = worldOf(g);
+  if (U.init > 0.5) {
+    textureStore(dst, c, vec4<f32>(max(scalAt(scal, samp, g).x, 0.0), 0.0, 0.0, 0.0));
+    return;
+  }
+  let u = velAt(vel, samp, g);
+  let uvw = g / nF();
+  let a = textureSampleLevel(detA, samp, uvw, 0.0);
+  let b = textureSampleLevel(detB, samp, uvw, 0.0);
+  let wa = U.wa / (1.0 + a.w * a.w);
+  let wb = U.wb / (1.0 + b.w * b.w);
+  let turb = (curlNoise((w + a.xyz) * U.k) * wa + curlNoise((w + b.xyz) * U.k + vec3<f32>(0.37, 0.61, 0.13)) * wb) / max(sqrt(U.wa * U.wa + U.wb * U.wb), 1e-3);
+  let v = u + U.strength * length(u) * turb;
+  // Back along the flow, in fine cells (twice as many per metre).
+  let gb = gF - 2.0 * v * P.grid.y / P.grid.x;
+  let n = vec3<f32>(nf);
+  var d = 0.0;
+  if (gb.x >= 0.0 && gb.x <= n.x && gb.z >= 0.0 && gb.z <= n.z && gb.y <= n.y) {
+    d = textureSampleLevel(src, samp, (clamp(gb - 0.5, vec3<f32>(0.0), n - 1.0) + 0.5) / n, 0.0).x;
+  }
+  let top = smoothstep(0.7, 1.0, gF.y / n.y);
+  d = max(d, 0.0) * exp(-(P.decay.y + 2.5 * top) * P.grid.y);
+  d = max(d, P.srcProps.x * sourceMask(w));
+  textureStore(dst, c, vec4<f32>(d, 0.0, 0.0, 0.0));
 }
 `

@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, RESOLVE, VEL_COMBINE, COMBINE, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, RESOLVE, UPRES, VEL_COMBINE, COMBINE, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, SOOT_CHROMA, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -83,6 +83,7 @@ interface Pipes {
   light: GPUComputePipeline
   render: GPURenderPipeline
   resolve: GPURenderPipeline
+  upres: GPUComputePipeline
 }
 
 // One multigrid level: its cells, and bind groups for smoothing (by colour), the residual, restriction into the
@@ -107,6 +108,7 @@ interface Grids {
   detA: [GPUTexture, GPUTexture]
   detB: [GPUTexture, GPUTexture]
   lightDims: Vec3
+  light: GPUTexture
   bg: {
     advectVel: GPUBindGroup // semi-Lagrangian, straight to the advected texture
     advectVelFwd: GPUBindGroup
@@ -156,7 +158,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, render, resolve] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, upres, render, resolve] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -180,6 +182,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(COMBINE),
     compute(DIFFUSE),
     compute(LIGHT),
+    compute(UPRES),
     d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: renderModule, entryPoint: 'vs' },
@@ -193,7 +196,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, render, resolve }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, upres, render, resolve }
 }
 
 export function prewarmPyro() {
@@ -278,6 +281,14 @@ export class PyroEngine {
   private histIndex = 0
   private taaCount = 0
   private renderFrame = 0
+  // Wavelet-turbulence upres for a smoke source: its two textures (twice the grid's resolution), made when first
+  // needed; the pass's bind group and uniform; the render bind group that reads it; and whether it must refill from
+  // the coarse density on its next step.
+  private upres: { tex: [GPUTexture, GPUTexture]; group: GPUBindGroup; render: GPUBindGroup } | null = null
+  private upresBuf: GPUBuffer
+  private upresInit = true
+  private upresWasActive = false
+  private dummy3d: GPUTexture
   private noiseSampler: GPUSampler
   private pipes: Pipes | null = null
   private grids: Grids | null = null
@@ -353,6 +364,8 @@ export class PyroEngine {
     this.blueTex = d.createTexture({ size: [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
     d.queue.writeTexture({ texture: this.blueTex }, blueNoise(), { bytesPerRow: BLUE_NOISE_SIZE }, [BLUE_NOISE_SIZE, BLUE_NOISE_SIZE])
     this.taaBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
+    this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
+    this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.whenReady = this.build(prebuilt)
   }
 
@@ -381,6 +394,9 @@ export class PyroEngine {
     const d = this.device
     const p = this.pipes!
     this.grids?.textures.forEach(t => t.destroy())
+    this.upres?.tex.forEach(t => t.destroy())
+    this.upres = null
+    this.upresInit = true
     this.grids?.buffers.forEach(b => b.destroy())
     const n = RESOLUTIONS[this.state.resolution].dims
     const T = GPUTextureUsage
@@ -479,6 +495,7 @@ export class PyroEngine {
       detA,
       detB,
       lightDims,
+      light,
       bg: {
         advectVel: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[3])]),
         advectVelFwd: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[1])]),
@@ -500,7 +517,7 @@ export class PyroEngine {
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
-        render: group(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView()]),
+        render: group(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView(), this.dummy3d.createView()]),
       },
     }
     this.simTime = 0
@@ -724,8 +741,17 @@ export class PyroEngine {
     if (this.state.advection === 'mac') run(pass, p.advBwd, g.bg.advBwd, cc)
     run(pass, p.combine, g.bg.combine, cc)
     run(pass, p.diffuse, g.bg.diffuse, cc)
+    // The upres grid refills from the coarse density whenever it starts (a new source, or switched on).
+    const upActive = this.upresActive()
+    if (upActive && !this.upresWasActive) this.upresInit = true
+    this.upresWasActive = upActive
+    const up = upActive ? this.ensureUpres() : null
+    if (up) {
+      run(pass, p.upres, up.group, [Math.ceil((2 * nx) / 4), Math.ceil((2 * ny) / 4), Math.ceil((2 * nz) / 4)])
+    }
     run(pass, p.advDetail, g.bg.advDetail, cc)
     pass.end()
+    if (up) enc.copyTextureToTexture({ texture: up.tex[1] }, { texture: up.tex[0] }, [2 * nx, 2 * ny, 2 * nz])
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
     enc.copyTextureToTexture({ texture: g.detA[1] }, { texture: g.detA[0] }, [nx, ny, nz])
     enc.copyTextureToTexture({ texture: g.detB[1] }, { texture: g.detB[0] }, [nx, ny, nz])
@@ -852,7 +878,7 @@ export class PyroEngine {
     r.set([fire ? 1 : 0, fire ? SOOT_CHROMA[0] : 1, fire ? SOOT_CHROMA[1] : 1, 0.5 * 1.9 * s.heatRelease ** 0.2], 40)
     r.set([...wb[0], s.wind], 44)
     r.set([...wb[1], s.tricubic ? 1 : 0], 48)
-    r.set([...wb[2], 0], 52)
+    r.set([...wb[2], this.upresActive() && this.upres ? 1 : 0], 52)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
@@ -885,6 +911,43 @@ export class PyroEngine {
     return this.targets
   }
 
+  private upresActive() {
+    return this.state.sourceType === 'smoke' && this.state.upres
+  }
+
+  // The upres grid's textures and bind groups, made on first use; writes the pass's uniform each step.
+  private ensureUpres() {
+    const g = this.grids!
+    const p = this.pipes!
+    const d = this.device
+    if (!this.upres) {
+      const [nx, ny, nz] = g.n
+      const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST
+      const make = () => d.createTexture({ size: [2 * nx, 2 * ny, 2 * nz], dimension: '3d', format: 'rgba16float', usage })
+      const tex: [GPUTexture, GPUTexture] = [make(), make()]
+      const v = (t: GPUTexture) => t.createView()
+      const entries = (res: GPUBindingResource[]) => res.map((resource, binding) => ({ binding, resource }))
+      const group = d.createBindGroup({
+        layout: p.upres.getBindGroupLayout(0),
+        entries: entries([{ buffer: this.simBuf }, this.sampler, v(g.vel[0]), v(tex[0]), v(tex[1]), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, v(g.scal[0]), { buffer: this.upresBuf }]),
+      })
+      const render = d.createBindGroup({
+        layout: p.render.getBindGroupLayout(0),
+        entries: entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView(), v(tex[0])]),
+      })
+      this.upres = { tex, group, render }
+      this.upresInit = true
+    }
+    const ageA = (this.simTime / DETAIL_PERIOD) % 1
+    const ageB = (this.simTime / DETAIL_PERIOD + 0.5) % 1
+    const dx = DOMAIN_WIDTH / g.n[0]
+    // Eddies from four cells across down to half a cell (the fbm's three octaves), at the strength of the flow's
+    // next band in Kolmogorov's spectrum, 2^(-5/6) of the resolved flow's, times the control.
+    d.queue.writeBuffer(this.upresBuf, 0, new Float32Array([2 ** (-5 / 6) * this.state.upresStrength, 1 / (8 * 4 * dx), 1 - Math.abs(2 * ageA - 1), 1 - Math.abs(2 * ageB - 1), this.upresInit ? 1 : 0, 0, 0, 0]))
+    this.upresInit = false
+    return this.upres
+  }
+
   private render() {
     const g = this.grids!
     const p = this.pipes!
@@ -907,7 +970,7 @@ export class PyroEngine {
       colorAttachments: [{ view: t.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
     })
     pass.setPipeline(p.render)
-    pass.setBindGroup(0, g.bg.render)
+    pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.render : g.bg.render)
     pass.draw(3)
     pass.end()
     // Read the last history, write the next.
@@ -1039,6 +1102,11 @@ export class PyroEngine {
     timed('advectBack', one(p.advBwd, g.bg.advBwd, cc))
     timed('combine', one(p.combine, g.bg.combine, cc))
     timed('mixing', one(p.diffuse, g.bg.diffuse, cc))
+    if (this.upresActive()) {
+      const up = this.ensureUpres()
+      timed('upres', one(p.upres, up.group, [Math.ceil((2 * nx) / 4), Math.ceil((2 * ny) / 4), Math.ceil((2 * nz) / 4)]))
+      enc.copyTextureToTexture({ texture: up.tex[1] }, { texture: up.tex[0] }, [2 * nx, 2 * ny, 2 * nz])
+    }
     timed('detail', one(p.advDetail, g.bg.advDetail, cc))
     timed('fireLight', pass => {
       one(p.fireSum, g.bg.fireSum, cc)(pass)

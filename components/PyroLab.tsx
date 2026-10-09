@@ -54,6 +54,10 @@ const TECH_NOTES: [string, string][] = [
     'Detail',
     'Wisps finer than the grid, in the spirit of production upres: two layers of texture coordinates ride with the flow, and the renderer reads a fine noise at them, so the detail moves with the smoke rather than sliding through it. The flow stretches each layer as it shears it, so each resets on its own schedule, half a period after the other, and the two cross-fade: a layer is invisible at the moment it resets. A stretched layer would streak its noise along the stretch, so each layer also tracks how far the flow has stretched it (after Neyret 2003) and counts for less the more it has; where both are stretched, as in the fast updraft over a fire, the detail fades rather than streaks. The detail works hardest in thin smoke, at the edges and in the wisps, and leaves the faintest haze smooth, where fine noise would read as grain. It shapes what the camera sees; the light still travels through the simulated density.',
   ],
+  [
+    'Upres',
+    'A smoke source’s density also runs on a grid twice as fine, in the manner of wavelet turbulence (Kim, Thürey, James and Gross): carried by the solver’s velocity plus turbulence too fine for the coarse grid, the curl of a noise, so it stays divergence free, read at the texture coordinates the detail layers carry with the flow (its eddies travel with the smoke and fade where the flow has stretched them), and as strong as the local flow times 2^(−5/6), the share of the next band of eddies in Kolmogorov’s spectrum. The camera sees this finer smoke; the lighting still comes from the coarse grid. It takes the place of the rendered detail for smoke, and the Solver tab turns it off. A fire keeps the rendered detail: its soot and temperature come from the combustion on the coarse grid.',
+  ],
   ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
   [
     'Rendering',
@@ -497,6 +501,19 @@ export default function PyroLab() {
                       Semi-Lagrangian
                     </Pill>
                   </Group>
+                </div>
+                <div className="lab-row">
+                  <Group label="Smoke upres">
+                    <Pill on={!pyro.upres} onClick={() => update({ upres: false })}>
+                      Off
+                    </Pill>
+                    <Pill on={pyro.upres} onClick={() => update({ upres: true })}>
+                      Wavelet turbulence, 2×
+                    </Pill>
+                  </Group>
+                  {pyro.upres && (
+                    <Slider label="Upres turbulence" min={0} max={2} step={0.05} value={pyro.upresStrength} onChange={v => update({ upresStrength: v })} />
+                  )}
                 </div>
                 <div className="lab-row">
                   <Group label="Pressure">

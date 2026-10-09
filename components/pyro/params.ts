@@ -58,6 +58,8 @@ export interface PyroState {
   exposure: number // the camera's EV100
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
   tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
+  upres: boolean // a smoke source's density also on a grid twice as fine (wavelet turbulence)
+  upresStrength: number // its turbulence, 1 = Kolmogorov's next band
   // Upres detail
   detail: number // 0 = off
   detailScale: number // m, the largest noise feature
@@ -98,6 +100,8 @@ export const PYRO_DEFAULTS: PyroState = {
   exposure: 7,
   whiteBalance: 5500,
   tricubic: true,
+  upres: true,
+  upresStrength: 1,
   detail: 1,
   detailScale: 0.05,
 }

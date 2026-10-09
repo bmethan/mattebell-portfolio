@@ -44,6 +44,9 @@ export interface PyroState {
   sunIntensity: number
   skyIntensity: number
   exposure: number // stops
+  // Upres detail
+  detail: number // 0 = off
+  detailScale: number // m, the largest noise feature
 }
 
 export const PYRO_DEFAULTS: PyroState = {
@@ -72,4 +75,6 @@ export const PYRO_DEFAULTS: PyroState = {
   sunIntensity: 2.6,
   skyIntensity: 0.35,
   exposure: 0,
+  detail: 1,
+  detailScale: 0.05,
 }

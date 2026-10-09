@@ -22,6 +22,7 @@ struct Params {
   stirD: vec4<f32>,     // stir velocity change (m/s), on (0 or 1)
   stirR: vec4<f32>,     // unused xyz, MacCormack on (0 or 1)
   origin: vec4<f32>,    // domain min corner (m)
+  detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B
 }
 @group(0) @binding(0) var<uniform> P: Params;
 
@@ -489,6 +490,81 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
+// Upres detail: two layers of texture coordinates ride with the flow (each cell stores where its smoke was when the
+// layer was last reset, relative to the cell), and the renderer looks up a fine noise there, so wisps finer than the
+// grid move with the smoke. A layer stretches as the flow shears it, so each is reset to the identity on its own
+// schedule, half a period apart, and the renderer cross-fades them: each is invisible at the moment it is reset.
+export const ADVECT_DETAIL = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var srcA: texture_3d<f32>;
+@group(0) @binding(4) var srcB: texture_3d<f32>;
+@group(0) @binding(5) var dstA: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(6) var dstB: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let g = vec3<f32>(id) + 0.5;
+  let gs = backtrace(vel, samp, g, 1.0);
+  // The material here came from gs: its origin, relative to here, is its origin relative to gs plus (gs - g).
+  let shift = (gs - g) * P.grid.x;
+  let a = select(scalAt(srcA, samp, gs).xyz + shift, vec3<f32>(0.0), P.detail.x > 0.5);
+  let b = select(scalAt(srcB, samp, gs).xyz + shift, vec3<f32>(0.0), P.detail.y > 0.5);
+  textureStore(dstA, c, vec4<f32>(a, 0.0));
+  textureStore(dstB, c, vec4<f32>(b, 0.0));
+}
+`
+
+// The detail noise: tileable gradient-noise fbm (lattice periods 8, 16 and 32 across a 64-texel tile; gradient noise
+// has none of value noise's blocky, axis-aligned look), made once.
+export const NOISE_GEN = /* wgsl */ `
+@group(0) @binding(0) var dst: texture_storage_3d<rgba8unorm, write>;
+
+fn hashW(c0: vec3<i32>, period: i32) -> f32 {
+  let c = ((c0 % period) + period) % period;
+  var h = (bitcast<u32>(c.x) * 0x8da6b343u) ^ (bitcast<u32>(c.y) * 0xd8163841u) ^ (bitcast<u32>(c.z) * 0xcb1ab31fu) ^ (u32(period) * 0x9e3779b9u);
+  h = (h ^ (h >> 16u)) * 0x7feb352du;
+  h = (h ^ (h >> 15u)) * 0x846ca68bu;
+  h = h ^ (h >> 16u);
+  return f32(h) * (1.0 / 4294967296.0);
+}
+// A random unit gradient at a lattice point (uniform on the sphere).
+fn gradW(c: vec3<i32>, period: i32) -> vec3<f32> {
+  let z = 2.0 * hashW(c, period) - 1.0;
+  let a = 6.2831853 * hashW(c + vec3<i32>(173, 311, 467), period);
+  let r = sqrt(max(1.0 - z * z, 0.0));
+  return vec3<f32>(r * cos(a), r * sin(a), z);
+}
+fn corner(c: vec3<i32>, o: vec3<i32>, f: vec3<f32>, period: i32) -> f32 {
+  return dot(gradW(c + o, period), f - vec3<f32>(o));
+}
+// Gradient (Perlin) noise, about -0.7 to 0.7, wrapping every period lattice cells.
+fn tileNoise(q: vec3<f32>, period: i32) -> f32 {
+  let i = floor(q);
+  let f = q - i;
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let c = vec3<i32>(i);
+  let x00 = mix(corner(c, vec3<i32>(0, 0, 0), f, period), corner(c, vec3<i32>(1, 0, 0), f, period), u.x);
+  let x10 = mix(corner(c, vec3<i32>(0, 1, 0), f, period), corner(c, vec3<i32>(1, 1, 0), f, period), u.x);
+  let x01 = mix(corner(c, vec3<i32>(0, 0, 1), f, period), corner(c, vec3<i32>(1, 0, 1), f, period), u.x);
+  let x11 = mix(corner(c, vec3<i32>(0, 1, 1), f, period), corner(c, vec3<i32>(1, 1, 1), f, period), u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = textureDimensions(dst);
+  if (any(id >= n)) { return; }
+  let q = vec3<f32>(id) / vec3<f32>(n);
+  let v = 0.55 * tileNoise(q * 8.0, 8) + 0.3 * tileNoise(q * 16.0, 16) + 0.15 * tileNoise(q * 32.0, 32);
+  let s = clamp(0.5 + 1.7 * v, 0.0, 1.0);
+  textureStore(dst, vec3<i32>(id), vec4<f32>(s, s, s, 1.0));
+}
+`
+
 // 8. Modified MacCormack (Selle et al. 2008): the forward result plus half the round-trip error, clamped to the
 // values the forward step interpolated between; then dissipation, cooling and the source.
 export const COMBINE = /* wgsl */ `
@@ -544,6 +620,7 @@ struct RParams {
   skyCol: vec4<f32>,   // sky colour x intensity, single-scattering albedo
   floorCol: vec4<f32>, // floor albedo, radius (m) over which the floor fades to black
   size: vec4<f32>,     // render target width, height
+  detail: vec4<f32>,   // weight of detail layer A, of layer B, amount, 1 / (8 x detail scale in m)
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -624,6 +701,10 @@ ${RENDER_COMMON}
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var scal: texture_3d<f32>;
 @group(0) @binding(4) var light: texture_3d<f32>;
+@group(0) @binding(5) var detA: texture_3d<f32>;
+@group(0) @binding(6) var detB: texture_3d<f32>;
+@group(0) @binding(7) var noiseTex: texture_3d<f32>;
+@group(0) @binding(8) var noiseSamp: sampler;
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -636,6 +717,20 @@ fn hg(c: f32, g: f32) -> f32 {
   return (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
 }
 fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
+
+// Upres detail at a point: the noise at each layer's advected coordinates, cross-faded, with the contrast that mixing
+// two independent noises loses restored (divided by the blend's standard-deviation factor).
+fn detail(w: vec3<f32>, uvw: vec3<f32>) -> f32 {
+  let a = textureSampleLevel(detA, samp, uvw, 0.0).xyz;
+  let b = textureSampleLevel(detB, samp, uvw, 0.0).xyz;
+  // A fixed rotation, so the noise lattice lines up with neither the grid nor the camera.
+  let rot = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
+  let na = textureSampleLevel(noiseTex, noiseSamp, rot * (w + a) * R.detail.w, 0.0).x - 0.5;
+  let nb = textureSampleLevel(noiseTex, noiseSamp, rot * (w + b) * R.detail.w + vec3<f32>(0.37, 0.61, 0.13), 0.0).x - 0.5;
+  let wa = R.detail.x;
+  let wb = R.detail.y;
+  return (na * wa + nb * wb) / max(sqrt(wa * wa + wb * wb), 1e-3);
+}
 
 // Stephen Hill's fit of the ACES RRT and sRGB ODT (rows of the input and output matrices).
 fn aces(c: vec3<f32>) -> vec3<f32> {
@@ -685,7 +780,12 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         continue;
       }
       t += ds;
-      let d = textureSampleLevel(scal, samp, uvw, 0.0).x * edgeFade(uvw);
+      var d = textureSampleLevel(scal, samp, uvw, 0.0).x * edgeFade(uvw);
+      if (d > 1e-4 && R.detail.z > 0.0) {
+        // Strongest in thin smoke (the edges and wisps), a third as strong in the dense core.
+        let thin = 1.0 - smoothstep(0.02, 0.4, d);
+        d *= clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin), 0.0, 2.0);
+      }
       if (d > 1e-4) {
         let L = textureSampleLevel(light, samp, uvw, 0.0);
         let tau = L.x;

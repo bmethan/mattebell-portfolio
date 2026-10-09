@@ -37,6 +37,10 @@ const TECH_NOTES: [string, string][] = [
     'Forces',
     'Buoyancy from temperature; vorticity confinement, which restores the small swirls a coarse grid smooths away; divergence-free turbulence from the curl of a noise potential, only where there is smoke; wind; and the source’s upward push. Hot air cools and smoke dissipates at the rates in the Forces tab.',
   ],
+  [
+    'Detail',
+    'Wisps finer than the grid, in the spirit of production upres: two layers of texture coordinates ride with the flow, and the renderer reads a fine noise at them, so the detail moves with the smoke rather than sliding through it. The flow stretches each layer as it shears it, so each resets on its own schedule, half a period after the other, and the two cross-fade: a layer is invisible at the moment it resets. The detail works hardest in thin smoke, at the edges and in the wisps. It shapes what the camera sees; the light still travels through the simulated density.',
+  ],
   ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
   [
     'Rendering',
@@ -375,6 +379,10 @@ export default function PyroLab() {
                   <Slider label="Sun" min={0} max={8} step={0.1} value={pyro.sunIntensity} digits={1} onChange={v => update({ sunIntensity: v })} />
                   <Slider label="Sky" min={0} max={2} step={0.05} value={pyro.skyIntensity} onChange={v => update({ skyIntensity: v })} />
                   <Slider label="Exposure" min={-3} max={3} step={0.1} value={pyro.exposure} digits={1} unit=" EV" onChange={v => update({ exposure: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Detail" min={0} max={1.5} step={0.05} value={pyro.detail} onChange={v => update({ detail: v })} />
+                  <Slider label="Detail scale" min={0.02} max={0.2} step={0.005} value={pyro.detailScale} digits={3} unit=" m" onChange={v => update({ detailScale: v })} />
                 </div>
                 <p className="lab-note">Pause the simulation to relight a frozen frame: shading changes redraw at once.</p>
               </>

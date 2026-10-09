@@ -32,7 +32,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Advection',
-    'Velocity and scalars move with Modified MacCormack: a forward and a backward semi-Lagrangian step, half the round-trip error added back, then clamped to the values the forward step read, so detail survives without new extremes. Semi-Lagrangian alone is the softer, more diffusive choice.',
+    'Velocity and scalars move with Modified MacCormack: a forward and a backward semi-Lagrangian step, half the round-trip error added back, then clamped to the values the forward step read, so detail survives without new extremes. The Solver tab also offers semi-Lagrangian alone, the softer, more diffusive choice, and for the velocity advection-reflection (Zehnder, Narain and Thomaszewski 2018): it advects half a step, projects, reflects the velocity through the projection and advects the reflection the second half, which loses far less of the flow’s energy to the projection. It needs two full pressure solves a step (with one V-cycle each, the reflection amplifies the solver’s error until it blows up). Measured against fire experiments it mixes the plume no differently from MacCormack at this resolution, where the grid itself, not the scheme, limits the turbulence, so MacCormack, the cheaper of the two, is the default.',
   ],
   [
     'Forces',
@@ -466,7 +466,20 @@ export default function PyroLab() {
                   </Group>
                 </div>
                 <div className="lab-row">
-                  <Group label="Advection">
+                  <Group label="Velocity">
+                    <Pill on={pyro.velocity === 'mac'} onClick={() => update({ velocity: 'mac' })}>
+                      Modified MacCormack
+                    </Pill>
+                    <Pill on={pyro.velocity === 'ar'} onClick={() => update({ velocity: 'ar' })}>
+                      Advection-reflection
+                    </Pill>
+                    <Pill on={pyro.velocity === 'sl'} onClick={() => update({ velocity: 'sl' })}>
+                      Semi-Lagrangian
+                    </Pill>
+                  </Group>
+                </div>
+                <div className="lab-row">
+                  <Group label="Scalars">
                     <Pill on={pyro.advection === 'mac'} onClick={() => update({ advection: 'mac' })}>
                       Modified MacCormack
                     </Pill>

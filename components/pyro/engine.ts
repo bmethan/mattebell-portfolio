@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, VEL_COMBINE, COMBINE, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, VEL_COMBINE, COMBINE, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { FUEL, G, SOOT_CHROMA, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
@@ -65,6 +65,8 @@ interface Pipes {
   mgProlong: GPUComputePipeline
   advectVel: GPUComputePipeline
   advectVelBack: GPUComputePipeline
+  advectVelHalf: GPUComputePipeline
+  projectReflect: GPUComputePipeline
   velCombine: GPUComputePipeline
   curl: GPUComputePipeline
   forces: GPUComputePipeline
@@ -106,6 +108,9 @@ interface Grids {
     advectVelFwd: GPUBindGroup
     advectVelBack: GPUBindGroup
     velCombine: GPUBindGroup
+    arAdvect1: GPUBindGroup // advection-reflection: u^n through itself, half a step
+    arAdvect2: GPUBindGroup // the reflected field through the halfway velocity, half a step
+    projectReflect: GPUBindGroup
     curl: GPUBindGroup
     forces: GPUBindGroup
     divergence: GPUBindGroup
@@ -146,7 +151,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
   const compute = (code: string, constants?: Record<string, number>) =>
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
-  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, render] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, render] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -157,6 +162,8 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(MG_PROLONG),
     compute(ADVECT_VEL, { DIR: 1 }),
     compute(ADVECT_VEL, { DIR: -1 }),
+    compute(ADVECT_VEL, { DIR: 0.5 }),
+    compute(PROJECT_REFLECT),
     compute(VEL_COMBINE),
     compute(CURL),
     compute(FORCES),
@@ -175,7 +182,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, render }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, diffuse, light, render }
 }
 
 export function prewarmPyro() {
@@ -363,7 +370,7 @@ export class PyroEngine {
         usage: T.TEXTURE_BINDING | T.STORAGE_BINDING | (copy ? T.COPY_SRC | T.COPY_DST : 0),
       })
     const velSize: Vec3 = [n[0] + 1, n[1] + 1, n[2] + 1]
-    const vel: [GPUTexture, GPUTexture, GPUTexture, GPUTexture] = [tex(velSize, true), tex(velSize, true), tex(velSize), tex(velSize)]
+    const vel: [GPUTexture, GPUTexture, GPUTexture, GPUTexture] = [tex(velSize, true), tex(velSize, true), tex(velSize), tex(velSize, true)]
     const scal = [tex(n, true), tex(n, true), tex(n), tex(n)] as [GPUTexture, GPUTexture, GPUTexture, GPUTexture]
     const detA: [GPUTexture, GPUTexture] = [tex(n, true), tex(n, true)]
     const detB: [GPUTexture, GPUTexture] = [tex(n, true), tex(n, true)]
@@ -455,6 +462,9 @@ export class PyroEngine {
         advectVelFwd: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[1])]),
         advectVelBack: group(p.advectVelBack, [P, s, v(vel[0]), v(vel[1]), v(vel[2])]),
         velCombine: group(p.velCombine, [P, s, v(vel[0]), v(vel[1]), v(vel[2]), v(vel[3])]),
+        arAdvect1: group(p.advectVelHalf, [P, s, v(vel[0]), v(vel[0]), v(vel[3])]),
+        arAdvect2: group(p.advectVelHalf, [P, s, v(vel[1]), v(vel[2]), v(vel[3])]),
+        projectReflect: group(p.projectReflect, [P, v(vel[0]), { buffer: pressure }, v(vel[1]), v(vel[2])]),
         curl: group(p.curl, [P, v(vel[3]), v(curl)]),
         forces: group(p.forces, [P, v(vel[3]), v(scal[0]), v(curl), v(vel[0])]),
         divergence: group(p.divergence, [P, v(vel[0]), { buffer: div }, v(scal[0]), { buffer: fireLight }, { buffer: hrr }]),
@@ -657,8 +667,13 @@ export class PyroEngine {
       pass.setBindGroup(0, bg)
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
     }
+    // Velocity: advect (into vel[3]), forces (into vel[0]), project (into vel[1]). Advection-reflection advects half a
+    // step, projects, reflects, advects the reflection the second half and projects again.
+    const scheme = this.state.velocity
     let pass = enc.beginComputePass()
-    if (this.state.advection === 'mac') {
+    if (scheme === 'ar') {
+      run(pass, p.advectVelHalf, g.bg.arAdvect1, cv)
+    } else if (scheme === 'mac') {
       run(pass, p.advectVel, g.bg.advectVelFwd, cv)
       run(pass, p.advectVelBack, g.bg.advectVelBack, cv)
       run(pass, p.velCombine, g.bg.velCombine, cv)
@@ -669,6 +684,15 @@ export class PyroEngine {
     run(pass, p.forces, g.bg.forces, cv)
     run(pass, p.divergence, g.bg.divergence, cc)
     this.solvePressure(pass)
+    if (scheme === 'ar') {
+      run(pass, p.projectReflect, g.bg.projectReflect, cv)
+      run(pass, p.advectVelHalf, g.bg.arAdvect2, cv)
+      pass.end()
+      enc.copyTextureToTexture({ texture: g.vel[3] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
+      pass = enc.beginComputePass()
+      run(pass, p.divergence, g.bg.divergence, cc)
+      this.solvePressure(pass)
+    }
     run(pass, p.project, g.bg.project, cv)
     pass.end()
     enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
@@ -909,7 +933,11 @@ export class PyroEngine {
       pass.setBindGroup(0, bg)
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
     }
-    if (this.state.advection === 'mac') {
+    const scheme = this.state.velocity
+    const solveLabel = this.state.pressure === 'sor' ? `sor x${this.state.pressureIters}` : `multigrid x${this.state.vcycles}`
+    if (scheme === 'ar') {
+      timed('advectVel', one(p.advectVelHalf, g.bg.arAdvect1, cv))
+    } else if (scheme === 'mac') {
       timed('advectVel', pass => {
         one(p.advectVel, g.bg.advectVelFwd, cv)(pass)
         one(p.advectVelBack, g.bg.advectVelBack, cv)(pass)
@@ -921,7 +949,16 @@ export class PyroEngine {
     timed('curl', one(p.curl, g.bg.curl, cc))
     timed('forces', one(p.forces, g.bg.forces, cv))
     timed('divergence', one(p.divergence, g.bg.divergence, cc))
-    timed(this.state.pressure === 'sor' ? `sor x${this.state.pressureIters}` : `multigrid x${this.state.vcycles}`, pass => this.solvePressure(pass))
+    timed(solveLabel, pass => this.solvePressure(pass))
+    if (scheme === 'ar') {
+      timed('reflect', pass => {
+        one(p.projectReflect, g.bg.projectReflect, cv)(pass)
+        one(p.advectVelHalf, g.bg.arAdvect2, cv)(pass)
+      })
+      enc.copyTextureToTexture({ texture: g.vel[3] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
+      timed('divergence 2', one(p.divergence, g.bg.divergence, cc))
+      timed(`${solveLabel} (2)`, pass => this.solvePressure(pass))
+    }
     timed('project', one(p.project, g.bg.project, cv))
     enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
     timed('advectScalars', one(p.advFwd, g.bg.advFwd, cc))

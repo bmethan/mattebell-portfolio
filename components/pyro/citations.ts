@@ -54,6 +54,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1007/s10915-007-9166-4',
   },
   {
+    id: 'advection-reflection',
+    group: 'Solver',
+    authors: 'Jonas Zehnder, Rahul Narain, Bernhard Thomaszewski',
+    title: 'An Advection-Reflection Solver for Detail-Preserving Fluid Simulation',
+    venue: 'ACM Transactions on Graphics 37(4), SIGGRAPH 2018',
+    year: '2018',
+    url: 'https://doi.org/10.1145/3197517.3201324',
+  },
+  {
     id: 'curl-noise',
     group: 'Solver',
     authors: 'Robert Bridson, Jim Hourihan, Marcus Nordenstam',

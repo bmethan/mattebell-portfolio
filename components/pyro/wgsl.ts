@@ -630,6 +630,44 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
+// 6b. Advection-reflection's projection (Zehnder, Narain and Thomaszewski 2018): the projected velocity, and the field
+// reflected through it, u_proj + (u_proj - u) = u - 2 dt grad p, which the step's second half advects. Projecting
+// halfway through the step and advecting the reflection, rather than the projected field, loses far less of the
+// flow's energy to the projection.
+export const PROJECT_REFLECT = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var vel: texture_3d<f32>;
+@group(0) @binding(2) var<storage, read> p: array<f32>;
+@group(0) @binding(3) var velOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(4) var velRefl: texture_storage_3d<rgba16float, write>;
+
+fn pAt(c: vec3<i32>) -> f32 {
+  if (any(c < vec3<i32>(0)) || any(c >= nCells())) { return 0.0; }
+  return p[cellIndex(c)];
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = P.dims.xyz;
+  if (id.x > n.x || id.y > n.y || id.z > n.z) { return; }
+  let c = vec3<i32>(id);
+  let k = P.grid.y / P.grid.x;
+  let v = textureLoad(vel, c, 0).xyz;
+  var g = vec3<f32>(0.0);
+  if (id.y < n.y && id.z < n.z) { g.x = k * (pAt(c) - pAt(c - X)); }
+  if (id.x < n.x && id.z < n.z && id.y > 0u) { g.y = k * (pAt(c) - pAt(c - Y)); }
+  if (id.x < n.x && id.y < n.y) { g.z = k * (pAt(c) - pAt(c - Z)); }
+  var proj = v - g;
+  var refl = v - 2.0 * g;
+  if (id.y == 0u) {
+    proj.y = 0.0;
+    refl.y = 0.0;
+  }
+  textureStore(velOut, c, vec4<f32>(proj, 0.0));
+  textureStore(velRefl, c, vec4<f32>(refl, 0.0));
+}
+`
+
 // 7. Scalar advection, semi-Lagrangian: DIR 1 traces back (the forward step), -1 traces forward (MacCormack's
 // reverse step).
 export const ADVECT_SCAL = /* wgsl */ `

@@ -4,6 +4,7 @@ import { FUEL } from './physics'
 
 export type PyroResolution = 'low' | 'medium' | 'high'
 export type Advection = 'sl' | 'mac'
+export type VelocityScheme = 'ar' | 'mac' | 'sl'
 export type PressureSolver = 'mg' | 'sor'
 export type SourceType = 'smoke' | 'fire'
 
@@ -20,7 +21,8 @@ export const DOMAIN_WIDTH = 4.8
 
 export interface PyroState {
   resolution: PyroResolution
-  advection: Advection
+  advection: Advection // the scalars
+  velocity: VelocityScheme // advection-reflection, Modified MacCormack or semi-Lagrangian
   pressure: PressureSolver
   vcycles: number // multigrid V-cycles per step
   pressureIters: number // red-black SOR sweeps per step
@@ -63,6 +65,7 @@ export interface PyroState {
 export const PYRO_DEFAULTS: PyroState = {
   resolution: 'medium',
   advection: 'mac',
+  velocity: 'mac',
   pressure: 'mg',
   vcycles: 2,
   pressureIters: 40,

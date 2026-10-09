@@ -263,11 +263,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
-// 4. Divergence of the face velocities at each cell (the floor face is solid).
+// 4. Divergence of the face velocities at each cell (the floor face is solid), written as the pressure equation's
+// right-hand side: lap(p) = div / dt with unit density, so g = -div / dt in the form (n p - sum of neighbours) / h2 = g.
 export const DIVERGENCE = /* wgsl */ `
 ${SIM_COMMON}
 @group(0) @binding(1) var vel: texture_3d<f32>;
-@group(0) @binding(2) var<storage, read_write> div: array<f32>;
+@group(0) @binding(2) var<storage, read_write> rhs: array<f32>;
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -275,24 +276,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (any(c >= nCells())) { return; }
   let a = textureLoad(vel, c, 0);
   let v0 = select(a.y, 0.0, c.y == 0);
-  div[cellIndex(c)] = ((textureLoad(vel, c + X, 0).x - a.x) + (textureLoad(vel, c + Y, 0).y - v0) + (textureLoad(vel, c + Z, 0).z - a.z)) / P.grid.x;
+  let div = ((textureLoad(vel, c + X, 0).x - a.x) + (textureLoad(vel, c + Y, 0).y - v0) + (textureLoad(vel, c + Z, 0).z - a.z)) / P.grid.x;
+  rhs[cellIndex(c)] = -div / P.grid.y;
 }
 `
 
-// 5. Pressure: red-black Gauss-Seidel with over-relaxation on the 7-point Laplacian, lap(p) = div / dt (unit
-// density). Open sides and top: p = 0 outside. Solid floor: no flow through it, so the floor neighbour drops out.
+// 5. Pressure, the comparison solver: red-black Gauss-Seidel with over-relaxation on the 7-point Laplacian. Open sides
+// and top: p = 0 outside. Solid floor: no flow through it, so the floor neighbour drops out.
 export const SOR = /* wgsl */ `
 ${SIM_COMMON}
 @group(0) @binding(1) var<uniform> S: vec4<u32>; // x: the colour updated in this pass
-@group(0) @binding(2) var<storage, read> div: array<f32>;
+@group(0) @binding(2) var<storage, read> rhs: array<f32>;
 @group(0) @binding(3) var<storage, read_write> p: array<f32>;
 
-@compute @workgroup_size(4, 4, 4)
+// One thread per cell of this pass's colour (half the grid), in runs along x so neighbouring threads read
+// neighbouring memory.
+@compute @workgroup_size(16, 4, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let c = vec3<i32>(id);
   let n = nCells();
+  let c = vec3<i32>(i32(2u * id.x + ((id.y + id.z + S.x) & 1u)), i32(id.y), i32(id.z));
   if (any(c >= n)) { return; }
-  if (((id.x + id.y + id.z) & 1u) != S.x) { return; }
   let i = i32(cellIndex(c));
   let sy = n.x;
   let sz = n.x * n.y;
@@ -305,8 +308,135 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (c.y > 0) { sum += p[i - sy]; cnt += 1.0; }
   cnt += 1.0;
   if (c.y < n.y - 1) { sum += p[i + sy]; }
-  let pn = (sum - div[i] * P.grid.x * P.grid.x / P.grid.y) / cnt;
+  let pn = (sum + rhs[i] * P.grid.x * P.grid.x) / cnt;
   p[i] = mix(p[i], pn, P.decay.z);
+}
+`
+
+// 5b. Pressure, the default solver: geometric multigrid V-cycles (cell-centred levels, each half the resolution of the
+// last; red-black Gauss-Seidel smoothing; residuals restricted by averaging the eight children; corrections
+// prolonged by trilinear interpolation). Every level keeps the fine grid's boundaries: open sides and top (p = 0 just
+// outside), a solid floor. Equation on each level: (n p - sum of neighbours) / h2 = g.
+const MG_COMMON = /* wgsl */ `
+struct Level {
+  n: vec4<u32>,  // this level's cells; the colour updated (smoothing)
+  nf: vec4<u32>, // the next finer level's cells (restriction, prolongation)
+  h: vec4<f32>,  // cell size squared (m2), relaxation factor
+}
+@group(0) @binding(0) var<uniform> L: Level;
+fn nL() -> vec3<i32> { return vec3<i32>(L.n.xyz); }
+fn at(c: vec3<i32>, n: vec3<i32>) -> i32 { return c.x + n.x * (c.y + n.y * c.z); }
+`
+
+export const MG_SMOOTH = /* wgsl */ `
+${MG_COMMON}
+@group(0) @binding(1) var<storage, read> g: array<f32>;
+@group(0) @binding(2) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(16, 4, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = nL();
+  let c = vec3<i32>(i32(2u * id.x + ((id.y + id.z + L.n.w) & 1u)), i32(id.y), i32(id.z));
+  if (any(c >= n)) { return; }
+  let i = at(c, n);
+  let sy = n.x;
+  let sz = n.x * n.y;
+  var sum = 0.0;
+  var cnt = 5.0; // the x and z sides and the top, inside or open
+  if (c.x > 0) { sum += x[i - 1]; }
+  if (c.x < n.x - 1) { sum += x[i + 1]; }
+  if (c.z > 0) { sum += x[i - sz]; }
+  if (c.z < n.z - 1) { sum += x[i + sz]; }
+  if (c.y < n.y - 1) { sum += x[i + sy]; }
+  if (c.y > 0) { sum += x[i - sy]; cnt += 1.0; }
+  x[i] = mix(x[i], (sum + g[i] * L.h.x) / cnt, L.h.y);
+}
+`
+
+export const MG_RESIDUAL = /* wgsl */ `
+${MG_COMMON}
+@group(0) @binding(1) var<storage, read> g: array<f32>;
+@group(0) @binding(2) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> r: array<f32>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = nL();
+  let c = vec3<i32>(id);
+  if (any(c >= n)) { return; }
+  let i = at(c, n);
+  let sy = n.x;
+  let sz = n.x * n.y;
+  var sum = 0.0;
+  var cnt = 5.0;
+  if (c.x > 0) { sum += x[i - 1]; }
+  if (c.x < n.x - 1) { sum += x[i + 1]; }
+  if (c.z > 0) { sum += x[i - sz]; }
+  if (c.z < n.z - 1) { sum += x[i + sz]; }
+  if (c.y < n.y - 1) { sum += x[i + sy]; }
+  if (c.y > 0) { sum += x[i - sy]; cnt += 1.0; }
+  r[i] = g[i] - (cnt * x[i] - sum) / L.h.x;
+}
+`
+
+// The coarse right-hand side is the average of the eight children's residuals; the coarse correction starts at 0.
+export const MG_RESTRICT = /* wgsl */ `
+${MG_COMMON}
+@group(0) @binding(1) var<storage, read> r: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gc: array<f32>;
+@group(0) @binding(3) var<storage, read_write> xc: array<f32>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = nL();
+  let nf = vec3<i32>(L.nf.xyz);
+  let c = vec3<i32>(id);
+  if (any(c >= n)) { return; }
+  var s = 0.0;
+  var k = 0.0;
+  for (var o = 0; o < 8; o++) {
+    let f = 2 * c + vec3<i32>(o & 1, (o >> 1) & 1, (o >> 2) & 1);
+    if (all(f < nf)) {
+      s += r[at(f, nf)];
+      k += 1.0;
+    }
+  }
+  gc[at(c, n)] = s / max(k, 1.0);
+  xc[at(c, n)] = 0.0;
+}
+`
+
+// The fine solution gains the coarse correction, interpolated trilinearly at each fine cell centre. Past an open side
+// or the top the correction mirrors to its negative (0 on the boundary face); below the floor it mirrors as is.
+export const MG_PROLONG = /* wgsl */ `
+${MG_COMMON}
+@group(0) @binding(1) var<storage, read> xc: array<f32>;
+@group(0) @binding(2) var<storage, read_write> xf: array<f32>;
+
+fn coarse(c0: vec3<i32>) -> f32 {
+  let n = nL();
+  var c = c0;
+  if (c.y < 0) { c.y = 0; }
+  let inside = c.x >= 0 && c.x < n.x && c.z >= 0 && c.z < n.z && c.y < n.y;
+  let v = xc[at(clamp(c, vec3<i32>(0), n - 1), n)];
+  return select(-v, v, inside);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let nf = vec3<i32>(L.nf.xyz);
+  let f = vec3<i32>(id);
+  if (any(f >= nf)) { return; }
+  let pc = (vec3<f32>(f) + 0.5) * 0.5 - 0.5;
+  let b = vec3<i32>(floor(pc));
+  let t = pc - vec3<f32>(b);
+  var v = 0.0;
+  for (var o = 0; o < 8; o++) {
+    let d = vec3<i32>(o & 1, (o >> 1) & 1, (o >> 2) & 1);
+    let w = select(1.0 - t.x, t.x, d.x == 1) * select(1.0 - t.y, t.y, d.y == 1) * select(1.0 - t.z, t.z, d.z == 1);
+    v += w * coarse(b + d);
+  }
+  xf[at(f, nf)] += v;
 }
 `
 
@@ -427,10 +557,12 @@ fn boxHit(o: vec3<f32>, d: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> vec2<f32>
   return vec2<f32>(max(max(a.x, a.y), a.z), min(min(b.x, b.y), b.z));
 }
 fn domainHi() -> vec3<f32> { return P.origin.xyz + vec3<f32>(P.dims.xyz) * P.grid.x; }
-// 1 inside, falling to 0 over the last few cells at the open sides and top (the box's edges never show).
+// 1 inside, falling to 0 toward the open sides and top, so smoke dissolves as it nears them instead of meeting a
+// wall: the outer 5% of the width (at the frame's edges on wide screens), the outer fifth of the depth, the top fifth.
 fn edgeFade(uvw: vec3<f32>) -> f32 {
-  let e = min(min(uvw.x, 1.0 - uvw.x), min(uvw.z, 1.0 - uvw.z));
-  return smoothstep(0.0, 0.08, e) * (1.0 - smoothstep(0.85, 1.0, uvw.y));
+  let ex = min(uvw.x, 1.0 - uvw.x);
+  let ez = min(uvw.z, 1.0 - uvw.z);
+  return smoothstep(0.0, 0.05, ex) * smoothstep(0.0, 0.2, ez) * (1.0 - smoothstep(0.8, 1.0, uvw.y));
 }
 fn uvwOf(w: vec3<f32>) -> vec3<f32> { return (w - P.origin.xyz) / (vec3<f32>(P.dims.xyz) * P.grid.x); }
 `
@@ -463,9 +595,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (any(id >= ld)) { return; }
   let ext = vec3<f32>(P.dims.xyz) * P.grid.x;
   let w = P.origin.xyz + (vec3<f32>(id) + 0.5) / vec3<f32>(ld) * ext;
+  // Occupancy: the largest density in this cell's block of the grid, plus its neighbours' (one cell each way),
+  // so a march can stride through empty space without stepping over the edge of the smoke.
+  let n = nCells();
+  let b = vec3<i32>(id) * 2;
+  var occ = 0.0;
+  for (var z = -1; z <= 2; z++) {
+    for (var y = -1; y <= 2; y++) {
+      for (var x = -1; x <= 2; x++) {
+        occ = max(occ, textureLoad(scal, clamp(b + vec3<i32>(x, y, z), vec3<i32>(0), n - 1), 0).x);
+      }
+    }
+  }
+  // Every cell gets its depths, smoke or not: the floor's shadow and sky lookups land in empty cells too.
   let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x);
   let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x);
-  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, 0.0, 0.0));
+  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, 0.0));
 }
 `
 
@@ -529,12 +674,17 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   if (box.y > max(box.x, 0.0) && box.x < tFloor) {
     let t0 = max(box.x, 0.0);
     let ds = 0.6 * P.grid.x;
-    let steps = min(i32(ceil((tEnd - t0) / ds)), 512);
-    for (var i = 0; i < steps; i++) {
-      let t = t0 + (f32(i) + jitter) * ds;
+    // Empty space (no smoke in a light cell's neighbourhood) is crossed in strides of a light cell.
+    var t = t0 + jitter * ds;
+    for (var i = 0; i < 2048; i++) {
       if (t > tEnd) { break; }
       let w = ro + rd * t;
       let uvw = uvwOf(w);
+      if (textureSampleLevel(light, samp, uvw, 0.0).z < 1e-4) {
+        t += 3.0 * ds;
+        continue;
+      }
+      t += ds;
       let d = textureSampleLevel(scal, samp, uvw, 0.0).x * edgeFade(uvw);
       if (d > 1e-4) {
         let L = textureSampleLevel(light, samp, uvw, 0.0);

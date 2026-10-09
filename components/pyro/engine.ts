@@ -1,13 +1,19 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_SCAL, ADVECT_VEL, COMBINE, CURL, DIVERGENCE, FORCES, LIGHT, PROJECT, RENDER, SOR } from './wgsl'
-import { DOMAIN_HEIGHT, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
+import { ADVECT_SCAL, ADVECT_VEL, COMBINE, CURL, DIVERGENCE, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, PROJECT, RENDER, SOR } from './wgsl'
+import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 
 export const SIM_DT = 1 / 30
 const MAX_STEPS_PER_FRAME = 2
 const MAX_IN_FLIGHT = 2 // frames of GPU work queued at once: enough to keep the GPU busy, too few to stall the page
 const SOR_OMEGA = 1.7
+// Multigrid: Gauss-Seidel sweeps before and after each coarse correction, and on the coarsest level (over-relaxed
+// there, where it is cheap); levels go down until a dimension would fall under 8 cells.
+const MG_PRE = 2
+const MG_POST = 2
+const MG_COARSE = 16
+const MG_COARSE_OMEGA = 1.6
 const SPEED_LIMIT = 8 // m/s
 const FOV_Y = (32 * Math.PI) / 180
 const RENDER_SCALE_MIN = 0.5
@@ -41,6 +47,10 @@ const norm = (a: Vec3): Vec3 => {
 }
 
 interface Pipes {
+  mgSmooth: GPUComputePipeline
+  mgResidual: GPUComputePipeline
+  mgRestrict: GPUComputePipeline
+  mgProlong: GPUComputePipeline
   advectVel: GPUComputePipeline
   curl: GPUComputePipeline
   forces: GPUComputePipeline
@@ -54,8 +64,19 @@ interface Pipes {
   render: GPURenderPipeline
 }
 
+// One multigrid level: its cells, and bind groups for smoothing (by colour), the residual, restriction into the
+// next coarser level, and prolongation from it.
+interface Level {
+  n: Vec3
+  smooth: [GPUBindGroup, GPUBindGroup]
+  residual: GPUBindGroup | null
+  restrictTo: GPUBindGroup | null // into this level from the finer one (levels 1 and on)
+  prolongFrom: GPUBindGroup | null // from this level into the finer one (levels 1 and on)
+}
+
 interface Grids {
   n: Vec3
+  levels: Level[]
   textures: GPUTexture[]
   buffers: GPUBuffer[]
   vel: [GPUTexture, GPUTexture]
@@ -74,6 +95,71 @@ interface Grids {
     light: GPUBindGroup
     render: GPUBindGroup
   }
+}
+
+// The device and the compiled pipelines can be made ahead of time (prewarmPyro), while the page rests on the Lab:
+// compiling the solver's programs can hold up the browser's frames for a moment, unnoticed when nothing moves, but a
+// visible hitch right after a click. The first engine takes them.
+interface Warm {
+  adapter: GPUAdapter
+  device: GPUDevice
+  pipes: Pipes
+  lost: boolean
+}
+let warm: Promise<Warm | null> | null = null
+
+async function requestDevice(): Promise<{ adapter: GPUAdapter; device: GPUDevice } | null> {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
+  if (!adapter) return null
+  // Timestamps only for the development profiler (profileStep); the lab runs without them.
+  const device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] })
+  return { adapter, device }
+}
+
+async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pipes> {
+  const compute = (code: string, constants?: Record<string, number>) =>
+    d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
+  const renderModule = d.createShaderModule({ code: RENDER })
+  const [mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render] = await Promise.all([
+    compute(MG_SMOOTH),
+    compute(MG_RESIDUAL),
+    compute(MG_RESTRICT),
+    compute(MG_PROLONG),
+    compute(ADVECT_VEL),
+    compute(CURL),
+    compute(FORCES),
+    compute(DIVERGENCE),
+    compute(SOR),
+    compute(PROJECT),
+    compute(ADVECT_SCAL, { DIR: 1 }),
+    compute(ADVECT_SCAL, { DIR: -1 }),
+    compute(COMBINE),
+    compute(LIGHT),
+    d.createRenderPipelineAsync({
+      layout: 'auto',
+      vertex: { module: renderModule, entryPoint: 'vs' },
+      fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format }] },
+      primitive: { topology: 'triangle-list' },
+    }),
+  ])
+  return { mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render }
+}
+
+export function prewarmPyro() {
+  if (warm || typeof navigator === 'undefined' || !navigator.gpu) return
+  warm = (async () => {
+    try {
+      const got = await requestDevice()
+      if (!got) return null
+      const w: Warm = { ...got, pipes: await compilePipes(got.device, navigator.gpu.getPreferredCanvasFormat()), lost: false }
+      got.device.lost.then(() => {
+        w.lost = true
+      })
+      return w
+    } catch {
+      return null
+    }
+  })()
 }
 
 export class PyroEngine {
@@ -100,16 +186,18 @@ export class PyroEngine {
         canvas.after(own)
         console.warn('Pyro: the canvas gave no webgpu context; drawing on one of its own')
       }
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
-      if (!adapter) {
+      // A device and pipelines made ahead of time, if they are ready and still usable; else new ones.
+      const ahead = warm ? await warm : null
+      warm = null
+      const got = ahead && !ahead.lost ? ahead : await requestDevice()
+      if (!got) {
         own?.remove()
         console.warn('Pyro: the browser offered no adapter')
         return null
       }
-      const device = await adapter.requestDevice()
-      const info = adapter.info
+      const info = got.adapter.info
       const name = [info?.vendor, info?.architecture, info?.description].filter(Boolean).join(' ') || 'unnamed adapter'
-      return new PyroEngine(own ?? canvas, own, ctx, device, onStatus, initial, onLost, name)
+      return new PyroEngine(own ?? canvas, own, ctx, got.device, onStatus, initial, onLost, name, ahead && !ahead.lost ? ahead.pipes : null)
     } catch (err) {
       own?.remove()
       console.warn('Pyro: WebGPU unavailable', err)
@@ -165,6 +253,7 @@ export class PyroEngine {
     initial: PyroState,
     private onLost: (() => void) | undefined,
     adapterName: string,
+    prebuilt: Pipes | null,
   ) {
     this.adapterName = adapterName
     this.state = { ...PYRO_DEFAULTS, ...initial }
@@ -188,35 +277,14 @@ export class PyroEngine {
       return b
     }) as [GPUBuffer, GPUBuffer]
     this.sampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' })
-    this.whenReady = this.build()
+    this.whenReady = this.build(prebuilt)
   }
 
   // Compiles every pipeline in the background, then makes the grids.
-  private async build() {
-    const d = this.device
-    const compute = (code: string, constants?: Record<string, number>) =>
-      d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
-    const renderModule = d.createShaderModule({ code: RENDER })
-    const [advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render] = await Promise.all([
-      compute(ADVECT_VEL),
-      compute(CURL),
-      compute(FORCES),
-      compute(DIVERGENCE),
-      compute(SOR),
-      compute(PROJECT),
-      compute(ADVECT_SCAL, { DIR: 1 }),
-      compute(ADVECT_SCAL, { DIR: -1 }),
-      compute(COMBINE),
-      compute(LIGHT),
-      d.createRenderPipelineAsync({
-        layout: 'auto',
-        vertex: { module: renderModule, entryPoint: 'vs' },
-        fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: this.format }] },
-        primitive: { topology: 'triangle-list' },
-      }),
-    ])
+  private async build(prebuilt: Pipes | null) {
+    const pipes = prebuilt ?? (await compilePipes(this.device, this.format))
     if (this.disposed) return false
-    this.pipes = { advectVel, curl, forces, divergence, sor, project, advFwd, advBwd, combine, light, render }
+    this.pipes = pipes
     this.makeGrids()
     this.layoutCamera()
     this.needsRender = true
@@ -245,19 +313,68 @@ export class PyroEngine {
     const curl = tex(n)
     const lightDims: Vec3 = [Math.ceil(n[0] / 2), Math.ceil(n[1] / 2), Math.ceil(n[2] / 2)]
     const light = tex(lightDims)
-    const cells = n[0] * n[1] * n[2]
-    const div = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE })
-    const pressure = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE })
     const v = (t: GPUTexture) => t.createView()
     const group = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[]) =>
       d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: resources.map((resource, binding) => ({ binding, resource })) })
+    const cells = n[0] * n[1] * n[2]
+    const div = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const pressure = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE })
+    const buffers: GPUBuffer[] = [div, pressure]
+    const storage = (count: number) => {
+      const b = d.createBuffer({ size: Math.max(16, count * 4), usage: GPUBufferUsage.STORAGE })
+      buffers.push(b)
+      return b
+    }
+    // Multigrid levels: level 0 solves for the pressure itself (right-hand side: the divergence buffer); each coarser
+    // level holds a correction, its right-hand side and a residual.
+    const dx = DOMAIN_WIDTH / n[0]
+    const dims: Vec3[] = [n]
+    while (dims.length < 6 && Math.min(...dims[dims.length - 1]) >= 8) {
+      const f = dims[dims.length - 1]
+      dims.push([Math.ceil(f[0] / 2), Math.ceil(f[1] / 2), Math.ceil(f[2] / 2)])
+    }
+    const xs: GPUBuffer[] = [pressure]
+    const gs: GPUBuffer[] = [div]
+    const rs: GPUBuffer[] = []
+    dims.forEach((m, l) => {
+      const count = m[0] * m[1] * m[2]
+      if (l > 0) {
+        xs.push(storage(count))
+        gs.push(storage(count))
+      }
+      rs.push(storage(count))
+    })
+    const coarsest = dims.length - 1
+    const levelUniform = (l: number, colour: number) => {
+      const b = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true })
+      const m = dims[l]
+      const f = dims[Math.max(0, l - 1)]
+      const h = dx * 2 ** l
+      new Uint32Array(b.getMappedRange(0, 32)).set([m[0], m[1], m[2], colour, f[0], f[1], f[2], 0])
+      new Float32Array(b.getMappedRange(32, 16)).set([h * h, l === coarsest ? MG_COARSE_OMEGA : 1, 0, 0])
+      b.unmap()
+      buffers.push(b)
+      return b
+    }
+    const levels: Level[] = dims.map((m, l) => {
+      const u0 = levelUniform(l, 0)
+      const u1 = levelUniform(l, 1)
+      return {
+        n: m,
+        smooth: [group(p.mgSmooth, [{ buffer: u0 }, { buffer: gs[l] }, { buffer: xs[l] }]), group(p.mgSmooth, [{ buffer: u1 }, { buffer: gs[l] }, { buffer: xs[l] }])],
+        residual: l < coarsest ? group(p.mgResidual, [{ buffer: u0 }, { buffer: gs[l] }, { buffer: xs[l] }, { buffer: rs[l] }]) : null,
+        restrictTo: l > 0 ? group(p.mgRestrict, [{ buffer: u0 }, { buffer: rs[l - 1] }, { buffer: gs[l] }, { buffer: xs[l] }]) : null,
+        prolongFrom: l > 0 ? group(p.mgProlong, [{ buffer: u0 }, { buffer: xs[l] }, { buffer: xs[l - 1] }]) : null,
+      }
+    })
     const P = { buffer: this.simBuf }
     const R = { buffer: this.renderBuf }
     const s = this.sampler
     this.grids = {
       n,
       textures: [...vel, ...scal, curl, light],
-      buffers: [div, pressure],
+      buffers,
+      levels,
       vel,
       scal,
       lightDims,
@@ -348,16 +465,17 @@ export class PyroEngine {
     this.kick()
   }
 
-  // A camera a little below the plume's middle, framing the domain's height with some room, looking along -z.
+  // A camera a little below the plume's middle, looking along -z, as close as framing the domain's height allows, and
+  // closer still on wide frames, until the domain spans the frame's width (smoke then leaves through the frame's
+  // edges, never a side of the box in view).
   private layoutCamera() {
     if (!this.grids) return
-    const [, ny, nz] = this.grids.n
-    const dx = DOMAIN_HEIGHT / ny
+    const [nx, ny] = this.grids.n
+    const dx = DOMAIN_WIDTH / nx
     const h = ny * dx
-    const depth = nz * dx
     const aspect = this.canvas.width / Math.max(1, this.canvas.height)
     const tanY = Math.tan(FOV_Y / 2)
-    const dist = (h * 0.56) / tanY + depth / 2
+    const dist = Math.min((h * 0.525) / tanY, (DOMAIN_WIDTH * 0.49) / (tanY * aspect))
     const target: Vec3 = [0, h * 0.47, 0]
     const pos: Vec3 = [0, h * 0.3, dist]
     const fwd = norm(sub(target, pos))
@@ -378,7 +496,8 @@ export class PyroEngine {
       c.fwd[2] + c.right[2] * x * c.tanY * c.aspect + c.up[2] * y * c.tanY,
     ])
     // World metres per ndc unit at the domain's centre plane.
-    const dist = Math.hypot(c.pos[0], c.pos[1] - DOMAIN_HEIGHT * 0.47, c.pos[2])
+    const [nx, ny] = this.grids.n
+    const dist = Math.hypot(c.pos[0], c.pos[1] - (ny * DOMAIN_WIDTH) / nx * 0.47, c.pos[2])
     const mx = dxNdc * dist * c.tanY * c.aspect
     const my = dyNdc * dist * c.tanY
     const secs = Math.max(dtMs, 8) / 1000
@@ -464,10 +583,7 @@ export class PyroEngine {
     run(pass, p.curl, g.bg.curl, cc)
     run(pass, p.forces, g.bg.forces, cv)
     run(pass, p.divergence, g.bg.divergence, cc)
-    for (let i = 0; i < this.state.pressureIters; i++) {
-      run(pass, p.sor, g.bg.sor[0], cc)
-      run(pass, p.sor, g.bg.sor[1], cc)
-    }
+    this.solvePressure(pass)
     run(pass, p.project, g.bg.project, cv)
     pass.end()
     enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
@@ -486,11 +602,54 @@ export class PyroEngine {
     if (this.runClock >= AUTO_RES_FROM_S && this.runClock < AUTO_RES_TO_S) this.autoSteps++
   }
 
+  // The pressure solve: multigrid V-cycles (default) or red-black SOR sweeps, both warm started from the last step.
+  private solvePressure(pass: GPUComputePassEncoder) {
+    const g = this.grids!
+    const p = this.pipes!
+    const [nx, ny, nz] = g.n
+    const dispatch = (pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => {
+      pass.setPipeline(pipe)
+      pass.setBindGroup(0, bg)
+      pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
+    }
+    if (this.state.pressure === 'sor') {
+      const cs: Vec3 = [Math.ceil(nx / 2 / 16), Math.ceil(ny / 4), nz]
+      for (let i = 0; i < this.state.pressureIters; i++) {
+        dispatch(p.sor, g.bg.sor[0], cs)
+        dispatch(p.sor, g.bg.sor[1], cs)
+      }
+      return
+    }
+    const L = g.levels
+    const cells = (m: Vec3): Vec3 => [Math.ceil(m[0] / 4), Math.ceil(m[1] / 4), Math.ceil(m[2] / 4)]
+    const smooth = (l: number, sweeps: number) => {
+      const m = L[l].n
+      const wg: Vec3 = [Math.ceil(m[0] / 2 / 16), Math.ceil(m[1] / 4), m[2]]
+      for (let i = 0; i < sweeps; i++) {
+        dispatch(p.mgSmooth, L[l].smooth[0], wg)
+        dispatch(p.mgSmooth, L[l].smooth[1], wg)
+      }
+    }
+    const vcycle = (l: number) => {
+      if (l === L.length - 1) {
+        smooth(l, MG_COARSE)
+        return
+      }
+      smooth(l, MG_PRE)
+      dispatch(p.mgResidual, L[l].residual!, cells(L[l].n))
+      dispatch(p.mgRestrict, L[l + 1].restrictTo!, cells(L[l + 1].n))
+      vcycle(l + 1)
+      dispatch(p.mgProlong, L[l + 1].prolongFrom!, cells(L[l].n))
+      smooth(l, MG_POST)
+    }
+    for (let k = 0; k < this.state.vcycles; k++) vcycle(0)
+  }
+
   private writeSim() {
     const s = this.state
     const g = this.grids!
     const [nx, ny, nz] = g.n
-    const dx = DOMAIN_HEIGHT / ny
+    const dx = DOMAIN_WIDTH / nx
     const u = new Uint32Array(this.simData)
     const f = new Float32Array(this.simData)
     u.set([nx, ny, nz, this.frame], 0)
@@ -525,7 +684,7 @@ export class PyroEngine {
     r.set([...sun, s.anisotropy], 16)
     r.set([...sunCol.map(v => v * s.sunIntensity), s.densityScale], 20)
     r.set([...skyCol.map(v => v * s.skyIntensity), s.albedo], 24)
-    r.set([0.14, 0.14, 0.14, 2.6], 28)
+    r.set([0.14, 0.14, 0.14, 3.2], 28)
     r.set([this.canvas.width, this.canvas.height, 0, 0], 32)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
@@ -598,6 +757,117 @@ export class PyroEngine {
       resolution: this.state.resolution,
       autoStepped: this.autoStepped,
     })
+  }
+
+  // Development profiler: one step and one frame, each kernel in its own pass with GPU timestamps; milliseconds per
+  // kernel (all SOR sweeps together). Needs the timestamp-query feature.
+  async profileStep(): Promise<Record<string, number> | null> {
+    if (!this.grids || !this.device.features.has('timestamp-query')) return null
+    const d = this.device
+    const g = this.grids
+    const p = this.pipes!
+    const labels: string[] = []
+    const slots = 64
+    const qs = d.createQuerySet({ type: 'timestamp', count: slots * 2 })
+    const resolve = d.createBuffer({ size: slots * 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC })
+    const read = d.createBuffer({ size: slots * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    this.writeSim()
+    this.writeRender()
+    const enc = d.createCommandEncoder()
+    const [nx, ny, nz] = g.n
+    const cv: Vec3 = [Math.ceil((nx + 1) / 4), Math.ceil((ny + 1) / 4), Math.ceil((nz + 1) / 4)]
+    const cc: Vec3 = [Math.ceil(nx / 4), Math.ceil(ny / 4), Math.ceil(nz / 4)]
+    const timed = (label: string, body: (pass: GPUComputePassEncoder) => void) => {
+      const k = labels.length
+      labels.push(label)
+      const pass = enc.beginComputePass({ timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 } })
+      body(pass)
+      pass.end()
+    }
+    const one = (pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => (pass: GPUComputePassEncoder) => {
+      pass.setPipeline(pipe)
+      pass.setBindGroup(0, bg)
+      pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
+    }
+    timed('advectVel', one(p.advectVel, g.bg.advectVel, cv))
+    timed('curl', one(p.curl, g.bg.curl, cc))
+    timed('forces', one(p.forces, g.bg.forces, cv))
+    timed('divergence', one(p.divergence, g.bg.divergence, cc))
+    timed(this.state.pressure === 'sor' ? `sor x${this.state.pressureIters}` : `multigrid x${this.state.vcycles}`, pass => this.solvePressure(pass))
+    timed('project', one(p.project, g.bg.project, cv))
+    enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
+    timed('advectScalars', one(p.advFwd, g.bg.advFwd, cc))
+    timed('advectBack', one(p.advBwd, g.bg.advBwd, cc))
+    timed('combine', one(p.combine, g.bg.combine, cc))
+    enc.copyTextureToTexture({ texture: g.scal[3] }, { texture: g.scal[0] }, [nx, ny, nz])
+    timed('light', one(p.light, g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
+    const k = labels.length
+    labels.push('render')
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+      timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 },
+    })
+    rp.setPipeline(p.render)
+    rp.setBindGroup(0, g.bg.render)
+    rp.draw(3)
+    rp.end()
+    enc.resolveQuerySet(qs, 0, labels.length * 2, resolve, 0)
+    enc.copyBufferToBuffer(resolve, 0, read, 0, labels.length * 16)
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const t = new BigInt64Array(read.getMappedRange())
+    const out: Record<string, number> = {}
+    labels.forEach((l, i) => {
+      out[l] = Number(t[2 * i + 1] - t[2 * i]) / 1e6
+    })
+    read.unmap()
+    qs.destroy()
+    resolve.destroy()
+    read.destroy()
+    return out
+  }
+
+  // Development check of the pressure solve: one step, then the divergence of the velocity before the solve (left in
+  // the right-hand side buffer) and after projection, as root-mean-square values in 1/s.
+  async measureDivergence(): Promise<{ before: number; after: number; bad: number } | null> {
+    if (!this.grids) return null
+    const d = this.device
+    const g = this.grids
+    const p = this.pipes!
+    const [nx, ny, nz] = g.n
+    const bytes = nx * ny * nz * 4
+    const rhs = g.buffers[0]
+    const readBack = async () => {
+      const read = d.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+      const enc = d.createCommandEncoder()
+      enc.copyBufferToBuffer(rhs, 0, read, 0, bytes)
+      d.queue.submit([enc.finish()])
+      await read.mapAsync(GPUMapMode.READ)
+      const a = new Float32Array(read.getMappedRange())
+      let s = 0
+      let k = 0
+      for (let i = 0; i < a.length; i++) {
+        if (Number.isFinite(a[i])) {
+          s += a[i] * a[i]
+          k++
+        } else bad++
+      }
+      read.unmap()
+      read.destroy()
+      return Math.sqrt(s / Math.max(k, 1)) * SIM_DT // rhs = -div / dt
+    }
+    let bad = 0
+    this.step()
+    const before = await readBack()
+    const enc = d.createCommandEncoder()
+    const pass = enc.beginComputePass()
+    pass.setPipeline(p.divergence)
+    pass.setBindGroup(0, g.bg.divergence)
+    pass.dispatchWorkgroups(Math.ceil(nx / 4), Math.ceil(ny / 4), Math.ceil(nz / 4))
+    pass.end()
+    d.queue.submit([enc.finish()])
+    const after = await readBack()
+    return { before, after, bad }
   }
 
   // For the lab's stills: the current frame drawn at an exact size, as an image file.

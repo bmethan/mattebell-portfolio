@@ -27,7 +27,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Pressure',
-    'Red-black Gauss-Seidel with over-relaxation (factor 1.7), started from the previous step’s pressure. Fewer iterations, set in the Solver tab, leave the flow slightly compressible: the smoke swells and loses some of its swirl.',
+    'Geometric multigrid, as production solvers use: each V-cycle smooths with red-black Gauss-Seidel on the full grid, hands the remaining error down through coarser grids (each half the resolution of the last), where the broad, slow-to-fix part of it is cheap to remove, and brings the corrections back up. Two V-cycles a step, started from the previous step’s pressure, leave about 1% of the flow’s divergence, the floor set by storing velocity at half precision (measured on this solver). The Solver tab also offers plain red-black SOR for comparison: 40 sweeps reach the same floor at four to eight times the GPU time, and a shorter solve shows as smoke that swells and loses some of its swirl.',
   ],
   [
     'Advection',
@@ -48,7 +48,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Limits',
-    'A real-time study rather than a production simulation: the grid is coarse (at most 80 × 128 × 64 cells over a 3 m tall box), velocity is stored at half precision, and a GPU that cannot keep up runs the simulation in slow motion rather than taking longer, less stable steps. Production pyro adds sparse and adaptive grids, multigrid pressure solves, collisions and combustion.',
+    'A real-time study rather than a production simulation: the grid is coarse (at most 200 × 80 × 40 cells over a box 4.8 m wide), velocity is stored at half precision, and a GPU that cannot keep up runs the simulation in slow motion rather than taking longer, less stable steps. Production pyro adds sparse and adaptive grids, far larger multigrid solves, collisions and combustion.',
   ],
 ]
 
@@ -401,7 +401,19 @@ export default function PyroLab() {
                   </Group>
                 </div>
                 <div className="lab-row">
-                  <Slider label="Pressure iterations" min={5} max={120} step={5} value={pyro.pressureIters} digits={0} onChange={v => update({ pressureIters: v })} />
+                  <Group label="Pressure">
+                    <Pill on={pyro.pressure === 'mg'} onClick={() => update({ pressure: 'mg' })}>
+                      Multigrid
+                    </Pill>
+                    <Pill on={pyro.pressure === 'sor'} onClick={() => update({ pressure: 'sor' })}>
+                      Red-black SOR
+                    </Pill>
+                  </Group>
+                  {pyro.pressure === 'mg' ? (
+                    <Slider label="V-cycles" min={1} max={4} step={1} value={pyro.vcycles} digits={0} onChange={v => update({ vcycles: v })} />
+                  ) : (
+                    <Slider label="Iterations" min={5} max={120} step={5} value={pyro.pressureIters} digits={0} onChange={v => update({ pressureIters: v })} />
+                  )}
                 </div>
                 <p className="lab-note">A new resolution restarts the simulation.</p>
               </>

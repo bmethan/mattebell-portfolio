@@ -2,20 +2,25 @@
 
 export type PyroResolution = 'low' | 'medium' | 'high'
 export type Advection = 'sl' | 'mac'
+export type PressureSolver = 'mg' | 'sor'
 
-// Cells along x, y, z; the domain is DOMAIN_HEIGHT metres tall, so the cell size follows from y.
+// Cells along x, y, z. The domain is DOMAIN_WIDTH metres wide (so the cell size follows from x) and shaped like the
+// wide frame, 2.5 : 1 : 0.5, so a plume pushed sideways leaves through the frame's edges before it meets a side; the
+// depth, seen end on, gets the fewest cells (about a metre, ample for the plume).
 export const RESOLUTIONS: Record<PyroResolution, { dims: [number, number, number]; label: string }> = {
-  low: { dims: [40, 64, 32], label: 'Low' },
-  medium: { dims: [64, 96, 48], label: 'Medium' },
-  high: { dims: [80, 128, 64], label: 'High' },
+  low: { dims: [104, 42, 20], label: 'Low' },
+  medium: { dims: [160, 64, 32], label: 'Medium' },
+  high: { dims: [200, 80, 40], label: 'High' },
 }
 export const RESOLUTION_ORDER: PyroResolution[] = ['low', 'medium', 'high']
-export const DOMAIN_HEIGHT = 3
+export const DOMAIN_WIDTH = 4.8
 
 export interface PyroState {
   resolution: PyroResolution
   advection: Advection
-  pressureIters: number
+  pressure: PressureSolver
+  vcycles: number // multigrid V-cycles per step
+  pressureIters: number // red-black SOR sweeps per step
   // Source
   srcRadius: number // m
   srcDensity: number
@@ -44,6 +49,8 @@ export interface PyroState {
 export const PYRO_DEFAULTS: PyroState = {
   resolution: 'medium',
   advection: 'mac',
+  pressure: 'mg',
+  vcycles: 2,
   pressureIters: 40,
   srcRadius: 0.22,
   srcDensity: 0.55,

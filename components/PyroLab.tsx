@@ -69,7 +69,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Camera',
-    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then ACES filmic tone mapping through a fitted curve. The fire is shot at dusk at EV 7, so its brightest flames saturate to yellow-white, as they do in photographs.',
+    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then ACES filmic tone mapping through a fitted curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze.',
   ],
   [
     'Validation',
@@ -455,7 +455,7 @@ export default function PyroLab() {
                 <div className="lab-row">
                   <Slider label="Radius" min={0.08} max={0.4} step={0.01} value={pyro.srcRadius} unit=" m" onChange={v => update({ srcRadius: v })} />
                   {pyro.sourceType === 'fire' ? (
-                    <Slider label="Heat release" min={10} max={200} step={5} value={pyro.heatRelease} digits={0} unit=" kW" onChange={v => update({ heatRelease: v })} />
+                    <Slider label="Heat release" min={10} max={400} step={5} value={pyro.heatRelease} digits={0} unit=" kW" onChange={v => update({ heatRelease: v })} />
                   ) : (
                     <Slider label="Density" min={0.2} max={2} step={0.05} value={pyro.srcDensity} onChange={v => update({ srcDensity: v })} />
                   )}
@@ -504,7 +504,7 @@ export default function PyroLab() {
             {tab === 'fire' && (
               <>
                 <div className="lab-row">
-                  <Slider label="Soot yield" min={0} max={0.1} step={0.001} value={pyro.sootYield} digits={3} unit=" kg/kg" onChange={v => update({ sootYield: v })} />
+                  <Slider label="Soot yield" min={0} max={0.2} step={0.001} value={pyro.sootYield} digits={3} unit=" kg/kg" onChange={v => update({ sootYield: v })} />
                   <Slider label="Radiant fraction" min={0.1} max={0.5} step={0.01} value={pyro.radiantFraction} onChange={v => update({ radiantFraction: v })} />
                 </div>
                 <div className="lab-row">
@@ -536,10 +536,30 @@ export default function PyroLab() {
                   <Slider label="Sky" min={-4} max={14} step={0.5} value={pyro.skyEV} digits={1} unit=" EV" onChange={v => update({ skyEV: v })} />
                 </div>
                 <div className="lab-row">
-                  <Slider label="Exposure" min={-2} max={16} step={0.25} value={pyro.exposure} digits={2} unit=" EV" onChange={v => update({ exposure: v })} />
+                  <Group label="Exposure">
+                    <Pill on={pyro.exposureMode === 'auto'} onClick={() => update({ exposureMode: 'auto' })}>
+                      Auto
+                    </Pill>
+                    <Pill on={pyro.exposureMode === 'manual'} onClick={() => update({ exposureMode: 'manual', exposure: Math.round((status?.exposureEV ?? pyro.exposure) * 4) / 4 })}>
+                      Manual
+                    </Pill>
+                  </Group>
+                  {pyro.exposureMode === 'auto' ? (
+                    <Slider label="Compensation" min={-3} max={3} step={0.25} value={pyro.exposureComp} digits={2} unit=" EV" onChange={v => update({ exposureComp: v })} />
+                  ) : (
+                    <Slider label="Exposure" min={-2} max={16} step={0.25} value={pyro.exposure} digits={2} unit=" EV" onChange={v => update({ exposure: v })} />
+                  )}
                   <Slider label="White balance" min={2000} max={10000} step={100} value={pyro.whiteBalance} digits={0} unit=" K" onChange={v => update({ whiteBalance: v })} />
                 </div>
                 <div className="lab-row">
+                  <Group label="Background">
+                    <Pill on={pyro.background === 'studio'} onClick={() => update({ background: 'studio' })}>
+                      Studio
+                    </Pill>
+                    <Pill on={pyro.background === 'sky'} onClick={() => update({ background: 'sky' })}>
+                      Sky
+                    </Pill>
+                  </Group>
                   <Group label="Sampling">
                     <Pill on={!pyro.tricubic} onClick={() => update({ tricubic: false })}>
                       Trilinear

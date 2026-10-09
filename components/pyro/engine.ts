@@ -4,7 +4,7 @@
 import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, RESOLVE, UPRES, VEL_COMBINE, COMBINE, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
-import { FIRE_BANDS, FUEL, G, SOOT_CHROMA, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
+import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, SOOT_CHROMA, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 
 export const SIM_DT = 1 / 30
@@ -47,6 +47,7 @@ export interface PyroStatus {
   dims: [number, number, number]
   resolution: PyroResolution // what the engine runs (it may step down from the default on a slow GPU)
   autoStepped: boolean // it did step down
+  exposureEV: number // the camera's exposure now (metered when auto)
 }
 
 type Vec3 = [number, number, number]
@@ -269,7 +270,7 @@ export class PyroEngine {
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
   private simData = new ArrayBuffer(256)
-  private renderData = new Float32Array(56)
+  private renderData = new Float32Array(60)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
@@ -281,6 +282,11 @@ export class PyroEngine {
   private histIndex = 0
   private taaCount = 0
   private renderFrame = 0
+  // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
+  private fireCd = 0
+  private metering = false
+  private meterEV: number | null = null
+  private meterAt = 0
   // The collision ball: its centre and velocity (from the visitor's drags, easing to rest), and its uniform for the
   // pressure solve's levels.
   private ballPos: Vec3 = [0.55, 0.7, 0]
@@ -952,7 +958,7 @@ export class PyroEngine {
     r.set([...c.pos, c.tanY], 0)
     r.set([...c.fwd, c.aspect], 4)
     r.set([...c.right, this.renderFrame % 4096], 8)
-    r.set([...c.up, exposureOfEV(s.exposure)], 12)
+    r.set([...c.up, exposureOfEV(this.exposureEV())], 12)
     r.set([...sun, s.anisotropy], 16)
     r.set([...SUN_COLOUR.map(v => v * luxOfEV(s.sunEV)), s.densityScale], 20)
     r.set([...SKY_COLOUR.map(v => v * luxOfEV(s.skyEV)), s.albedo], 24)
@@ -968,6 +974,7 @@ export class PyroEngine {
     r.set([...wb[0], s.wind], 44)
     r.set([...wb[1], s.tricubic ? 1 : 0], 48)
     r.set([...wb[2], this.upresActive() && this.upres ? 1 : 0], 52)
+    r.set([s.background === 'sky' ? 1 : 0, 0, 0, 0], 56)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
@@ -1112,10 +1119,48 @@ export class PyroEngine {
     }
   }
 
+  // Auto exposure (see physics.ts): the ambient light metered, but no brighter than the fire allows. Eased over about
+  // a second, so the fire's puffing does not pump the exposure.
+  private targetEV() {
+    const s = this.state
+    const ambient = Math.log2((METER_AMBIENT * (luxOfEV(s.sunEV) + luxOfEV(s.skyEV))) / 2.5)
+    if (s.sourceType !== 'fire' || this.fireCd <= 0) return ambient
+    return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(this.fireCd / METER_FIRE_CD))
+  }
+  private exposureEV() {
+    const s = this.state
+    if (s.exposureMode === 'manual') return s.exposure
+    const target = this.targetEV()
+    const now = performance.now()
+    if (this.meterEV === null) this.meterEV = target
+    else this.meterEV += (target - this.meterEV) * (1 - Math.exp(-(now - this.meterAt) / 800))
+    this.meterAt = now
+    return this.meterEV - s.exposureComp
+  }
+  // The fire's luminous intensity, read back from the grid sums.
+  private async readFire() {
+    if (this.metering || !this.grids || this.state.sourceType !== 'fire') return
+    this.metering = true
+    const d = this.device
+    const read = d.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    enc.copyBufferToBuffer(this.grids.fireLight, 0, read, 0, 16)
+    d.queue.submit([enc.finish()])
+    try {
+      await read.mapAsync(GPUMapMode.READ)
+      const dx = DOMAIN_WIDTH / this.grids.n[0]
+      this.fireCd = new Float32Array(read.getMappedRange())[3] * dx * dx * dx
+      read.unmap()
+    } catch {}
+    read.destroy()
+    this.metering = false
+  }
+
   private report(force: boolean) {
     const now = performance.now()
     if (!force && now - this.lastStatus < STATUS_MS) return
     this.lastStatus = now
+    void this.readFire()
     while (this.stepTimes.length && now - this.stepTimes[0] > 1000) this.stepTimes.shift()
     this.onStatus({
       ready: !!this.grids,
@@ -1126,6 +1171,7 @@ export class PyroEngine {
       dims: this.grids ? this.grids.n : RESOLUTIONS[this.state.resolution].dims,
       resolution: this.state.resolution,
       autoStepped: this.autoStepped,
+      exposureEV: this.state.exposureMode === 'manual' ? this.state.exposure : (this.meterEV ?? this.targetEV()) - this.state.exposureComp,
     })
   }
 
@@ -1371,7 +1417,9 @@ export class PyroEngine {
     this.canvas.width = w
     this.canvas.height = h
     this.layoutCamera()
-    // A still accumulates as a paused frame does.
+    // A still meters at once (no easing) and accumulates as a paused frame does.
+    await this.readFire()
+    this.meterEV = this.targetEV()
     const paused = this.paused
     this.paused = true
     for (let i = 0; i < TAA_SETTLE; i++) this.render()

@@ -1007,6 +1007,7 @@ struct RParams {
   wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear Rec.709; wind (m/s) in the first row's w
   wb1: vec4<f32>,      // (w: sample the scalars tricubically, 0 or 1)
   wb2: vec4<f32>,      // (w: render the smoke from the upres grid, 0 or 1)
+  scene: vec4<f32>,    // background: the sky and a floor to the horizon (1) or a studio's black (0); unused
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -1471,7 +1472,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     col += T * BALL_ALBEDO * INV_PI * E;
   } else if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     let pf = ro + rd * tFloor;
-    let fade = exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w));
+    // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon.
+    let fade = select(exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
     // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
     let sb = boxHit(pf, sun, P.origin.xyz, domainHi());
     var shadow = vec3<f32>(1.0);
@@ -1506,7 +1508,14 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let fireE = fireColour * fireLux;
     let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis * ballSky + fireE;
-    col += T * R.floorCol.xyz * INV_PI * E * fade;
+    var floorL = R.floorCol.xyz * INV_PI * E * fade;
+    // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
+    if (R.scene.x > 0.5) { floorL = mix(floorL, R.skyCol.xyz * INV_PI * 1.25, 1.0 - exp(-tFloor / 40.0)); }
+    col += T * floorL;
+  } else if (R.scene.x > 0.5 && tBall >= 1e8) {
+    // The sky: a dome of the sky's radiance (its illuminance on the ground over pi), a little brighter toward the
+    // horizon. At night it is too dim to see.
+    col += T * R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0)));
   }
 
   // Exposed (as a fraction of the luminance the camera maps to white), for the accumulation pass.

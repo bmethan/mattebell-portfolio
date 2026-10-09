@@ -51,6 +51,14 @@ export const SOOT_CHROMA: [number, number] = [(REF_NM / 612) ** SOOT_ALPHA, (REF
 // EV100 saturates at 1.2 x 2^EV100 cd/m2 (Lagarde and de Rousiers 2014).
 export const luxOfEV = (ev: number) => 2.5 * 2 ** ev
 export const exposureOfEV = (ev: number) => 1 / (1.2 * 2 ** ev)
+// Auto exposure. The ambient light is metered as an incident meter reads it, less 2.3 EV (smoke is pale and sits in
+// the open, and the camera's saturation-based exposure runs darker than a meter's grey); a fire sets the least
+// exposure (the highest EV) the frame may take: EV 7 for an 80 kW campfire (about 130 cd), and half a stop more for
+// each doubling of the fire's intensity (less than in proportion: photographers let flames burn out a little).
+export const METER_AMBIENT = 0.2
+export const METER_FIRE_EV = 7
+export const METER_FIRE_CD = 130
+export const METER_FIRE_SLOPE = 0.35
 
 // The fire's light is gathered from this many slices of the grid's height, each a point light at its own centre.
 export const FIRE_BANDS = 8

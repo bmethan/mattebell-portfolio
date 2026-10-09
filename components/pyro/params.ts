@@ -56,8 +56,11 @@ export interface PyroState {
   lightEl: number // degrees
   sunEV: number // the sun's illuminance as an incident-meter reading (lux = 2.5 x 2^EV)
   skyEV: number // the sky's, on open ground
-  exposure: number // the camera's EV100
+  exposure: number // the camera's EV100 (manual)
+  exposureMode: 'auto' | 'manual'
+  exposureComp: number // EV of compensation on the metered exposure: positive brightens, as on a camera's dial
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
+  background: 'studio' | 'sky' // black around the floor's pool of light, or the sky and a floor to the horizon
   tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
   upres: boolean // a smoke source's density also on a grid twice as fine (wavelet turbulence)
   upresStrength: number // its turbulence, 1 = Kolmogorov's next band
@@ -77,13 +80,13 @@ export const PYRO_DEFAULTS: PyroState = {
   vcycles: 2,
   pressureIters: 40,
   sourceType: 'fire',
-  srcRadius: 0.3,
+  srcRadius: 0.4,
   srcDensity: 0.55,
   srcTemp: 70,
   srcSpeed: 0.45,
   srcNoise: 0.8,
   srcX: 0,
-  heatRelease: 80,
+  heatRelease: 180,
   buoyancy: 1,
   vorticity: 0.35,
   turbulence: 1,
@@ -91,19 +94,22 @@ export const PYRO_DEFAULTS: PyroState = {
   wind: 0,
   cooling: 0,
   dissipation: 0,
-  sootYield: FUEL.sootYield,
+  sootYield: 0.04,
   radiantFraction: FUEL.radiantFraction,
   expansion: 1,
   flameDetail: 1,
   densityScale: 9,
-  albedo: 0.25,
+  albedo: 0.45,
   anisotropy: 0.3,
-  lightAz: -45,
-  lightEl: 35,
-  sunEV: 2,
-  skyEV: 1,
+  lightAz: -60,
+  lightEl: 12,
+  sunEV: 8,
+  skyEV: 7,
   exposure: 7,
-  whiteBalance: 5500,
+  exposureMode: 'auto',
+  exposureComp: 0,
+  whiteBalance: 5000,
+  background: 'studio',
   tricubic: true,
   upres: true,
   upresStrength: 1,
@@ -117,17 +123,20 @@ export const PYRO_DEFAULTS: PyroState = {
 // shot at dusk, exposed for the flames as a photographer would, and its smoke is soot, darker than a smoke pot's.
 export const SOURCE_LOOKS: Record<SourceType, Partial<PyroState>> = {
   smoke: { sunEV: 13, skyEV: 11, exposure: 11, whiteBalance: 6500, albedo: 0.6, turbulence: 2, vorticity: 0.25 },
-  fire: { sunEV: 2, skyEV: 1, exposure: 7, whiteBalance: 5500, albedo: 0.25, turbulence: 1, vorticity: 0.35 },
+  fire: { sunEV: 8, skyEV: 7, exposure: 7, whiteBalance: 5000, albedo: 0.45, turbulence: 1, vorticity: 0.35 },
 }
 
-// Starting points: each sets the source, its look and the wind, and the lab restarts from it.
-const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, sootYield: FUEL.sootYield, radiantFraction: FUEL.radiantFraction }
-const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3 }
+// Starting points: each sets the source, the light and the wind, and the lab restarts from it. A fire's smoke is
+// soot (dark, albedo about 0.25) when the fuel burns sooty; wood smoke also carries tarry droplets, which make it paler.
+const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, radiantFraction: FUEL.radiantFraction, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0 }
+const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0 }
+export const BONFIRE_AT_DUSK: Partial<PyroState> = { ...FIRE_START, heatRelease: 180, srcRadius: 0.4, sootYield: 0.04, albedo: 0.45, sunEV: 8, skyEV: 7, lightAz: -60, lightEl: 12, whiteBalance: 5000 }
 export const PRESETS: { id: string; label: string; state: Partial<PyroState> }[] = [
-  { id: 'campfire', label: 'Campfire', state: { ...FIRE_START, heatRelease: 80, srcRadius: 0.3, srcX: 0, wind: 0 } },
-  { id: 'bonfire', label: 'Bonfire', state: { ...FIRE_START, heatRelease: 200, srcRadius: 0.4, srcX: 0, wind: 0 } },
-  { id: 'fire-wind', label: 'Fire in wind', state: { ...FIRE_START, heatRelease: 100, srcRadius: 0.3, srcX: -1.2, wind: 1.5 } },
-  { id: 'sooty', label: 'Sooty fire', state: { ...FIRE_START, heatRelease: 120, srcRadius: 0.3, srcX: 0, wind: 0, sootYield: 0.08 } },
-  { id: 'plume', label: 'Smoke plume', state: { ...SMOKE_START, srcX: 0, wind: 0 } },
-  { id: 'smoke-wind', label: 'Smoke in wind', state: { ...SMOKE_START, srcX: -1.4, wind: 1.2 } },
+  { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'studio' } },
+  { id: 'campfire', label: 'Campfire at night', state: { ...FIRE_START, background: 'studio', heatRelease: 80, srcRadius: 0.3, sootYield: FUEL.sootYield, albedo: 0.35, sunEV: -1, skyEV: -2, lightAz: -45, lightEl: 35, whiteBalance: 5500 } },
+  { id: 'oil', label: 'Oil fire in daylight', state: { ...FIRE_START, background: 'sky', heatRelease: 250, srcRadius: 0.4, sootYield: 0.12, albedo: 0.25, sunEV: 14, skyEV: 11, lightAz: -40, lightEl: 40, whiteBalance: 5500 } },
+  { id: 'fire-wind', label: 'Fire in wind', state: { ...FIRE_START, background: 'sky', heatRelease: 120, srcRadius: 0.3, sootYield: 0.05, albedo: 0.4, sunEV: 12, skyEV: 10, lightAz: -45, lightEl: 30, whiteBalance: 6000, srcX: -1, wind: 1.8 } },
+  { id: 'plume', label: 'Smoke plume', state: { ...SMOKE_START, background: 'studio' } },
+  { id: 'smoke-wind', label: 'Smoke in wind', state: { ...SMOKE_START, background: 'sky', srcX: -1.4, wind: 1.2, skyEV: 10, lightAz: 30, lightEl: 40 } },
+  { id: 'steam', label: 'Steam', state: { ...SMOKE_START, background: 'sky', albedo: 0.95, densityScale: 5, srcTemp: 60, srcSpeed: 0.7, srcRadius: 0.2, turbulence: 1.5, sunEV: 13, skyEV: 10, lightAz: 30, lightEl: 40 } },
 ]

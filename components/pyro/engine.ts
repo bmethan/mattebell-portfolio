@@ -27,7 +27,7 @@ const AUTO_RES_MIN_RATE = 18
 const MAX_RENDER_PIXELS = 900_000
 const STATUS_MS = 250
 const STIR_RADIUS = 0.3 // m
-const DETAIL_PERIOD = 1.6 // s of simulation between resets of each upres layer (half a period apart); flames stretch them fast
+const DETAIL_PERIOD = 1 // s of simulation between resets of each upres layer (half a period apart); the plume stretches them fast
 const NOISE_SIZE = 64 // texels along each side of the tileable detail noise
 const FLAME_DECAY = 3 // 1/s: how fast the flame field fades once nothing burns
 const IGNITION = 0.3 // temperature above ambient at which fuel burns
@@ -233,7 +233,7 @@ export class PyroEngine {
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
   private simData = new ArrayBuffer(224)
-  private renderData = new Float32Array(44)
+  private renderData = new Float32Array(48)
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
   private noiseSampler: GPUSampler
@@ -716,8 +716,8 @@ export class PyroEngine {
     const f = new Float32Array(this.simData)
     u.set([nx, ny, nz, this.frame], 0)
     f.set([dx, SIM_DT, this.simTime, 0], 4)
-    // The source rests on the floor (a fire's dome is 1.6 times wider than tall).
-    f.set([0, (s.sourceType === 'fire' ? s.srcRadius / 1.6 : s.srcRadius) + dx, 0, s.srcRadius], 8)
+    // The source's dome rests on the floor (it is 2.5 times wider than tall).
+    f.set([0, s.srcRadius / 2.5 + dx, 0, s.srcRadius], 8)
     f.set([s.srcDensity, s.srcTemp, s.srcSpeed, s.srcNoise], 12)
     f.set([s.buoyancy, 0, s.vorticity, s.turbulence], 16)
     f.set([s.turbScale, s.wind, 0, 0.05], 20)
@@ -760,6 +760,7 @@ export class PyroEngine {
     const ageB = (this.simTime / DETAIL_PERIOD + 0.5) % 1
     r.set([1 - Math.abs(2 * ageA - 1), 1 - Math.abs(2 * ageB - 1), s.detail, 1 / (8 * s.detailScale)], 36)
     r.set([s.sourceType === 'fire' ? s.flameIntensity : 0, s.flameKelvin - 300, s.flameContrast, 0], 40)
+    r.set([s.sourceType === 'fire' ? s.flameDetail : 0, 0, 0, this.simTime], 44)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 

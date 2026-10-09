@@ -36,7 +36,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Forces',
-    'Buoyancy from temperature; vorticity confinement, which restores the small swirls a coarse grid smooths away; divergence-free turbulence from the curl of a noise potential, only where there is smoke; wind; and the source’s upward push. Hot air cools and smoke dissipates at the rates in the Forces tab.',
+    'Buoyancy from temperature; vorticity confinement, which restores the small swirls a coarse grid smooths away; divergence-free turbulence from the curl of a noise potential, where there is smoke or flame, which rises with the plume and churns as it rises (held still, it would push the gas the same way at the same places, and the updraft would draw those pushes out into steady vertical streaks); wind; and the source’s upward push. Hot air cools and smoke dissipates at the rates in the Forces tab.',
   ],
   [
     'Combustion',
@@ -44,11 +44,11 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Flames',
-    'Flames emit light at the blackbody colour and brightness of their temperature: Planck\u2019s law integrated against the CIE colour matching functions. The radiating temperature follows the reaction, at the flame\u2019s peak (1900 K by default) where it is fresh at the base, cooling toward the tips as it runs out, which gives the yellow-to-orange-to-red of a real flame. Real flames span a huge range of brightness, a 2000 K core about 60 times brighter than a 1500 K edge; the contrast control compresses it, 1 being physical. The fire also lights the smoke and the floor, as a point light at its brightness-weighted centre carrying its total emitted light, summed on the GPU every step; the smoke does not shadow that light.',
+    'Flames emit light at the blackbody colour and brightness of their temperature: Planck\u2019s law integrated against the CIE colour matching functions. The radiating temperature follows the reaction: the flame\u2019s peak (2100 K by default) through most of the flame, cooling over the last of the reaction toward the tips, which gives the yellow-to-orange-to-red of a real flame. The grid is too coarse for a flame\u2019s thin, sharp-edged tongues, so the renderer carves them: a noise taller than it is wide, rising with the flames and churning as it rises, offsets the flame, and a narrow threshold cuts tongues with dark gaps between them (Flame detail sets how deeply). The noise is not carried by the flow, which would stretch it into streaks within a fraction of a second. Real flames span a huge range of brightness, a 2000 K core about 60 times brighter than a 1500 K edge; the contrast control compresses it, 1 being physical. The fire also lights the smoke and the floor, as a point light at its brightness-weighted centre carrying its total emitted light, summed on the GPU every step; the smoke does not shadow that light.',
   ],
   [
     'Detail',
-    'Wisps finer than the grid, in the spirit of production upres: two layers of texture coordinates ride with the flow, and the renderer reads a fine noise at them, so the detail moves with the smoke rather than sliding through it. The flow stretches each layer as it shears it, so each resets on its own schedule, half a period after the other, and the two cross-fade: a layer is invisible at the moment it resets. The detail works hardest in thin smoke, at the edges and in the wisps. It shapes what the camera sees; the light still travels through the simulated density.',
+    'Wisps finer than the grid, in the spirit of production upres: two layers of texture coordinates ride with the flow, and the renderer reads a fine noise at them, so the detail moves with the smoke rather than sliding through it. The flow stretches each layer as it shears it, so each resets on its own schedule, half a period after the other, and the two cross-fade: a layer is invisible at the moment it resets. A stretched layer would streak its noise along the stretch, so each layer also tracks how far the flow has stretched it (after Neyret 2003) and counts for less the more it has; where both are stretched, as in the fast updraft over a fire, the detail fades rather than streaks. The detail works hardest in thin smoke, at the edges and in the wisps, and leaves the faintest haze smooth, where fine noise would read as grain. It shapes what the camera sees; the light still travels through the simulated density.',
   ],
   ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
   [
@@ -404,11 +404,14 @@ export default function PyroLab() {
                 <div className="lab-row">
                   <Slider label="Flame intensity" min={0} max={4} step={0.05} value={pyro.flameIntensity} onChange={v => update({ flameIntensity: v })} />
                   <Slider label="Flame temperature" min={1200} max={2600} step={10} value={pyro.flameKelvin} digits={0} unit=" K" onChange={v => update({ flameKelvin: v })} />
+                </div>
+                <div className="lab-row">
                   <Slider label="Flame contrast" min={0.2} max={1} step={0.05} value={pyro.flameContrast} onChange={v => update({ flameContrast: v })} />
+                  <Slider label="Flame detail" min={0} max={1} step={0.05} value={pyro.flameDetail} onChange={v => update({ flameDetail: v })} />
                 </div>
                 <p className="lab-note">
                   {pyro.sourceType === 'fire'
-                    ? 'Flame temperature: the gas at its hottest, where burning a full measure of fuel takes it. Flame contrast 1 is physical blackbody brightness.'
+                    ? 'Flame temperature: the gas at its hottest, where burning a full measure of fuel takes it. Flame contrast 1 is physical blackbody brightness. Flame detail 0 shows the simulated flame without its tongues.'
                     : 'These act on a fire source: choose Fire under Source.'}
                 </p>
               </>

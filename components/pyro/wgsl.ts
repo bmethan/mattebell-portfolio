@@ -63,12 +63,13 @@ fn fbm(p: vec3<f32>) -> f32 {
   return 0.6 * vnoise(p) + 0.3 * vnoise(p * 2.03 + 17.1) + 0.1 * vnoise(p * 4.07 + 31.7);
 }
 
-// The source, its edge one cell soft, broken into puffs by fast-drifting noise: a sphere resting on the floor for smoke,
-// for fire a squat dome, 1.6 times wider than tall (a fire bed).
+// The source, its edge one cell soft, broken into puffs by fast-drifting noise: a squat dome on the floor, 2.5 times
+// wider than tall (a fire bed, or the mouth of a smoke pot). A taller source fills with gas that has only just left
+// it, all of it as dense or as hot as the source makes it, and reads as a solid ball.
 fn sourceMask(w: vec3<f32>) -> f32 {
   let r = P.src.w;
   let q = w - P.src.xyz;
-  let d = length(vec3<f32>(q.x, q.y * select(1.0, 1.6, P.fire.x > 0.5), q.z));
+  let d = length(vec3<f32>(q.x, q.y * 2.5, q.z));
   let m = 1.0 - smoothstep(r - 2.0 * P.grid.x, r, d);
   if (m <= 0.0) { return 0.0; }
   // Coarse noise drifting in every direction: a pattern held still in x and z would emit the same thin columns
@@ -191,8 +192,21 @@ fn confine(c0: vec3<i32>) -> vec3<f32> {
   return P.forces.z * P.grid.x * cross(g / l, w.xyz);
 }
 
-// Turbulence: the curl of a noise vector potential (divergence free by construction), one component at a time.
-fn psi(q: vec3<f32>, k: f32) -> f32 { return vnoise(q + vec3<f32>(k * 37.1, k * 11.7, k * 23.3)) - 0.5; }
+// Turbulence: the curl of a noise vector potential (divergence free by construction), one component at a time. The
+// potential rises with the plume and churns as it rises (value noise in time as well as space, a new slice every
+// TURB_CHURN seconds): held still, it would push the gas the same way at the same places step after step, and the
+// updraft would draw those pushes out into steady vertical lanes.
+const TURB_RISE = 1.0; // m/s
+const TURB_CHURN = 0.35; // s
+fn psi(q: vec3<f32>, k: f32) -> f32 {
+  let s = P.grid.z / TURB_CHURN;
+  let i = floor(s);
+  let f = s - i;
+  let o = vec3<f32>(k * 37.1, k * 11.7, k * 23.3);
+  let a = vnoise(q + o + vec3<f32>(i * 17.31, i * 7.13, i * 29.71));
+  let b = vnoise(q + o + vec3<f32>(i * 17.31 + 17.31, i * 7.13 + 7.13, i * 29.71 + 29.71));
+  return mix(a, b, f * f * (3.0 - 2.0 * f)) - 0.5;
+}
 const H = 0.25;
 fn curlX(q: vec3<f32>) -> f32 {
   return ((psi(q + vec3<f32>(0.0, H, 0.0), 2.0) - psi(q - vec3<f32>(0.0, H, 0.0), 2.0)) - (psi(q + vec3<f32>(0.0, 0.0, H), 1.0) - psi(q - vec3<f32>(0.0, 0.0, H), 1.0))) / (2.0 * H);
@@ -204,9 +218,10 @@ fn curlZ(q: vec3<f32>) -> f32 {
   return ((psi(q + vec3<f32>(H, 0.0, 0.0), 1.0) - psi(q - vec3<f32>(H, 0.0, 0.0), 1.0)) - (psi(q + vec3<f32>(0.0, H, 0.0), 0.0) - psi(q - vec3<f32>(0.0, H, 0.0), 0.0))) / (2.0 * H);
 }
 fn noiseSpace(w: vec3<f32>) -> vec3<f32> {
-  return w / max(P.forces2.x, 0.01) + vec3<f32>(0.0, -0.5 * P.grid.z, 0.13 * P.grid.z);
+  return (w - vec3<f32>(0.0, TURB_RISE * P.grid.z, 0.0)) / max(P.forces2.x, 0.01);
 }
-fn turbMask(d: f32) -> f32 { return clamp(d * 3.0, 0.0, 1.0); }
+// Turbulence acts where there is smoke or flame.
+fn turbMask(a: vec4<f32>, b: vec4<f32>) -> f32 { return clamp(1.5 * (max(a.x, a.w) + max(b.x, b.w)), 0.0, 1.0); }
 
 // The stir: a velocity change along the visitor's drag, falling off from where the pointer's ray passes the plume.
 fn stir(w: vec3<f32>) -> vec3<f32> {
@@ -230,9 +245,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   if (id.y < n.y && id.z < n.z) {
     let w = worldOf(vec3<f32>(f.x, f.y + 0.5, f.z + 0.5));
-    let d = 0.5 * (cellScal(c - X).x + cellScal(c).x);
     var a = 0.5 * (confine(c - X).x + confine(c).x);
-    a += P.forces.w * turbMask(d) * curlX(noiseSpace(w));
+    a += P.forces.w * turbMask(cellScal(c - X), cellScal(c)) * curlX(noiseSpace(w));
     var u = v.x + a * dt;
     u += (P.forces2.y - u) * windT;
     u = (u + stir(w).x) * keep;
@@ -248,7 +262,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       let d = 0.5 * (s0.x + s1.x);
       let temp = 0.5 * (s0.y + s1.y);
       var a = 0.5 * (confine(c - Y).y + confine(c).y) + P.forces.x * (temp - P.grid.w) - P.forces.y * d;
-      a += P.forces.w * turbMask(d) * curlY(noiseSpace(w));
+      a += P.forces.w * turbMask(s0, s1) * curlY(noiseSpace(w));
       var vy = v.y + a * dt;
       vy -= vy * windT;
       vy = mix(vy, P.srcProps.z, sourceMask(w));
@@ -258,9 +272,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   if (id.x < n.x && id.y < n.y) {
     let w = worldOf(vec3<f32>(f.x + 0.5, f.y + 0.5, f.z));
-    let d = 0.5 * (cellScal(c - Z).x + cellScal(c).x);
     var a = 0.5 * (confine(c - Z).z + confine(c).z);
-    a += P.forces.w * turbMask(d) * curlZ(noiseSpace(w));
+    a += P.forces.w * turbMask(cellScal(c - Z), cellScal(c)) * curlZ(noiseSpace(w));
     var wz = v.z + a * dt;
     wz += (P.forces2.z - wz) * windT;
     wz = (wz + stir(w).z) * keep;
@@ -512,6 +525,32 @@ ${SIM_COMMON}
 @group(0) @binding(5) var dstA: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(6) var dstB: texture_storage_3d<rgba16float, write>;
 
+// How far a layer has strayed from a rigid motion since its reset (after Neyret 2003): the map from here to the
+// material's origin has the Jacobian J = I + the gradient of the stored offset, and J^T J - I measures its stretch,
+// 0 for a translation or a rotation and about 1.6 for a twofold stretch.
+fn distortion(src: texture_3d<f32>, c: vec3<i32>) -> f32 {
+  let n = nCells() - 1;
+  var J: array<vec3<f32>, 3>;
+  for (var k = 0; k < 3; k++) {
+    var e = vec3<i32>(0);
+    e[k] = 1;
+    let hi = min(c + e, n);
+    let lo = max(c - e, vec3<i32>(0));
+    let span = f32(hi[k] - lo[k]) * P.grid.x;
+    var col = (textureLoad(src, hi, 0).xyz - textureLoad(src, lo, 0).xyz) / span;
+    col[k] += 1.0;
+    J[k] = col;
+  }
+  var s = 0.0;
+  for (var i = 0; i < 3; i++) {
+    for (var j = 0; j < 3; j++) {
+      let m = dot(J[i], J[j]) - select(0.0, 1.0, i == j);
+      s += m * m;
+    }
+  }
+  return sqrt(s);
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let c = vec3<i32>(id);
@@ -519,11 +558,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let g = vec3<f32>(id) + 0.5;
   let gs = backtrace(vel, samp, g, 1.0);
   // The material here came from gs: its origin, relative to here, is its origin relative to gs plus (gs - g).
+  // The fourth channel keeps the layer's distortion (from the last step's layer: a step behind, which is close enough).
   let shift = (gs - g) * P.grid.x;
-  let a = select(scalAt(srcA, samp, gs).xyz + shift, vec3<f32>(0.0), P.detail.x > 0.5);
-  let b = select(scalAt(srcB, samp, gs).xyz + shift, vec3<f32>(0.0), P.detail.y > 0.5);
-  textureStore(dstA, c, vec4<f32>(a, 0.0));
-  textureStore(dstB, c, vec4<f32>(b, 0.0));
+  let resetA = P.detail.x > 0.5;
+  let resetB = P.detail.y > 0.5;
+  let a = select(vec4<f32>(scalAt(srcA, samp, gs).xyz + shift, distortion(srcA, c)), vec4<f32>(0.0), resetA);
+  let b = select(vec4<f32>(scalAt(srcB, samp, gs).xyz + shift, distortion(srcB, c)), vec4<f32>(0.0), resetB);
+  textureStore(dstA, c, a);
+  textureStore(dstB, c, b);
 }
 `
 
@@ -532,35 +574,40 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 export const NOISE_GEN = /* wgsl */ `
 @group(0) @binding(0) var dst: texture_storage_3d<rgba8unorm, write>;
 
-fn hashW(c0: vec3<i32>, period: i32) -> f32 {
+fn hashW(c0: vec3<i32>, period: i32, seed: u32) -> f32 {
   let c = ((c0 % period) + period) % period;
-  var h = (bitcast<u32>(c.x) * 0x8da6b343u) ^ (bitcast<u32>(c.y) * 0xd8163841u) ^ (bitcast<u32>(c.z) * 0xcb1ab31fu) ^ (u32(period) * 0x9e3779b9u);
+  var h = (bitcast<u32>(c.x) * 0x8da6b343u) ^ (bitcast<u32>(c.y) * 0xd8163841u) ^ (bitcast<u32>(c.z) * 0xcb1ab31fu) ^ ((u32(period) + 97u * seed) * 0x9e3779b9u);
   h = (h ^ (h >> 16u)) * 0x7feb352du;
   h = (h ^ (h >> 15u)) * 0x846ca68bu;
   h = h ^ (h >> 16u);
   return f32(h) * (1.0 / 4294967296.0);
 }
 // A random unit gradient at a lattice point (uniform on the sphere).
-fn gradW(c: vec3<i32>, period: i32) -> vec3<f32> {
-  let z = 2.0 * hashW(c, period) - 1.0;
-  let a = 6.2831853 * hashW(c + vec3<i32>(173, 311, 467), period);
+fn gradW(c: vec3<i32>, period: i32, seed: u32) -> vec3<f32> {
+  let z = 2.0 * hashW(c, period, seed) - 1.0;
+  let a = 6.2831853 * hashW(c + vec3<i32>(173, 311, 467), period, seed);
   let r = sqrt(max(1.0 - z * z, 0.0));
   return vec3<f32>(r * cos(a), r * sin(a), z);
 }
-fn corner(c: vec3<i32>, o: vec3<i32>, f: vec3<f32>, period: i32) -> f32 {
-  return dot(gradW(c + o, period), f - vec3<f32>(o));
+fn corner(c: vec3<i32>, o: vec3<i32>, f: vec3<f32>, period: i32, seed: u32) -> f32 {
+  return dot(gradW(c + o, period, seed), f - vec3<f32>(o));
 }
 // Gradient (Perlin) noise, about -0.7 to 0.7, wrapping every period lattice cells.
-fn tileNoise(q: vec3<f32>, period: i32) -> f32 {
+fn tileNoise(q: vec3<f32>, period: i32, seed: u32) -> f32 {
   let i = floor(q);
   let f = q - i;
   let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
   let c = vec3<i32>(i);
-  let x00 = mix(corner(c, vec3<i32>(0, 0, 0), f, period), corner(c, vec3<i32>(1, 0, 0), f, period), u.x);
-  let x10 = mix(corner(c, vec3<i32>(0, 1, 0), f, period), corner(c, vec3<i32>(1, 1, 0), f, period), u.x);
-  let x01 = mix(corner(c, vec3<i32>(0, 0, 1), f, period), corner(c, vec3<i32>(1, 0, 1), f, period), u.x);
-  let x11 = mix(corner(c, vec3<i32>(0, 1, 1), f, period), corner(c, vec3<i32>(1, 1, 1), f, period), u.x);
+  let x00 = mix(corner(c, vec3<i32>(0, 0, 0), f, period, seed), corner(c, vec3<i32>(1, 0, 0), f, period, seed), u.x);
+  let x10 = mix(corner(c, vec3<i32>(0, 1, 0), f, period, seed), corner(c, vec3<i32>(1, 1, 0), f, period, seed), u.x);
+  let x01 = mix(corner(c, vec3<i32>(0, 0, 1), f, period, seed), corner(c, vec3<i32>(1, 0, 1), f, period, seed), u.x);
+  let x11 = mix(corner(c, vec3<i32>(0, 1, 1), f, period, seed), corner(c, vec3<i32>(1, 1, 1), f, period, seed), u.x);
   return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+fn fbm(q: vec3<f32>, seed: u32) -> f32 {
+  let v = 0.55 * tileNoise(q * 8.0, 8, seed) + 0.3 * tileNoise(q * 16.0, 16, seed) + 0.15 * tileNoise(q * 32.0, 32, seed);
+  return clamp(0.5 + 1.7 * v, 0.0, 1.0);
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -568,9 +615,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = textureDimensions(dst);
   if (any(id >= n)) { return; }
   let q = vec3<f32>(id) / vec3<f32>(n);
-  let v = 0.55 * tileNoise(q * 8.0, 8) + 0.3 * tileNoise(q * 16.0, 16) + 0.15 * tileNoise(q * 32.0, 32);
-  let s = clamp(0.5 + 1.7 * v, 0.0, 1.0);
-  textureStore(dst, vec3<i32>(id), vec4<f32>(s, s, s, 1.0));
+  // Three independent fbms, one per channel.
+  textureStore(dst, vec3<i32>(id), vec4<f32>(fbm(q, 0u), fbm(q, 1u), fbm(q, 2u), 1.0));
 }
 `
 
@@ -651,6 +697,7 @@ struct RParams {
   size: vec4<f32>,     // render target width, height
   detail: vec4<f32>,   // weight of detail layer A, of layer B, amount, 1 / (8 x detail scale in m)
   fire: vec4<f32>,     // flame intensity, kelvins per unit of temperature (peak flame K - 300), flame contrast (1 = physical), unused
+  shape: vec4<f32>,    // flame tongues: amount (0 = off), unused, unused, simulation time (s)
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -744,7 +791,10 @@ fn blackbody(kelvin: f32) -> vec3<f32> {
 }
 fn emission(s: vec4<f32>) -> vec3<f32> {
   if (s.w <= 1e-3 || R.fire.x <= 0.0) { return vec3<f32>(0.0); }
-  let kelvin = 300.0 + pow(clamp(s.w, 0.0, 1.0), 0.3) * R.fire.y;
+  // The glowing soot stays near the peak temperature through most of the flame and cools over the last of the
+  // reaction (the last 40%), so the flame is bright up to its tips rather than only at its base.
+  let x = 1.0 - min(clamp(s.w, 0.0, 1.0) / 0.4, 1.0);
+  let kelvin = 300.0 + (1.0 - x * x) * R.fire.y;
   return R.fire.x * blackbody(kelvin) * smoothstep(0.0, 0.08, s.w);
 }
 `
@@ -857,17 +907,43 @@ fn jitterAt(p: vec2<f32>, frame: f32) -> f32 {
 const FIRE_R2 = 0.06; // m2: softens the fire's point light over the flames' size
 
 // Upres detail at a point: the noise at each layer's advected coordinates, cross-faded, with the contrast that mixing
-// two independent noises loses restored (divided by the blend's standard-deviation factor).
+// two independent noises loses restored (divided by the blend's standard-deviation factor). A layer the flow has
+// stretched would streak its noise along the stretch, so each counts less the more it has stretched (Neyret 2003),
+// and where both have, the detail fades rather than streaks.
 fn detail(w: vec3<f32>, uvw: vec3<f32>) -> f32 {
-  let a = textureSampleLevel(detA, samp, uvw, 0.0).xyz;
-  let b = textureSampleLevel(detB, samp, uvw, 0.0).xyz;
+  let a = textureSampleLevel(detA, samp, uvw, 0.0);
+  let b = textureSampleLevel(detB, samp, uvw, 0.0);
   // A fixed rotation, so the noise lattice lines up with neither the grid nor the camera.
   let rot = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
-  let na = textureSampleLevel(noiseTex, noiseSamp, rot * (w + a) * R.detail.w, 0.0).x - 0.5;
-  let nb = textureSampleLevel(noiseTex, noiseSamp, rot * (w + b) * R.detail.w + vec3<f32>(0.37, 0.61, 0.13), 0.0).x - 0.5;
-  let wa = R.detail.x;
-  let wb = R.detail.y;
-  return (na * wa + nb * wb) / max(sqrt(wa * wa + wb * wb), 1e-3);
+  let na = textureSampleLevel(noiseTex, noiseSamp, rot * (w + a.xyz) * R.detail.w, 0.0).x - 0.5;
+  let nb = textureSampleLevel(noiseTex, noiseSamp, rot * (w + b.xyz) * R.detail.w + vec3<f32>(0.37, 0.61, 0.13), 0.0).x - 0.5;
+  let wa = R.detail.x / (1.0 + a.w * a.w);
+  let wb = R.detail.y / (1.0 + b.w * b.w);
+  return (na * wa + nb * wb) / max(sqrt(R.detail.x * R.detail.x + R.detail.y * R.detail.y), 1e-3);
+}
+
+// Flame tongues. The flame field is smooth at the grid's scale, but a flame's glowing zone is thin and sharp-edged:
+// tongues with dark gaps between them, whose tips break away as the flame runs out. A noise taller than it is wide,
+// rising with the flames and churning as it rises, offsets the flame value, and a narrow threshold on the result
+// carves the tongues (the noise also varies the brightness within them). The noise is not carried by the flow (the
+// updraft stretches anything it carries into streaks within a fraction of a second) but warped by a second noise, so
+// the tongues bend and split. The offset scales with the flame, so faint flame is never lifted into bright pockets,
+// and reaches into the dense flame at the base, so the fuel bed breaks into separate flames too.
+const TONGUE_TILE = 1.4; // m across the noise tile: tongues about 18 cm wide, 40 cm tall at the largest
+const TONGUE_RISE = 1.5; // m/s
+const TONGUE_EDGE = 0.3; // the flame value where a tongue's edge begins (it is fully lit 0.25 above)
+fn flameShape(w: vec3<f32>, f: f32, rot: mat3x3<f32>) -> f32 {
+  let t = R.shape.w;
+  let k = 1.0 / TONGUE_TILE;
+  var p = vec3<f32>(w.x * k, (w.y - TONGUE_RISE * t) * 0.45 * k, w.z * k + 0.35 * t);
+  let warp = textureSampleLevel(noiseTex, noiseSamp, rot * (0.5 * p) + vec3<f32>(0.11, 0.53, 0.29), 0.0).yz - 0.5;
+  p.x += 0.9 * warp.x;
+  p.z += 0.9 * warp.y;
+  let n = textureSampleLevel(noiseTex, noiseSamp, rot * p, 0.0).x;
+  // The fbm's values cluster about its middle (a standard deviation of about 0.2): stretched to about -1 to 1.
+  let v = clamp((n - 0.5) * 4.0, -1.0, 1.0);
+  let level = f + R.shape.x * v * (smoothstep(0.0, 0.3, f) + 0.8 * f);
+  return smoothstep(TONGUE_EDGE, TONGUE_EDGE + 0.25, level) * (1.0 + R.shape.x * v);
 }
 
 // Stephen Hill's fit of the ACES RRT and sRGB ODT (rows of the input and output matrices).
@@ -922,16 +998,21 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       let fade = edgeFade(uvw);
       let s4 = textureSampleLevel(scal, samp, uvw, 0.0);
       var d = s4.x * fade;
-      let flame = s4.w * fade;
+      var flame = s4.w * fade;
       if (d > 1e-4 || flame > 1e-3) {
-        // Upres detail: strongest in thin smoke (the edges and wisps), a third as strong in the dense core; it shapes
-        // the flames too.
+        // Upres detail: strongest in thin smoke (the edges and wisps), a third as strong in the dense core, and fading
+        // out in the faintest haze, where fine noise reads as grain.
         var f = 1.0;
         if (R.detail.z > 0.0) {
           let thin = 1.0 - smoothstep(0.02, 0.4, d);
-          f = clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin), 0.0, 2.0);
+          let faint = smoothstep(0.0, 0.1, d);
+          f = clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
         }
         d *= f;
+        var tongues = 1.0;
+        if (flame > 1e-3 && R.shape.x > 0.0) {
+          tongues = flameShape(w, flame, mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6));
+        }
         let L = textureSampleLevel(light, samp, uvw, 0.0);
         let tau = L.x;
         let lsun = exp(-tau) * ph0 + 0.5 * exp(-0.5 * tau) * ph1 + 0.25 * exp(-0.25 * tau) * ph2;
@@ -941,7 +1022,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         let fireE = fireLight[0].xyz * fireVolume / (12.566371 * (dot(toFire, toFire) + FIRE_R2));
         let S = albedo * (R.sunCol.xyz * lsun + amb + fireE);
         let Ts = exp(-d * sigScale * ds);
-        col += T * ((1.0 - Ts) * S + emission(vec4<f32>(s4.xyz, flame)) * f * ds);
+        col += T * ((1.0 - Ts) * S + emission(vec4<f32>(s4.xyz, flame)) * tongues * ds);
         T *= Ts;
         if (T < 0.004) { break; }
       }

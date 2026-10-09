@@ -55,6 +55,7 @@ export interface PyroState {
   flameIntensity: number
   flameKelvin: number // the flame's peak temperature: solver temperature 1 maps to this, 0 to ambient (300 K)
   flameContrast: number // exponent on the blackbody brightness, 1 = physical
+  flameDetail: number // flame tongues: how deeply the flames are carved (0 = smooth, as simulated)
   // Upres detail
   detail: number // 0 = off
   detailScale: number // m, the largest noise feature
@@ -94,14 +95,15 @@ export const PYRO_DEFAULTS: PyroState = {
   heat: 1.2,
   expansion: 0.8,
   soot: 0.3,
-  flameIntensity: 1,
-  flameKelvin: 1900,
-  flameContrast: 0.5,
+  flameIntensity: 1.6,
+  flameKelvin: 2100,
+  flameContrast: 0.7,
+  flameDetail: 0.7,
 }
 
 // Choosing a source sets the lighting and shading it reads best with (each control can still be changed): fire
 // lights its own scene, so the sun and sky come down, and its smoke is soot, darker than plain smoke.
 export const SOURCE_LOOKS: Record<SourceType, Partial<PyroState>> = {
-  smoke: { sunIntensity: 2.6, skyIntensity: 0.35, albedo: 0.6, densityScale: 9, cooling: 0.5, srcTemp: 1, srcSpeed: 0.45, srcRadius: 0.22, turbulence: 1.2, vorticity: 0.25, buoyancy: 2.2 },
+  smoke: { sunIntensity: 2.6, skyIntensity: 0.35, albedo: 0.6, densityScale: 9, cooling: 0.5, srcTemp: 1, srcSpeed: 0.45, srcRadius: 0.3, turbulence: 2, vorticity: 0.25, buoyancy: 2.2 },
   fire: { sunIntensity: 0.5, skyIntensity: 0.12, albedo: 0.45, densityScale: 12, cooling: 1.5, srcTemp: 1, srcSpeed: 0.8, srcRadius: 0.3, turbulence: 1.8, vorticity: 0.35, buoyancy: 3 },
 }

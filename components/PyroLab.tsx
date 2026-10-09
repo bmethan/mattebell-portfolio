@@ -1,0 +1,446 @@
+'use client'
+// The lab's pyro mode: a 3D smoke solver and volume renderer on the GPU (see pyro/engine.ts), stirred by dragging
+// across the image, with the solver's controls below. It mounts when the Lab switch first selects it, and starts
+// at once (choosing it is the visitor's go-ahead).
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
+import { PyroEngine, type PyroStatus } from './pyro/engine'
+import { PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroState } from './pyro/params'
+import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
+import { citeAuthors } from './lookdev/citations'
+import { Group, Pill, Range, Tabs } from './lab/ui'
+
+const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
+const noSubscribe = () => () => {}
+
+type PyroTab = 'source' | 'forces' | 'shading' | 'solver'
+const PYRO_TABS = [
+  { id: 'source', label: 'Source' },
+  { id: 'forces', label: 'Forces' },
+  { id: 'shading', label: 'Shading' },
+  { id: 'solver', label: 'Solver' },
+] as const
+
+const TECH_NOTES: [string, string][] = [
+  [
+    'Solver',
+    'Air and smoke on a staggered grid, the layout production solvers use: velocity on the cell faces, density and temperature at the cell centres. Each step, 30 per simulated second, advects the velocity (semi-Lagrangian, with a second-order backtrace), adds the forces, then makes the flow incompressible with a pressure solve and projection.',
+  ],
+  [
+    'Pressure',
+    'Red-black Gauss-Seidel with over-relaxation (factor 1.7), started from the previous step’s pressure. Fewer iterations, set in the Solver tab, leave the flow slightly compressible: the smoke swells and loses some of its swirl.',
+  ],
+  [
+    'Advection',
+    'Density and temperature move with Modified MacCormack: a forward and a backward semi-Lagrangian step, half the round-trip error added back, then clamped to the values the forward step read, so detail survives without new extremes. Semi-Lagrangian alone is the softer, more diffusive choice.',
+  ],
+  [
+    'Forces',
+    'Buoyancy from temperature; vorticity confinement, which restores the small swirls a coarse grid smooths away; divergence-free turbulence from the curl of a noise potential, only where there is smoke; wind; and the source’s upward push. Hot air cools and smoke dissipates at the rates in the Forces tab.',
+  ],
+  ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none.'],
+  [
+    'Rendering',
+    'Each pixel marches through the volume and integrates the light over each step in closed form. Sunlight reaches every point through the smoke’s optical depth toward the sun, recomputed each frame on a half-resolution grid. Multiple-scattering octaves stand in for light bouncing inside the smoke, the sky lights it from above through the smoke overhead, and the floor takes its shadow.',
+  ],
+  [
+    'Display',
+    'ACES filmic tone mapping through a fitted curve (the lookdev lab applies the full ACES 2.0 transform; the fit keeps the per-pixel cost small).',
+  ],
+  [
+    'Limits',
+    'A real-time study rather than a production simulation: the grid is coarse (at most 80 × 128 × 64 cells over a 3 m tall box), velocity is stored at half precision, and a GPU that cannot keep up runs the simulation in slow motion rather than taking longer, less stable steps. Production pyro adds sparse and adaptive grids, multigrid pressure solves, collisions and combustion.',
+  ],
+]
+
+// The solver's own frame of the default settings, one per frame shape (the frame is 4:3 on narrow screens).
+function PyroStill({ alt }: { alt: string }) {
+  return (
+    <picture>
+      <source media="(max-width: 768px)" srcSet="/pyro/poster-4x3.jpg" />
+      <img className="lab-still-img" src="/pyro/poster.jpg" alt={alt} decoding="async" />
+    </picture>
+  )
+}
+
+// A labelled slider with its value.
+function Slider({
+  label,
+  min,
+  max,
+  step,
+  value,
+  digits = 2,
+  unit = '',
+  onChange,
+}: {
+  label: string
+  min: number
+  max: number
+  step: number
+  value: number
+  digits?: number
+  unit?: string
+  onChange: (v: number) => void
+}) {
+  return (
+    <Group label={label}>
+      <Range min={min} max={max} step={step} value={value} label={unit ? `${label}, ${unit.trim()}` : label} onChange={onChange} />
+      <span className="lab-readout">
+        {value.toFixed(digits)}
+        {unit}
+      </span>
+    </Group>
+  )
+}
+
+export default function PyroLab() {
+  const frameRef = useRef<HTMLDivElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const engineRef = useRef<PyroEngine | null>(null)
+  const [pyro, setPyro] = useState<PyroState>(PYRO_DEFAULTS)
+  const pyroRef = useRef(pyro)
+  const [status, setStatus] = useState<PyroStatus | null>(null)
+  // Mounted only on the client (the Lab switch shows it), so WebGPU can be checked here.
+  const [mode, setMode] = useState<'starting' | 'live' | 'fallback'>(() => (PyroEngine.detect() ? 'starting' : 'fallback'))
+  const [paused, setPaused] = useState(false)
+  const [tab, setTab] = useState<PyroTab>('source')
+  const [renderer, setRenderer] = useState('')
+  const tabsId = useId()
+  const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
+  const shown = mode === 'live' && !!status && status.simTime > 0
+
+  useEffect(() => {
+    pyroRef.current = pyro
+  }, [pyro])
+  // The engine's reports; when it steps down from the default resolution on a slow GPU, the Solver tab follows.
+  const onStatus = (s: PyroStatus) => {
+    setStatus(s)
+    if (s.autoStepped) setPyro(p => (p.resolution === s.resolution ? p : { ...p, resolution: s.resolution }))
+  }
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    const frame = frameRef.current
+    if (!canvas || !frame || !PyroEngine.detect()) return
+    let engine: PyroEngine | null = null
+    let unmounted = false
+    let visible = false
+    let losses = 0
+    const fit = () => {
+      const r = frame.getBoundingClientRect()
+      engine?.resize(r.width, r.height, window.devicePixelRatio || 1)
+    }
+    const start = async () => {
+      const e = await PyroEngine.create(canvas, onStatus, pyroRef.current, onLost)
+      if (unmounted) {
+        e?.dispose()
+        return
+      }
+      if (!e) {
+        setMode('fallback')
+        return
+      }
+      engine = e
+      engineRef.current = e
+      if (process.env.NODE_ENV !== 'production') {
+        ;(window as unknown as { __pyro?: PyroEngine }).__pyro = e
+      }
+      setRenderer(`WebGPU, ${e.adapterName}`)
+      fit()
+      e.setVisible(visible)
+      const ok = await e.whenReady.catch(err => {
+        console.error(err)
+        return false
+      })
+      if (unmounted || engine !== e) return
+      if (!ok) {
+        e.dispose()
+        engine = null
+        engineRef.current = null
+        setMode('fallback')
+        return
+      }
+      setMode('live')
+    }
+    // A lost device is replaced, twice at most.
+    const onLost = () => {
+      engine?.dispose()
+      engine = null
+      engineRef.current = null
+      if (++losses > 2) {
+        setMode('fallback')
+        return
+      }
+      setTimeout(() => !unmounted && start(), 1000)
+    }
+    const io = new IntersectionObserver(entries => {
+      visible = entries.some(en => en.isIntersecting)
+      engine?.setVisible(visible)
+    })
+    io.observe(frame)
+    const ro = new ResizeObserver(fit)
+    ro.observe(frame)
+    start()
+    return () => {
+      unmounted = true
+      io.disconnect()
+      ro.disconnect()
+      engine?.dispose()
+      engineRef.current = null
+    }
+  }, [])
+
+  const update = (patch: Partial<PyroState>) => {
+    setPyro(p => ({ ...p, ...patch }))
+    if (patch.resolution && engineRef.current) engineRef.current.autoResolution = false
+    engineRef.current?.setState(patch)
+  }
+  const togglePause = () => {
+    setPaused(!paused)
+    engineRef.current?.setPaused(!paused)
+  }
+
+  // Stirring: a mouse or pen stirs at once; a finger must first travel sideways (a vertical swipe scrolls).
+  const drag = useRef<{ id: number; x: number; y: number; t: number; live: boolean } | null>(null)
+  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    const live = e.pointerType !== 'touch'
+    drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp, live }
+    if (live) e.currentTarget.setPointerCapture(e.pointerId)
+  }
+  const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const d = drag.current
+    if (!d || d.id !== e.pointerId) return
+    if (!d.live) {
+      const mx = Math.abs(e.clientX - d.x)
+      const my = Math.abs(e.clientY - d.y)
+      if (mx < TOUCH_SLOP && my < TOUCH_SLOP) return
+      if (my > mx) {
+        drag.current = null
+        return
+      }
+      d.live = true
+      e.currentTarget.setPointerCapture(e.pointerId)
+    }
+    const r = e.currentTarget.getBoundingClientRect()
+    const x = ((e.clientX - r.left) / r.width) * 2 - 1
+    const y = 1 - ((e.clientY - r.top) / r.height) * 2
+    engineRef.current?.stirAt(x, y, ((e.clientX - d.x) / r.width) * 2, (-(e.clientY - d.y) / r.height) * 2, e.timeStamp - d.t)
+    d.x = e.clientX
+    d.y = e.clientY
+    d.t = e.timeStamp
+  }
+  const endDrag = () => {
+    drag.current = null
+  }
+  // The arrow keys push the smoke sideways or up from the middle of the frame.
+  const onKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    const push: Record<string, [number, number]> = { ArrowLeft: [-0.05, 0], ArrowRight: [0.05, 0], ArrowUp: [0, 0.05], ArrowDown: [0, -0.05] }
+    const p = push[e.key]
+    if (!p) return
+    e.preventDefault()
+    engineRef.current?.stirAt(0, 0, p[0], p[1], 33)
+  }
+
+  const dims = status?.dims ?? RESOLUTIONS[pyro.resolution].dims
+  const inputOn = mode === 'live'
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em', marginBottom: 12 }}>Smoke, simulated live</h2>
+        <p style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.8, maxWidth: 640 }}>
+          A 3D smoke solver running on your GPU, built the way production FX tools are: buoyancy, vorticity, turbulence
+          and a pressure solve every step, lit with physically based volume rendering.
+        </p>
+      </div>
+
+      <p className="lab-howto">
+        <span className="lab-howto-pointer">Drag across the image</span>
+        <span className="lab-howto-touch">Swipe sideways on the image</span> to stir the smoke
+        <span aria-hidden="true"> · </span>
+        <span className="sr-only">. </span>Every control below is live
+      </p>
+
+      <div ref={frameRef} className="lab-frame">
+        {mode === 'fallback' ? (
+          <PyroStill alt="A column of smoke rising from a source on the floor, lit from the front left, rendered by the pyro lab's solver" />
+        ) : (
+          <canvas
+            ref={canvasRef}
+            tabIndex={0}
+            role="application"
+            aria-roledescription="smoke simulation"
+            aria-label="Live smoke simulation. Drag, or use the arrow keys, to stir the smoke."
+            className="lab-canvas"
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            onKeyDown={onKeyDown}
+          />
+        )}
+        {mode !== 'fallback' && (
+          <div className={`lab-still${shown ? ' gone' : ''}`}>
+            <PyroStill alt="" />
+          </div>
+        )}
+        <div className="lab-hud lab-hud-left">
+          {mode === 'fallback'
+            ? 'Still frame. The live solver needs WebGPU, which this browser does not offer.'
+            : mode === 'starting'
+              ? 'Starting the solver'
+              : `Smoke  ${dims.join(' × ')}`}
+        </div>
+        {mode === 'live' && status && (
+          <div className="lab-hud lab-hud-right">
+            {paused ? `Paused  ${status.simTime.toFixed(1)} s` : `${status.simTime.toFixed(1)} s  ${status.stepsPerSec} steps/s`}
+          </div>
+        )}
+        {debugOn && (
+          <div className="lab-hud lab-hud-bottom">
+            {`Renderer: ${renderer || (mode === 'fallback' ? 'none (no WebGPU)' : 'starting')}`}
+            {status && `\nRender scale ${status.renderScale.toFixed(2)}`}
+          </div>
+        )}
+      </div>
+
+      {mode !== 'fallback' && (
+        <fieldset className="lab-controls" disabled={!inputOn}>
+          <div className="lab-row">
+            <Pill on={paused} onClick={togglePause}>
+              {paused ? 'Resume' : 'Pause'}
+            </Pill>
+            <Pill on={false} onClick={() => engineRef.current?.restart()}>
+              Restart
+            </Pill>
+            <Pill
+              on={false}
+              onClick={() => {
+                setPyro(PYRO_DEFAULTS)
+                engineRef.current?.setState(PYRO_DEFAULTS)
+              }}
+            >
+              Reset controls
+            </Pill>
+          </div>
+          <Tabs id={tabsId} label="Pyro controls" tabs={PYRO_TABS} tab={tab} onTab={setTab} />
+          <div className="lab-panel" role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`}>
+            {tab === 'source' && (
+              <>
+                <div className="lab-row">
+                  <Slider label="Radius" min={0.08} max={0.4} step={0.01} value={pyro.srcRadius} unit=" m" onChange={v => update({ srcRadius: v })} />
+                  <Slider label="Density" min={0.2} max={2} step={0.05} value={pyro.srcDensity} onChange={v => update({ srcDensity: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Temperature" min={0.2} max={2} step={0.05} value={pyro.srcTemp} onChange={v => update({ srcTemp: v })} />
+                  <Slider label="Speed" min={0} max={2} step={0.05} value={pyro.srcSpeed} unit=" m/s" onChange={v => update({ srcSpeed: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Noise" min={0} max={1} step={0.05} value={pyro.srcNoise} onChange={v => update({ srcNoise: v })} />
+                </div>
+              </>
+            )}
+            {tab === 'forces' && (
+              <>
+                <div className="lab-row">
+                  <Slider label="Buoyancy" min={0} max={5} step={0.1} value={pyro.buoyancy} digits={1} onChange={v => update({ buoyancy: v })} />
+                  <Slider label="Vorticity" min={0} max={1} step={0.01} value={pyro.vorticity} onChange={v => update({ vorticity: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Turbulence" min={0} max={3} step={0.05} value={pyro.turbulence} onChange={v => update({ turbulence: v })} />
+                  <Slider label="Turbulence scale" min={0.1} max={1} step={0.01} value={pyro.turbScale} unit=" m" onChange={v => update({ turbScale: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Wind" min={-2} max={2} step={0.05} value={pyro.wind} unit=" m/s" onChange={v => update({ wind: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Cooling" min={0} max={2} step={0.05} value={pyro.cooling} unit=" /s" onChange={v => update({ cooling: v })} />
+                  <Slider label="Dissipation" min={0} max={0.5} step={0.01} value={pyro.dissipation} unit=" /s" onChange={v => update({ dissipation: v })} />
+                </div>
+              </>
+            )}
+            {tab === 'shading' && (
+              <>
+                <div className="lab-row">
+                  <Slider label="Smoke density" min={2} max={60} step={1} value={pyro.densityScale} digits={0} unit=" /m" onChange={v => update({ densityScale: v })} />
+                  <Slider label="Albedo" min={0.1} max={1} step={0.01} value={pyro.albedo} onChange={v => update({ albedo: v })} />
+                  <Slider label="Anisotropy" min={-0.5} max={0.9} step={0.01} value={pyro.anisotropy} onChange={v => update({ anisotropy: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Light azimuth" min={-180} max={180} step={1} value={pyro.lightAz} digits={0} unit={'°'} onChange={v => update({ lightAz: v })} />
+                  <Slider label="Light elevation" min={5} max={85} step={1} value={pyro.lightEl} digits={0} unit={'°'} onChange={v => update({ lightEl: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Sun" min={0} max={8} step={0.1} value={pyro.sunIntensity} digits={1} onChange={v => update({ sunIntensity: v })} />
+                  <Slider label="Sky" min={0} max={2} step={0.05} value={pyro.skyIntensity} onChange={v => update({ skyIntensity: v })} />
+                  <Slider label="Exposure" min={-3} max={3} step={0.1} value={pyro.exposure} digits={1} unit=" EV" onChange={v => update({ exposure: v })} />
+                </div>
+                <p className="lab-note">Pause the simulation to relight a frozen frame: shading changes redraw at once.</p>
+              </>
+            )}
+            {tab === 'solver' && (
+              <>
+                <div className="lab-row">
+                  <Group label="Resolution">
+                    {RESOLUTION_ORDER.map(r => (
+                      <Pill key={r} on={pyro.resolution === r} onClick={() => update({ resolution: r })}>
+                        {`${RESOLUTIONS[r].label} ${RESOLUTIONS[r].dims.join('×')}`}
+                      </Pill>
+                    ))}
+                  </Group>
+                </div>
+                <div className="lab-row">
+                  <Group label="Advection">
+                    <Pill on={pyro.advection === 'mac'} onClick={() => update({ advection: 'mac' })}>
+                      Modified MacCormack
+                    </Pill>
+                    <Pill on={pyro.advection === 'sl'} onClick={() => update({ advection: 'sl' })}>
+                      Semi-Lagrangian
+                    </Pill>
+                  </Group>
+                </div>
+                <div className="lab-row">
+                  <Slider label="Pressure iterations" min={5} max={120} step={5} value={pyro.pressureIters} digits={0} onChange={v => update({ pressureIters: v })} />
+                </div>
+                <p className="lab-note">A new resolution restarts the simulation.</p>
+              </>
+            )}
+          </div>
+        </fieldset>
+      )}
+
+      <details className="lab-tech">
+        <summary>Technical notes and references</summary>
+        <div className="lab-tech-body">
+          <dl className="lab-tech-notes">
+            {TECH_NOTES.map(([term, text]) => (
+              <div key={term}>
+                <dt>{term}</dt>
+                <dd>{text}</dd>
+              </div>
+            ))}
+          </dl>
+          <div className="lab-refs">
+            {PYRO_CITATION_GROUPS.map(g => (
+              <div key={g} className="lab-refs-group">
+                <h3>{g}</h3>
+                <ol>
+                  {PYRO_CITATIONS.filter(c => c.group === g).map(c => (
+                    <li key={c.id}>
+                      {citeAuthors(c)} ({c.year}).{' '}
+                      <a href={c.url} target="_blank" rel="noopener noreferrer">
+                        {c.title}
+                      </a>
+                      . <span className="lab-refs-venue">{c.venue}.</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ))}
+          </div>
+        </div>
+      </details>
+    </div>
+  )
+}

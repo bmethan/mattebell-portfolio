@@ -356,7 +356,7 @@ export const CITATIONS: Citation[] = [
 ]
 
 // "Wald", "Aila and Laine", "Schied et al." from the full author list.
-export function citeAuthors(c: Citation) {
+export function citeAuthors(c: Pick<Citation, 'by' | 'authors'>) {
   if (c.by) return c.by
   const surname = (name: string) => name.trim().split(/\s+/).pop() ?? name
   const names = c.authors.split(',').map(a => a.trim()).filter(Boolean)

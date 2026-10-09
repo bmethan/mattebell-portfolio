@@ -20,6 +20,7 @@ import { MODELS, MODEL_ORDER, type Model } from './lookdev/models'
 import { CITATIONS, CITATION_GROUPS, citeAuthors } from './lookdev/citations'
 import { ENVIRONMENTS, ENV_ORDER, type Env } from './lookdev/environments'
 import WorkIndicator from './WorkIndicator'
+import { Group, Pill, Range } from './lab/ui'
 
 // The renderer: WebGPU where the browser has it (compute shaders, compiled in the background), WebGL otherwise.
 // ?renderer=webgl forces the WebGL one (for comparing the two).
@@ -70,48 +71,6 @@ const deg = (r: number) => Math.round((r * 180) / Math.PI)
 const clock = (ms: number) => {
   const s = Math.floor(ms / 1000)
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
-}
-
-// A slider on the skill meters' track: --pct drives the teal fill (see .lab-range).
-function Range({
-  min,
-  max,
-  step,
-  value,
-  label,
-  onChange,
-  disabled,
-}: {
-  min: number
-  max: number
-  step: number
-  value: number
-  label: string
-  onChange: (v: number) => void
-  disabled?: boolean
-}) {
-  return (
-    <input
-      type="range"
-      className="lab-range"
-      disabled={disabled}
-      min={min}
-      max={max}
-      step={step}
-      value={value}
-      aria-label={label}
-      style={{ '--pct': `${((value - min) / (max - min)) * 100}%` } as React.CSSProperties}
-      onChange={e => onChange(+e.target.value)}
-    />
-  )
-}
-
-function Pill({ on, onClick, children }: { on: boolean; onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button type="button" className={`lab-pill${on ? ' on' : ''}`} aria-pressed={on} onClick={onClick}>
-      {children}
-    </button>
-  )
 }
 
 // The renderer's own 2048 spp image of the default settings, one per frame shape (the frame is 4:3 on narrow
@@ -369,20 +328,8 @@ function LightMixer({ lab, update }: { lab: LabState; update: (patch: Partial<La
   )
 }
 
-function Group({ label, children }: { label: string; children: React.ReactNode }) {
-  const id = useId()
-  return (
-    <div className="lab-group" role="group" aria-labelledby={id}>
-      <span id={id} className="lab-label">
-        {label}
-      </span>
-      {children}
-    </div>
-  )
-}
-
 export default function LookdevLab() {
-  const sectionRef = useRef<HTMLElement>(null)
+  const sectionRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
@@ -810,13 +757,9 @@ export default function LookdevLab() {
   const ballNames = ['18% gray', 'Chrome', model ? `${model.label}, ${heroName.toLowerCase()}` : heroName, 'Color chart']
 
   return (
-    <section ref={sectionRef} id="lab" className="section-pad" style={{ borderBottom: '0.5px solid var(--border)' }}>
+    // The section and its Lookdev / Pyro switch are the Lab's (see Lab.tsx).
+    <div ref={sectionRef}>
       <div style={{ marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>
-          <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
-          Lookdev lab
-          <span style={{ display: 'inline-block', width: 16, height: 1, background: 'var(--accent)' }} />
-        </div>
         <h2 style={{ fontSize: 26, fontWeight: 500, color: 'var(--text-bright)', letterSpacing: '-0.01em', marginBottom: 12 }}>
           Light, rendered live
         </h2>
@@ -1324,6 +1267,6 @@ export default function LookdevLab() {
           </div>
         </div>
       </details>
-    </section>
+    </div>
   )
 }

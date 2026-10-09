@@ -283,7 +283,7 @@ export class PyroEngine {
   private renderFrame = 0
   // The collision ball: its centre and velocity (from the visitor's drags, easing to rest), and its uniform for the
   // pressure solve's levels.
-  private ballPos: Vec3 = [0.85, 0.55, 0]
+  private ballPos: Vec3 = [0.55, 0.7, 0]
   private ballVel: Vec3 = [0, 0, 0]
   private ballDragAt = 0
   private ballBuf: GPUBuffer

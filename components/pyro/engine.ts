@@ -5,6 +5,7 @@ import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, RESOLVE, UPRES
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
+import { writeVdb, type VdbGrid } from './vdb'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 
 export const SIM_DT = 1 / 30
@@ -1471,7 +1472,50 @@ export class PyroEngine {
         }
     read.unmap()
     read.destroy()
-    return { n: sc.n, dx: sc.dx, origin: [(-nx * sc.dx) / 2, 0, (-nz * sc.dx) / 2], time: sc.t, fire, density, temperature, fuel, heat, vel }
+    const dx = sc.dx
+    return { n: sc.n, dx, origin: [(-nx * dx) / 2 + dx / 2, dx / 2, (-nz * dx) / 2 + dx / 2], time: sc.t, fire, density, temperature, fuel, heat, vel }
+  }
+
+  // The simulation at this moment as an OpenVDB file (vdb.ts), y up, in metres: density (the extinction at 550 nm,
+  // 1/m, a fog volume), temperature (K), vel (m/s) and, for a fire, fuel (the unburned fuel's mass fraction) and
+  // heat_release (W/m3). Every grid stores the voxels where there is smoke, heat or fuel.
+  async vdbFrame(): Promise<Uint8Array<ArrayBuffer> | null> {
+    const f = await this.readFields()
+    if (!f) return null
+    const active = new Uint8Array(f.density.length)
+    for (let i = 0; i < active.length; i++)
+      active[i] = f.density[i] > 1e-4 || Math.abs(f.temperature[i] - T_AMBIENT) > 1 || (f.fuel !== null && f.fuel[i] > 1e-4) ? 1 : 0
+    const grids: VdbGrid[] = [
+      { name: 'density', data: f.density, fogVolume: true },
+      { name: 'temperature', data: f.temperature, background: T_AMBIENT },
+      { name: 'vel', data: f.vel, vector: true },
+    ]
+    if (f.fuel) grids.push({ name: 'fuel', data: f.fuel })
+    if (f.heat) grids.push({ name: 'heat_release', data: f.heat })
+    return writeVdb({ n: f.n, voxelSize: f.dx, origin: f.origin, active, grids, creator: 'mattebell.xyz pyro lab' })
+  }
+
+  // A run of frames as OpenVDB files, one per simulation step (1/30 s), each handed on as it is made. The simulation
+  // holds still while each frame is read back, then carries on as it was. Stops early if cancelled; returns the
+  // number of frames made.
+  async vdbSequence(frames: number, onFrame: (file: Uint8Array<ArrayBuffer>, index: number) => void, cancelled?: () => boolean): Promise<number> {
+    const paused = this.paused
+    this.paused = true
+    let made = 0
+    try {
+      for (let i = 0; i < frames && !cancelled?.(); i++) {
+        if (i > 0) await this.advance(1)
+        const file = await this.vdbFrame()
+        if (!file) break
+        onFrame(file, i)
+        made++
+      }
+    } finally {
+      this.paused = paused
+      this.acc = 0
+      this.kick()
+    }
+    return made
   }
 
   async probeColumn(): Promise<number[][] | null> {

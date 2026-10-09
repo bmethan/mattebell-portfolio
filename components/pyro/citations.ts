@@ -54,6 +54,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1007/s10915-007-9166-4',
   },
   {
+    id: 'conservative-sl',
+    group: 'Solver',
+    authors: 'Michael Lentine, Jón Tómas Grétarsson, Ronald Fedkiw',
+    title: 'An Unconditionally Stable Fully Conservative Semi-Lagrangian Method',
+    venue: 'Journal of Computational Physics 230(8)',
+    year: '2011',
+    url: 'https://doi.org/10.1016/j.jcp.2010.12.036',
+  },
+  {
     id: 'advection-reflection',
     group: 'Solver',
     authors: 'Jonas Zehnder, Rahul Narain, Bernhard Thomaszewski',

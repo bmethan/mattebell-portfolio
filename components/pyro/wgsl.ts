@@ -923,9 +923,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // products, loses mass (a quarter to a third of the fire's, measured). So first every cell's backtrace scatters its
 // trilinear weights onto the cells it samples, and each cell learns over how much volume its gas was spread (in
 // cells); then each cell gets the ratio of the room its gas should fill (1 + e dt, e its expansion) to that, and the
-// advection scales what it takes from the cell by it: Lentine, Aanjaneya and Fedkiw's mass-conserving
-// semi-Lagrangian advection. (Correcting only the expanding cells is not enough: the cells around them, sampled
-// more to fill the gap, then gain what the hot gas lost.) The fields are all per unit volume: masses, and the density deficit, which is the
+// advection scales what it takes from the cell by it. This follows the conservative semi-Lagrangian method of
+// Lentine, Gretarsson and Fedkiw (2011), which measures the same per-cell sums but only scales over-drawn cells down
+// (to 1, its gas incompressible in conserved form) and traces the undrawn rest of a cell forward; here both ways
+// are a scale, toward a room that includes the expansion. (Correcting only the expanding cells is not enough: the
+// cells around them, sampled more to fill the gap, then gain what the hot gas lost.) The fields are all per unit volume: masses, and the density deficit, which is the
 // gas's heat (rho (T - T0) = rho0 T0 times the deficit), so the fire keeps its fuel, its products and its heat.
 export const CONSERVE_SPREAD = /* wgsl */ `
 ${SIM_COMMON}

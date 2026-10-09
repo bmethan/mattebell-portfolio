@@ -4,6 +4,7 @@
 // at once (choosing it is the visitor's go-ahead).
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { PyroEngine, type PyroStatus } from './pyro/engine'
+import { ZipStore } from './pyro/vdb'
 import { PRESETS, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, SOURCE_LOOKS, type PyroState, type SourceType } from './pyro/params'
 import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
 import { citeAuthors } from './lookdev/citations'
@@ -44,7 +45,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Mixing',
-    'Three corrections make a coarse grid mix the way gas does. A fire’s fields are kept per unit volume (the density deficit and partial densities) rather than as a temperature and mass fractions, because the solver mixes by volume and gas mixes by mass: equal volumes of 1300 K gas and 293 K air make 478 K, not the 796 K an average of temperatures gives. Without this the plume stayed three times too hot. And mixing finer than the grid, as large-eddy simulations model it: Smagorinsky’s eddy diffusivity over a turbulent Schmidt number (0.2 and 0.5, FDS’s values), on the scalars. And mass: semi-Lagrangian advection carries values along the flow, not masses, and where burning gas swells to several times its volume in a step it made too little room for it, so a quarter to a third of the fire’s products and heat, and a tenth of its fuel, simply vanished. A pass before the advection measures how widely each cell’s gas was spread and scales it to the room it should fill (Lentine, Aanjaneya and Fedkiw’s mass-conserving semi-Lagrangian advection); MacCormack’s sharpening, which is not mass-neutral where gas expands, stands aside in those cells. The fire now releases 98 to 102% of the heat asked for.',
+    'Three corrections make a coarse grid mix the way gas does. A fire’s fields are kept per unit volume (the density deficit and partial densities) rather than as a temperature and mass fractions, because the solver mixes by volume and gas mixes by mass: equal volumes of 1300 K gas and 293 K air make 478 K, not the 796 K an average of temperatures gives. Without this the plume stayed three times too hot. And mixing finer than the grid, as large-eddy simulations model it: Smagorinsky’s eddy diffusivity over a turbulent Schmidt number (0.2 and 0.5, FDS’s values), on the scalars. And mass: semi-Lagrangian advection carries values along the flow, not masses, and where burning gas swells to several times its volume in a step it made too little room for it, so a quarter to a third of the fire’s products and heat, and a tenth of its fuel, simply vanished. A pass before the advection measures how widely each cell’s gas was spread and scales it to the room it should fill, after Lentine, Grétarsson and Fedkiw’s conservative semi-Lagrangian method (which scales over-drawn cells down and traces the undrawn rest of a cell forward; here both are a scale, toward a room that includes the expansion); MacCormack’s sharpening, which is not mass-neutral where gas expands, stands aside in those cells. The fire now releases 98 to 102% of the heat asked for.',
   ],
   [
     'Flames',
@@ -70,6 +71,10 @@ const TECH_NOTES: [string, string][] = [
   [
     'Camera',
     'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then ACES filmic tone mapping through a fitted curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze.',
+  ],
+  [
+    'Export',
+    'The Solver tab writes the simulation as OpenVDB, the volume format of film effects work, so a frame or a two-second sequence can be rendered in Houdini, Blender or any other program that reads it. The writer is the lab’s own, a few hundred lines: each grid a standard OpenVDB tree (a root, internal nodes of 32³ and 16³ children, leaves of 8³ voxels), with only the leaves that hold smoke, heat or fuel written, and values as 32-bit floats with OpenVDB’s active-mask compression. Every grid reads back bit for bit in OpenVDB 13, the version Blender 5.2 bundles, and the frames render in Blender’s Cycles.',
   ],
   [
     'Validation',
@@ -133,6 +138,9 @@ export default function PyroLab() {
   const [mode, setMode] = useState<'starting' | 'live' | 'fallback'>(() => (PyroEngine.detect() ? 'starting' : 'fallback'))
   const [paused, setPaused] = useState(false)
   const [tab, setTab] = useState<PyroTab>('source')
+  // VDB export: frames written so far while a sequence records (null when idle).
+  const [exporting, setExporting] = useState<{ done: number; of: number } | null>(null)
+  const exportCancel = useRef(false)
   // What a drag on the image does: stir the gas, move the source along the floor, or move the collision ball.
   const [tool, setTool] = useState<'stir' | 'source' | 'ball'>('stir')
   const [renderer, setRenderer] = useState('')
@@ -222,6 +230,43 @@ export default function PyroLab() {
   }, [])
 
   // A new source brings the look it reads best with (see SOURCE_LOOKS).
+  const saveFile = (blob: Blob, name: string) => {
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 10000)
+  }
+  const exportVdb = async (frames: number) => {
+    const engine = engineRef.current
+    if (!engine || exporting) return
+    const d = new Date()
+    const two = (v: number) => String(v).padStart(2, '0')
+    const stamp = `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`
+    const name = `pyro-${pyro.sourceType}-${stamp}`
+    setExporting({ done: 0, of: frames })
+    exportCancel.current = false
+    try {
+      if (frames === 1) {
+        const file = await engine.vdbFrame()
+        if (file) saveFile(new Blob([file], { type: 'application/octet-stream' }), `${name}.vdb`)
+      } else {
+        const zip = new ZipStore()
+        const made = await engine.vdbSequence(
+          frames,
+          (file, i) => {
+            zip.add(`${name}/${name}.${String(i + 1).padStart(4, '0')}.vdb`, file)
+            setExporting({ done: i + 1, of: frames })
+          },
+          () => exportCancel.current,
+        )
+        if (made) saveFile(zip.finish(), `${name}.zip`)
+      }
+    } finally {
+      setExporting(null)
+    }
+  }
   const applyPreset = (state: Partial<PyroState>) => {
     update(state)
     engineRef.current?.restart()
@@ -642,6 +687,24 @@ export default function PyroLab() {
                   )}
                 </div>
                 <p className="lab-note">A new resolution restarts the simulation.</p>
+                <div className="lab-row">
+                  <Group label="Export to VDB">
+                    <Pill on={false} onClick={() => void exportVdb(1)}>
+                      This frame
+                    </Pill>
+                    <Pill on={false} onClick={() => void exportVdb(60)}>
+                      Next 2 seconds
+                    </Pill>
+                    {exporting && exporting.of > 1 && (
+                      <Pill on={false} onClick={() => (exportCancel.current = true)}>
+                        {`Stop (${exporting.done} of ${exporting.of})`}
+                      </Pill>
+                    )}
+                  </Group>
+                </div>
+                <p className="lab-note">
+                  OpenVDB, y up, in metres: density (extinction, 1/m), temperature (K) and vel (m/s), and for a fire its unburned fuel and heat release. Two seconds is 60 frames in a zip, 2 to 5 MB each. In Blender, turn the volume 90° about x, and set Principled Volume’s Density and Temperature to 1 so the grids read in their own units.
+                </p>
               </>
             )}
           </div>

@@ -712,6 +712,16 @@ export default function PyroLab() {
                   </Group>
                 </div>
                 <div className="lab-row">
+                  <Group label="Lost vorticity">
+                    <Pill on={pyro.ivock} onClick={() => update({ ivock: true })}>
+                      IVOCK, for smoke
+                    </Pill>
+                    <Pill on={!pyro.ivock} onClick={() => update({ ivock: false })}>
+                      Off
+                    </Pill>
+                  </Group>
+                </div>
+                <div className="lab-row">
                   <Group label="Scalars">
                     <Pill on={pyro.advection === 'mac'} onClick={() => update({ advection: 'mac' })}>
                       Modified MacCormack

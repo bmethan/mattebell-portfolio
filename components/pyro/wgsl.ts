@@ -20,7 +20,7 @@ export const SKIN_H = 64
 export const SIM_COMMON = /* wgsl */ `
 struct Params {
   dims: vec4<u32>,      // nx, ny, nz, frame
-  grid: vec4<f32>,      // dx (m), dt (s), time (s), unused
+  grid: vec4<f32>,      // dx (m), dt (s), time (s), whether the velocity is advected with MacCormack (0 or 1)
   src: vec4<f32>,       // source centre (m), radius (m)
   srcProps: vec4<f32>,  // smoke density, smoke temperature rise (K), upward speed (m/s), noise (0..1)
   forces: vec4<f32>,    // buoyancy (m/s2 per K of temperature rise), unused, vorticity, turbulence (m/s2)
@@ -28,7 +28,7 @@ struct Params {
   decay: vec4<f32>,     // cooling (1/s), dissipation (1/s), SOR relaxation, speed limit (m/s)
   stirO: vec4<f32>,     // stir centre (m), radius (m)
   stirD: vec4<f32>,     // stir velocity change (m/s), on (0 or 1)
-  stirR: vec4<f32>,     // unused xyz, MacCormack on (0 or 1)
+  stirR: vec4<f32>,     // unused xy, IVOCK and its eddy viscosity on (0 or 1), the scalars' MacCormack on (0 or 1)
   origin: vec4<f32>,    // domain min corner (m)
   detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B
   fire: vec4<f32>,      // source is a fire bed (0 or 1), fuel it gives off (kg/s), soot yield (kg/kg), radiant fraction
@@ -373,11 +373,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
-// 2. Vorticity at cell centres (from cell-centred velocity, central differences), and its magnitude.
+// 2. Vorticity at cell centres (from cell-centred velocity, central differences), and its magnitude. And, when IVOCK
+// runs, the momentum's subgrid viscosity: Smagorinsky's eddy viscosity (C_s dx)^2 |S|, as FDS uses for momentum, kept
+// as the explicit diffusion step's weight nu dt / dx^2 (at most 0.15, inside its stability limit). Without IVOCK the
+// solver's own numerical dissipation plays that part; IVOCK takes the numerical dissipation away, and a fire's plume
+// then piled energy into the smallest eddies until it ran away.
 export const CURL = /* wgsl */ `
 ${SIM_COMMON}
 @group(0) @binding(1) var vel: texture_3d<f32>;
 @group(0) @binding(2) var curlOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(3) var nutOut: texture_storage_3d<rgba16float, write>;
 
 fn vc(c0: vec3<i32>) -> vec3<f32> {
   let c = clamp(c0, vec3<i32>(0), nCells() - 1);
@@ -394,6 +399,204 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let dz = vc(c + Z) - vc(c - Z);
   let w = vec3<f32>(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) / (2.0 * P.grid.x);
   textureStore(curlOut, c, vec4<f32>(w, length(w)));
+  var k = 0.0;
+  if (P.stirR.z > 0.5) {
+    k = min(C_S * C_S * strainRate(vel, c) * P.grid.y, 0.15);
+  }
+  textureStore(nutOut, c, vec4<f32>(k, 0.0, 0.0, 0.0));
+}
+`
+
+// 2b. IVOCK (Zhang, Bridson and Greif 2015): restoring the vorticity that advecting the velocity loses. The vorticity
+// of the step's velocity is stretched by the flow, (w . grad u) dt, taken as the velocity's difference across a
+// vortex segment one cell long, h |w| / h (the paper's form), and for a fire scaled by exp(-div u dt), as burning gas
+// expands (its fire variant). It is then advected with the velocity's own scheme (with MacCormack's, when the velocity
+// uses it: paired with plain semi-Lagrangian vorticity, the correction ran away), and what the advected velocity's
+// curl falls short of it is the loss, dw. A vector potential with (-lap + 1 / l^2) psi = dw (three screened Poisson
+// solves, two red-black Gauss-Seidel sweeps of all three at once, warm started: the screening makes the equation
+// local, so it needs no multigrid) gives the velocity that restores it, curl psi, added before the forces and the projection. The
+// screening, l four cells, is this lab's: the loss advection causes is at small scales. Simplifications: vorticity and potential at cell centres rather than the paper's cell edges, and
+// psi = 0 past the open sides rather than its open-space values. Masked out within two cells of the floor, the open
+// sides and the collision ball, where shearing boundary layers make it unstable. Two more of this lab's: only lost
+// magnitude along the advected vorticity's own direction is restored (unrestricted, the correction fed on itself and
+// ran away), and it runs for a smoke source only: in a fire it mixed the plume far too fast (its centreline 10% of
+// McCaffrey's temperatures), most likely from the fire's strong expansion meeting this cell-centred form.
+export const VORT_BEFORE = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var dst: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let h = P.grid.x;
+  let dx = cellVel(vel, c + X) - cellVel(vel, c - X);
+  let dy = cellVel(vel, c + Y) - cellVel(vel, c - Y);
+  let dz = cellVel(vel, c + Z) - cellVel(vel, c - Z);
+  var w = vec3<f32>(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) / (2.0 * h);
+  let mag = length(w);
+  if (mag > 1e-6) {
+    let g = vec3<f32>(id) + 0.5;
+    let half = 0.5 * w / mag;
+    let du = velAt(vel, samp, g + half) - velAt(vel, samp, g - half);
+    w += P.grid.y * mag * du / h;
+  }
+  if (P.fire.x > 0.5) {
+    let a = textureLoad(vel, c, 0);
+    let div = (textureLoad(vel, c + X, 0).x - a.x + textureLoad(vel, c + Y, 0).y - a.y + textureLoad(vel, c + Z, 0).z - a.z) / h;
+    // (Only expansion: a pressure solve's leftover convergence would otherwise grow it exponentially.)
+    w *= exp(-clamp(div * P.grid.y, 0.0, 5.0));
+  }
+  textureStore(dst, c, vec4<f32>(w, 0.0));
+}
+`
+
+export const IVOCK_TARGET = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var velOld: texture_3d<f32>; // the step's velocity, before advection
+@group(0) @binding(3) var velAdv: texture_3d<f32>; // the advected velocity
+@group(0) @binding(4) var<storage, read_write> rhs: array<vec4<f32>>;
+@group(0) @binding(7) var vort0: texture_3d<f32>; // the stretched vorticity, before advection
+@group(0) @binding(8) var vort1: texture_3d<f32>; // advected forward
+@group(0) @binding(9) var vort2: texture_3d<f32>; // and back (MacCormack's round trip)
+
+fn ivockMask(c: vec3<i32>) -> f32 {
+  let n = nCells();
+  // Cells from the floor, and from the nearest open side or the top: the correction fades in from 2 to 6 of them.
+  let side = f32(min(min(min(c.x, n.x - 1 - c.x), min(c.z, n.z - 1 - c.z)), n.y - 1 - c.y));
+  var m = smoothstep(2.0, 6.0, side) * smoothstep(1.0, 3.0, f32(c.y));
+  if (P.ball.w > 0.0) {
+    let gap = distance(worldOf(vec3<f32>(c) + 0.5), P.ball.xyz) - P.ball.w;
+    m *= smoothstep(1.0, 2.5, gap / P.grid.x);
+  }
+  return m;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  let n = nCells();
+  if (any(c >= n)) { return; }
+  let i = cellIndex(c);
+  // The vorticity advected: semi-Lagrangian, or with MacCormack's correction clamped to the values it interpolated.
+  var w = textureLoad(vort1, c, 0).xyz;
+  if (P.grid.w > 0.5) {
+    let g = backtrace(velOld, samp, vec3<f32>(id) + 0.5, 1.0);
+    if (inDomain(g)) {
+      let b = vec3<i32>(floor(clamp(g - 0.5, vec3<f32>(0.0), vec3<f32>(n - 1))));
+      var lo = vec3<f32>(1e9);
+      var hi = vec3<f32>(-1e9);
+      for (var k = 0; k < 8; k++) {
+        let q = textureLoad(vort0, min(b + vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1), n - 1), 0).xyz;
+        lo = min(lo, q);
+        hi = max(hi, q);
+      }
+      w = clamp(w + 0.5 * (textureLoad(vort0, c, 0).xyz - textureLoad(vort2, c, 0).xyz), lo, hi);
+    }
+  }
+  // The advected velocity's own curl.
+  let h = 2.0 * P.grid.x;
+  let ax = cellVel(velAdv, c + X) - cellVel(velAdv, c - X);
+  let ay = cellVel(velAdv, c + Y) - cellVel(velAdv, c - Y);
+  let az = cellVel(velAdv, c + Z) - cellVel(velAdv, c - Z);
+  let have = vec3<f32>(ay.z - az.y, az.x - ax.z, ax.y - ay.x) / h;
+  // (Where burning gas expands strongly the correction is unreliable, so it fades out there.)
+  let a0 = textureLoad(velOld, c, 0);
+  let div = (textureLoad(velOld, c + X, 0).x - a0.x + textureLoad(velOld, c + Y, 0).y - a0.y + textureLoad(velOld, c + Z, 0).z - a0.z) / P.grid.x;
+  let swell = div * P.grid.y / 0.02;
+  // Only lost magnitude along the advected vorticity's own direction is restored: the correction never adds vorticity
+  // the flow did not carry, and never more than it carried.
+  let wl = length(w);
+  var dw = vec3<f32>(0.0);
+  if (wl > 1e-4) {
+    let dir = w / wl;
+    dw = dir * clamp(dot(w - have, dir), 0.0, wl) * ivockMask(c) / (1.0 + swell * swell);
+  }
+  rhs[i] = vec4<f32>(dw, 0.0);
+}
+`
+
+// The potentials' screened Poisson equation, (n + h^2 / l^2) psi - sum of neighbours = h^2 dw, all three components in
+// one red-black Gauss-Seidel sweep: psi = 0 past the open sides and the top, nothing below the floor or inside the
+// collision ball (as the pressure's).
+export const IVOCK_SMOOTH = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var<uniform> S: vec4<u32>; // x: the colour updated in this pass
+@group(0) @binding(2) var<storage, read> rhs: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> psi: array<vec4<f32>>;
+const SCREEN = ${wf(1 / 16)}; // (h / l)^2, l = 4 cells
+
+fn psiAt(i: i32) -> vec3<f32> { return psi[i].xyz; }
+
+@compute @workgroup_size(16, 4, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = nCells();
+  let c = vec3<i32>(i32(2u * id.x + ((id.y + id.z + S.x) & 1u)), i32(id.y), i32(id.z));
+  if (any(c >= n)) { return; }
+  let i = i32(cellIndex(c));
+  if (cellSolid(c)) {
+    psi[i] = vec4<f32>(0.0);
+    return;
+  }
+  let sy = n.x;
+  let sz = n.x * n.y;
+  var sum = vec3<f32>(0.0);
+  var cnt = SCREEN;
+  if (c.x > 0) { if (!cellSolid(c - X)) { sum += psiAt(i - 1); cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.x < n.x - 1) { if (!cellSolid(c + X)) { sum += psiAt(i + 1); cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z > 0) { if (!cellSolid(c - Z)) { sum += psiAt(i - sz); cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.z < n.z - 1) { if (!cellSolid(c + Z)) { sum += psiAt(i + sz); cnt += 1.0; } } else { cnt += 1.0; }
+  if (c.y > 0 && !cellSolid(c - Y)) { sum += psiAt(i - sy); cnt += 1.0; }
+  if (c.y < n.y - 1) { if (!cellSolid(c + Y)) { sum += psiAt(i + sy); cnt += 1.0; } } else { cnt += 1.0; }
+  let h2 = P.grid.x * P.grid.x;
+  psi[i] = vec4<f32>((sum + rhs[i].xyz * h2) / cnt, 0.0);
+}
+`
+
+// The correction, curl psi, at each cell centre (central differences; psi = 0 past the domain), then on each face
+// the mean of the two cells it divides, added to the advected velocity. The domain's own boundary faces are left alone.
+export const IVOCK_CURL = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var<storage, read> psi: array<vec4<f32>>;
+@group(0) @binding(4) var dst: texture_storage_3d<rgba16float, write>;
+
+fn psiAt(c: vec3<i32>) -> vec3<f32> {
+  if (any(c < vec3<i32>(0)) || any(c >= nCells())) { return vec3<f32>(0.0); }
+  return psi[cellIndex(c)].xyz;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let h = 2.0 * P.grid.x;
+  let gx = (psiAt(c + X) - psiAt(c - X)) / h;
+  let gy = (psiAt(c + Y) - psiAt(c - Y)) / h;
+  let gz = (psiAt(c + Z) - psiAt(c - Z)) / h;
+  textureStore(dst, c, vec4<f32>(gy.z - gz.y, gz.x - gx.z, gx.y - gy.x, 0.0));
+}
+`
+
+export const IVOCK_APPLY = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var velAdv: texture_3d<f32>;
+@group(0) @binding(2) var curlPsi: texture_3d<f32>;
+@group(0) @binding(3) var dst: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = nCells();
+  let f = vec3<i32>(id);
+  if (any(f > n)) { return; }
+  var u = textureLoad(velAdv, f, 0);
+  // Face f.x sits between cells f - X and f along x; likewise y and z.
+  if (f.x > 0 && f.x < n.x && f.y < n.y && f.z < n.z) { u.x += 0.5 * (textureLoad(curlPsi, f - X, 0).x + textureLoad(curlPsi, f, 0).x); }
+  if (f.y > 0 && f.y < n.y && f.x < n.x && f.z < n.z) { u.y += 0.5 * (textureLoad(curlPsi, f - Y, 0).y + textureLoad(curlPsi, f, 0).y); }
+  if (f.z > 0 && f.z < n.z && f.x < n.x && f.y < n.y) { u.z += 0.5 * (textureLoad(curlPsi, f - Z, 0).z + textureLoad(curlPsi, f, 0).z); }
+  textureStore(dst, f, u);
 }
 `
 
@@ -406,6 +609,7 @@ ${SIM_COMMON}
 @group(0) @binding(2) var scal: texture_3d<f32>;
 @group(0) @binding(3) var curlT: texture_3d<f32>;
 @group(0) @binding(4) var velOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(5) var nutT: texture_3d<f32>;
 
 const WIND_DRAG = 0.4; // 1/s: how quickly the air takes up the wind
 
@@ -456,6 +660,17 @@ fn turbMask(a: vec4<f32>, b: vec4<f32>) -> f32 {
   return clamp(select(3.0 * s.x, riseOf(s) / 300.0, P.fire.x > 0.5), 0.0, 1.0);
 }
 
+// The eddy viscosity's step at a face: its weight (the two cells' mean) times the face lattice's Laplacian of each
+// component (each component on its own lattice; past the lattice's edge, its value at the edge).
+fn nutAt(c: vec3<i32>) -> f32 { return textureLoad(nutT, clamp(c, vec3<i32>(0), nCells() - 1), 0).x; }
+fn faceVel(c: vec3<i32>) -> vec3<f32> { return textureLoad(velIn, clamp(c, vec3<i32>(0), vec3<i32>(P.dims.xyz)), 0).xyz; }
+fn eddyDiffusion(c: vec3<i32>) -> vec3<f32> {
+  let u = faceVel(c);
+  let lap = faceVel(c + X) + faceVel(c - X) + faceVel(c + Y) + faceVel(c - Y) + faceVel(c + Z) + faceVel(c - Z) - 6.0 * u;
+  let k = vec3<f32>(0.5 * (nutAt(c - X) + nutAt(c)), 0.5 * (nutAt(c - Y) + nutAt(c)), 0.5 * (nutAt(c - Z) + nutAt(c)));
+  return k * lap;
+}
+
 // The stir: a velocity change along the visitor's drag, falling off from where the pointer's ray passes the plume.
 fn stir(w: vec3<f32>) -> vec3<f32> {
   if (P.stirD.w <= 0.0) { return vec3<f32>(0.0); }
@@ -475,6 +690,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let keep = exp(-P.forces2.w * dt);
   let windT = 1.0 - exp(-WIND_DRAG * dt);
   var v = textureLoad(velIn, c, 0).xyz;
+  // The momentum's eddy viscosity (2), when IVOCK runs: an explicit diffusion of each face's velocity.
+  if (P.stirR.z > 0.5) { v += eddyDiffusion(c); }
 
   if (id.y < n.y && id.z < n.z) {
     let w = worldOf(vec3<f32>(f.x, f.y + 0.5, f.z + 0.5));

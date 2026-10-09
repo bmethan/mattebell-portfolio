@@ -25,6 +25,7 @@ export interface PyroState {
   velocity: VelocityScheme // advection-reflection, Modified MacCormack or semi-Lagrangian
   pressure: PressureSolver
   vcycles: number // multigrid V-cycles per step
+  ivock: boolean // restore the vorticity advection loses (IVOCK)
   pressureIters: number // red-black SOR sweeps per step
   // Source
   sourceType: SourceType
@@ -79,6 +80,7 @@ export const PYRO_DEFAULTS: PyroState = {
   velocity: 'mac',
   pressure: 'mg',
   vcycles: 2,
+  ivock: true,
   pressureIters: 40,
   sourceType: 'fire',
   srcRadius: 0.4,

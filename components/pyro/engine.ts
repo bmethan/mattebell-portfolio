@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -17,6 +17,8 @@ const SOR_OMEGA = 1.7
 const MG_PRE = 2
 const MG_POST = 2
 const MG_COARSE = 16
+// Red-black sweeps per step for each of its potentials (warm started).
+const IVOCK_SWEEPS = 2
 const MG_COARSE_OMEGA = 1.6
 const SPEED_LIMIT = 8 // m/s
 const FOV_Y = (32 * Math.PI) / 180
@@ -115,6 +117,11 @@ interface Pipes {
   conserveSpread: GPUComputePipeline
   conserveRatio: GPUComputePipeline
   ballHeat: GPUComputePipeline
+  vortBefore: GPUComputePipeline
+  ivockTarget: GPUComputePipeline
+  ivockCurl: GPUComputePipeline
+  ivockSmooth: GPUComputePipeline
+  ivockApply: GPUComputePipeline
   diffuse: GPUComputePipeline
   light: GPUComputePipeline
   render: GPURenderPipeline
@@ -145,6 +152,8 @@ interface Grids {
   skin: GPUBuffer // the wooden ball's skin (SKIN_W x SKIN_H texels, four floats each), and its next step
   skinNext: GPUBuffer
   flame: GPUTexture // a fire's heat release rate per cell (MW/m3), for the renderer
+  // IVOCK: the three components of the vector potential, each with its own finest multigrid level.
+  ivockRhs: GPUBuffer // its right-hand side, the vorticity lost, four floats a cell (readable for development checks)
   detA: [GPUTexture, GPUTexture]
   detB: [GPUTexture, GPUTexture]
   lightDims: Vec3
@@ -168,6 +177,13 @@ interface Grids {
     conserveSpread: GPUBindGroup
     conserveRatio: GPUBindGroup
     ballHeat: GPUBindGroup
+    vortBefore: GPUBindGroup
+    vortAdvect: GPUBindGroup
+    vortBack: GPUBindGroup
+    ivockTarget: GPUBindGroup
+    ivockCurl: GPUBindGroup
+    ivockSmooth: [GPUBindGroup, GPUBindGroup]
+    ivockApply: GPUBindGroup
     diffuse: GPUBindGroup
     advDetail: GPUBindGroup
     fireSum: GPUBindGroup
@@ -201,7 +217,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, diffuse, light, upres, render, resolve] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, diffuse, light, upres, render, resolve] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -226,6 +242,11 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(CONSERVE_SPREAD),
     compute(CONSERVE_RATIO),
     compute(BALL_HEAT),
+    compute(VORT_BEFORE),
+    compute(IVOCK_TARGET),
+    compute(IVOCK_CURL),
+    compute(IVOCK_SMOOTH),
+    compute(IVOCK_APPLY),
     compute(DIFFUSE),
     compute(LIGHT),
     compute(UPRES),
@@ -242,7 +263,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, diffuse, light, upres, render, resolve }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, diffuse, light, upres, render, resolve }
 }
 
 export function prewarmPyro() {
@@ -469,11 +490,18 @@ export class PyroEngine {
         usage: T.TEXTURE_BINDING | T.STORAGE_BINDING | (copy ? T.COPY_SRC | T.COPY_DST : 0),
       })
     const velSize: Vec3 = [n[0] + 1, n[1] + 1, n[2] + 1]
-    const vel: [GPUTexture, GPUTexture, GPUTexture, GPUTexture] = [tex(velSize, true), tex(velSize, true), tex(velSize), tex(velSize, true)]
+    const vel: [GPUTexture, GPUTexture, GPUTexture, GPUTexture] = [tex(velSize, true), tex(velSize, true), tex(velSize, true), tex(velSize, true)]
     const scal = [tex(n, true), tex(n, true), tex(n), tex(n)] as [GPUTexture, GPUTexture, GPUTexture, GPUTexture]
     const detA: [GPUTexture, GPUTexture] = [tex(n, true), tex(n, true)]
     const detB: [GPUTexture, GPUTexture] = [tex(n, true), tex(n, true)]
     const curl = tex(n)
+    // IVOCK: the vorticity before advection, and advected.
+    // IVOCK's partner: the momentum's eddy viscosity, as the diffusion step's weight per cell.
+    const nut = tex(n)
+    const vortA = tex(n)
+    const vortB = tex(n)
+    const vortC = tex(n)
+    const psiCurl = tex(n)
     // A fire's heat release rate per cell (MW/m3), filterable, for rendering the flame sheets.
     const flame = tex(n)
     const lightDims: Vec3 = [Math.ceil(n[0] / 2), Math.ceil(n[1] / 2), Math.ceil(n[2] / 2)]
@@ -538,6 +566,11 @@ export class PyroEngine {
         prolongFrom: l > 0 ? group(p.mgProlong, [{ buffer: u0 }, { buffer: xs[l] }, { buffer: xs[l - 1] }]) : null,
       }
     })
+    // IVOCK's vector potential, a component at a time: its right-hand side and solution at the finest level (warm
+    // started from the last step), sharing the coarser levels with the pressure.
+    const ivockRhs = d.createBuffer({ size: cells * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    buffers.push(ivockRhs)
+    const ivockPsi = storage(cells * 4)
     // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
     const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
     const firePartial = storage(groups * 12)
@@ -568,7 +601,7 @@ export class PyroEngine {
     const s = this.sampler
     this.grids = {
       n,
-      textures: [...vel, ...scal, ...detA, ...detB, curl, light, flame],
+      textures: [...vel, ...scal, ...detA, ...detB, curl, light, flame, nut, vortA, vortB, vortC, psiCurl],
       buffers,
       levels,
       vel,
@@ -579,6 +612,7 @@ export class PyroEngine {
       skin,
       skinNext,
       flame,
+      ivockRhs,
       detA,
       detB,
       lightDims,
@@ -591,8 +625,28 @@ export class PyroEngine {
         arAdvect1: group(p.advectVelHalf, [P, s, v(vel[0]), v(vel[0]), v(vel[3])]),
         arAdvect2: group(p.advectVelHalf, [P, s, v(vel[1]), v(vel[2]), v(vel[3])]),
         projectReflect: group(p.projectReflect, [P, v(vel[0]), { buffer: pressure }, v(vel[1]), v(vel[2])]),
-        curl: group(p.curl, [P, v(vel[3]), v(curl)]),
-        forces: group(p.forces, [P, v(vel[3]), v(scal[0]), v(curl), v(vel[0])]),
+        curl: group(p.curl, [P, v(vel[3]), v(curl), v(nut)]),
+        vortBefore: group(p.vortBefore, [P, s, v(vel[0]), v(vortA)]),
+        vortAdvect: group(p.advFwd, [P, s, v(vel[0]), v(vortA), v(vortB)]),
+        vortBack: group(p.advBwd, [P, s, v(vel[0]), v(vortB), v(vortC)]),
+        ivockTarget: d.createBindGroup({
+          layout: p.ivockTarget.getBindGroupLayout(0),
+          entries: [P, s, v(vel[0]), v(vel[3]), { buffer: ivockRhs }].map((resource, binding) => ({ binding, resource })).concat([7, 8, 9].map((binding, k) => ({ binding, resource: v([vortA, vortB, vortC][k]) }))),
+        }),
+
+        ivockSmooth: [0, 1].map(k =>
+          group(p.ivockSmooth, [P, { buffer: this.parityBufs[k] }, { buffer: ivockRhs }, { buffer: ivockPsi }]),
+        ) as [GPUBindGroup, GPUBindGroup],
+        ivockCurl: d.createBindGroup({
+          layout: p.ivockCurl.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: P },
+            { binding: 1, resource: { buffer: ivockPsi } },
+            { binding: 4, resource: v(psiCurl) },
+          ],
+        }),
+        ivockApply: group(p.ivockApply, [P, v(vel[3]), v(psiCurl), v(vel[2])]),
+        forces: group(p.forces, [P, v(vel[3]), v(scal[0]), v(curl), v(vel[0]), v(nut)]),
         divergence: withSkin(p.divergence, [P, v(vel[0]), { buffer: div }, v(scal[0]), { buffer: fireLight }, { buffer: hrr }]),
         sor: [0, 1].map(k => group(p.sor, [P, { buffer: this.parityBufs[k] }, { buffer: div }, { buffer: pressure }])) as [GPUBindGroup, GPUBindGroup],
         project: group(p.project, [P, v(vel[0]), { buffer: pressure }, v(vel[1])]),
@@ -905,6 +959,12 @@ export class PyroEngine {
     } else {
       run(pass, p.advectVel, g.bg.advectVel, cv)
     }
+    if (this.ivockOn()) {
+      this.ivock(pass, run, cv, cc)
+      pass.end()
+      enc.copyTextureToTexture({ texture: g.vel[2] }, { texture: g.vel[3] }, [nx + 1, ny + 1, nz + 1])
+      pass = enc.beginComputePass()
+    }
     run(pass, p.curl, g.bg.curl, cc)
     run(pass, p.forces, g.bg.forces, cv)
     run(pass, p.divergence, g.bg.divergence, cc)
@@ -979,14 +1039,27 @@ export class PyroEngine {
       }
       return
     }
+    this.mgCycles(pass, this.state.vcycles)
+  }
+
+  // Multigrid V-cycles over the levels.
+  private mgCycles(pass: GPUComputePassEncoder, count: number) {
+    const g = this.grids!
+    const p = this.pipes!
+    const dispatch = (pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => {
+      pass.setPipeline(pipe)
+      pass.setBindGroup(0, bg)
+      pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
+    }
     const L = g.levels
     const cells = (m: Vec3): Vec3 => [Math.ceil(m[0] / 4), Math.ceil(m[1] / 4), Math.ceil(m[2] / 4)]
     const smooth = (l: number, sweeps: number) => {
       const m = L[l].n
       const wg: Vec3 = [Math.ceil(m[0] / 2 / 16), Math.ceil(m[1] / 4), m[2]]
+      const groups = L[l].smooth
       for (let i = 0; i < sweeps; i++) {
-        dispatch(p.mgSmooth, L[l].smooth[0], wg)
-        dispatch(p.mgSmooth, L[l].smooth[1], wg)
+        dispatch(p.mgSmooth, groups[0], wg)
+        dispatch(p.mgSmooth, groups[1], wg)
       }
     }
     const vcycle = (l: number) => {
@@ -1001,7 +1074,32 @@ export class PyroEngine {
       dispatch(p.mgProlong, L[l + 1].prolongFrom!, cells(L[l].n))
       smooth(l, MG_POST)
     }
-    for (let k = 0; k < this.state.vcycles; k++) vcycle(0)
+    for (let k = 0; k < count; k++) vcycle(0)
+  }
+
+  // IVOCK runs for a smoke source (see wgsl.ts), with MacCormack or semi-Lagrangian velocity.
+  private ivockOn() {
+    return this.state.ivock && this.state.velocity !== 'ar' && this.state.sourceType === 'smoke'
+  }
+
+  // IVOCK, after the velocity is advected (into vel[3]); the corrected velocity goes to vel[2] for the caller to copy
+  // back. The vorticity before advection, advected; the loss against the advected velocity's curl; the three
+  // potentials; their curl added.
+  private ivock(pass: GPUComputePassEncoder, run: (pass: GPUComputePassEncoder, pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => void, cv: Vec3, cc: Vec3) {
+    const g = this.grids!
+    const p = this.pipes!
+    run(pass, p.vortBefore, g.bg.vortBefore, cc)
+    run(pass, p.advFwd, g.bg.vortAdvect, cc)
+    if (this.state.velocity === 'mac') run(pass, p.advBwd, g.bg.vortBack, cc)
+    run(pass, p.ivockTarget, g.bg.ivockTarget, cc)
+    const [nx, ny, nz] = g.n
+    const sweep: Vec3 = [Math.ceil(nx / 2 / 16), Math.ceil(ny / 4), nz]
+    for (let i = 0; i < IVOCK_SWEEPS; i++) {
+      run(pass, p.ivockSmooth, g.bg.ivockSmooth[0], sweep)
+      run(pass, p.ivockSmooth, g.bg.ivockSmooth[1], sweep)
+    }
+    run(pass, p.ivockCurl, g.bg.ivockCurl, cc)
+    run(pass, p.ivockApply, g.bg.ivockApply, cv)
   }
 
   private writeSim() {
@@ -1012,7 +1110,7 @@ export class PyroEngine {
     const u = new Uint32Array(this.simData)
     const f = new Float32Array(this.simData)
     u.set([nx, ny, nz, this.frame], 0)
-    f.set([dx, SIM_DT, this.simTime, 0], 4)
+    f.set([dx, SIM_DT, this.simTime, s.velocity === 'mac' ? 1 : 0], 4)
     // A smoke source's dome rests on the floor (it is 2.5 times wider than tall); a fire's bed is a disc on the floor.
     f.set([s.srcX, s.srcRadius / 2.5 + dx, 0, s.srcRadius], 8)
     f.set([s.srcDensity, s.srcTemp, s.srcSpeed, s.srcNoise], 12)
@@ -1025,7 +1123,7 @@ export class PyroEngine {
     const st = this.stir
     f.set([...(st ? st.centre : [0, 0, 0]), STIR_RADIUS], 28)
     f.set([...(st ? st.vel : [0, 0, 0]), st ? 1 : 0], 32)
-    f.set([0, 0, 0, s.advection === 'mac' ? 1 : 0], 36)
+    f.set([0, 0, this.ivockOn() ? 1 : 0, s.advection === 'mac' ? 1 : 0], 36)
     f.set([(-nx * dx) / 2, 0, (-nz * dx) / 2, 0], 40)
     // Each upres layer resets when the simulation clock crosses its period (layer B half a period later).
     const t0 = this.simTime / DETAIL_PERIOD
@@ -1397,6 +1495,28 @@ export class PyroEngine {
     } else {
       timed('advectVel', one(p.advectVel, g.bg.advectVel, cv))
     }
+    if (this.ivockOn()) {
+      // Each part of IVOCK on its own.
+      const [ix, iy, iz] = g.n
+      const sweep: Vec3 = [Math.ceil(ix / 2 / 16), Math.ceil(iy / 4), iz]
+      timed('ivock: vorticity', one(p.vortBefore, g.bg.vortBefore, cc))
+      timed('ivock: advect', pass => {
+        one(p.advFwd, g.bg.vortAdvect, cc)(pass)
+        if (this.state.velocity === 'mac') one(p.advBwd, g.bg.vortBack, cc)(pass)
+      })
+      timed('ivock: loss', one(p.ivockTarget, g.bg.ivockTarget, cc))
+      timed('ivock: potentials', pass => {
+        for (let i = 0; i < IVOCK_SWEEPS; i++) {
+          one(p.ivockSmooth, g.bg.ivockSmooth[0], sweep)(pass)
+          one(p.ivockSmooth, g.bg.ivockSmooth[1], sweep)(pass)
+        }
+      })
+      timed('ivock: correction', pass => {
+        one(p.ivockCurl, g.bg.ivockCurl, cc)(pass)
+        one(p.ivockApply, g.bg.ivockApply, cv)(pass)
+      })
+      enc.copyTextureToTexture({ texture: g.vel[2] }, { texture: g.vel[3] }, [nx + 1, ny + 1, nz + 1])
+    }
     timed('curl', one(p.curl, g.bg.curl, cc))
     timed('forces', one(p.forces, g.bg.forces, cv))
     timed('divergence', one(p.divergence, g.bg.divergence, cc))
@@ -1559,6 +1679,22 @@ export class PyroEngine {
     read.destroy()
     sums.destroy()
     hrrRead.destroy()
+    return out
+  }
+
+  // Development check of IVOCK: the vorticity lost in the last step, four floats a cell (x, y, z, unused).
+  async readIvock(): Promise<Float32Array | null> {
+    if (!this.grids) return null
+    const d = this.device
+    const bytes = this.grids.n[0] * this.grids.n[1] * this.grids.n[2] * 16
+    const read = d.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    enc.copyBufferToBuffer(this.grids.ivockRhs, 0, read, 0, bytes)
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const out = new Float32Array(read.getMappedRange().slice(0))
+    read.unmap()
+    read.destroy()
     return out
   }
 

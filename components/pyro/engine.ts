@@ -1316,7 +1316,7 @@ export class PyroEngine {
           const [t1, t2, char] = [a[k], a[k + 1], a[k + 2]]
           hottest = Math.max(hottest, t1)
           const front = t1 + (t2 - t1) * Math.min(Math.max(char / 4, 0), 1)
-          const m = 500 * 0.75 * Math.min(9.5 * Math.exp(-8230 / Math.max(front, 300)), 6e-5)
+          const m = 500 * (1 - 0.16) * Math.min(9.5 * Math.exp(-8230 / Math.max(front, 300)), 6e-5)
           fuel += m * smooth(0.0015, 0.0025, m) * texel
           if (char > 0.3) charredArea += texel
           area += texel

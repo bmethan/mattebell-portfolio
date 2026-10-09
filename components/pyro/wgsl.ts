@@ -77,7 +77,7 @@ fn charRate(s: vec4<f32>) -> f32 {
   return min(9.5 * exp(-8230.0 / max(front, 300.0)), 6e-5);
 }
 const WOOD_RHO = 500.0;
-const CHAR_YIELD = 0.25;
+const CHAR_YIELD = 0.16; // pine's, at fire heating rates (Rinta-Paavola and Hostikka 2022)
 // The volatiles the charring drives off (kg / m2 / s): the wood that does not stay behind as char.
 fn pyrolysisOf(s: vec4<f32>) -> f32 { return WOOD_RHO * (1.0 - CHAR_YIELD) * charRate(s); }
 // What reaches the fire from the ball's surface: its volatiles, once they come off fast enough to burn (about 2 g per
@@ -1045,13 +1045,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // 7c. The wooden ball's skin, heated by the fire. Each texel is a patch of wood, a surface layer 1.5 mm thick over a
 // layer 6 mm thick over the cool core, with its heat balance worked out every step:
 //  - radiation from the gas outside it: four layers along the normal, out to 25 cm, each a layer of soot at its own
-//    temperature (absorption coefficient 1810 f_v T per metre, the Planck mean FDS uses for soot), seen through the
-//    layers nearer, then the air beyond;
+//    temperature (soot's Planck-mean absorption coefficient, 3.72 C0 T / C2 per unit volume fraction with C0 = 7,
+//    about 1810 f_v T per metre), seen through the layers nearer, then the air beyond;
 //  - radiation from the fire further off: each band of its height a point source of its share of the radiated heat
 //    (the radiant fraction of the heat release), q cos / (4 pi r^2);
 //  - convection from the gas just outside (10 W/m2K), and the surface's own radiation (emissivity 0.9);
-//  - conduction into the wood (0.14 W/mK), the heat the pyrolysis takes (1 MJ per kg of volatiles), and, once the
-//    char glows, the char's own oxidation (up to 12 kW/m2, while there is oxygen at the surface).
+//  - conduction into the wood (0.14 W/mK), the heat the pyrolysis takes (0.3 MJ per kg of volatiles; measured values
+//    run 0.1 to 0.3), and, once the char glows, the char's own oxidation (up to 12 kW/m2, while there is oxygen at the
+//    surface).
 // The char front advances by charRate(), so the volatiles come off at pyrolysisOf(), which COMBINE adds to the gas as
 // fuel: the ball's flames are the solver's own combustion. Ash builds on glowing char over a minute or two.
 export const BALL_HEAT = /* wgsl */ `
@@ -1068,7 +1069,7 @@ const C1 = WOOD_RHO * 1700.0 * 0.0015; // J / (m2 K), the surface layer
 const C2 = WOOD_RHO * 1700.0 * 0.006; // the layer below
 const G12 = K_WOOD / 0.00375; // W / (m2 K), between their middles
 const G2C = K_WOOD / 0.018; // from the lower layer to the core
-const L_PYRO = 1.0e6; // J per kg of volatiles
+const L_PYRO = 3.0e5; // J per kg of volatiles
 const Q_OX = 12000.0; // W / m2, glowing char
 fn gasAt(w: vec3<f32>) -> Gas { return gasOf(scalAt(scal, samp, (w - P.origin.xyz) / P.grid.x)); }
 fn t4(t: f32) -> f32 { let t2 = t * t; return t2 * t2; }
@@ -1094,10 +1095,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     qGas += through * a * SIGMA * t4(t);
     through *= 1.0 - a;
   }
-  // The flames' emissivity is held to 0.35, a wood flame's some 30 cm thick: the lab's soot yield is a look as much
-  // as a measurement, and its flames run hotter than measured (see Validation), which T^4 would magnify.
+  // The flames' emissivity is held to 0.25, a wood flame's some 40 cm deep (such flames absorb about 0.7 per metre):
+  // the lab's soot yield is a look as much as a measurement, and its flames run hotter than measured (see
+  // Validation), which T^4 would magnify.
   let flameEps = 1.0 - through;
-  if (flameEps > 0.35) { qGas *= 0.35 / flameEps; through = 0.65; }
+  if (flameEps > 0.25) { qGas *= 0.25 / flameEps; through = 0.75; }
   qGas += through * SIGMA * t4(T_AMB);
   // The fire further off.
   let vol = dx * dx * dx;
@@ -1117,7 +1119,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   // The ball's own flame along its surface: a layer too thin for the grid, it heats the wood above a burning patch,
   // which is how fire climbs a surface. A wall flame's heat flux grows with the burning height beneath it, to about
-  // 30 kW/m2 once some 9 cm of the surface below is alight: a small new patch cannot keep thick wood burning without
+  // 25 kW/m2 once some 9 cm of the surface below is alight (measured averages run 15 to 20, the usual assumption 25 to
+  // 30): a small new patch cannot keep thick wood burning without
   // outside heat, a tall one can. Up the surface is up the map (v toward the top), within a texel either way around.
   var below = 0.0;
   for (var dj = 1u; dj <= 8u; dj++) {
@@ -1130,7 +1133,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     below += row / 8.0;
   }
-  let qWall = 30000.0 * below;
+  let qWall = 25000.0 * below;
   let o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
   let charred = clamp(s.z / 0.5, 0.0, 1.0);
   let rate = charRate(s);

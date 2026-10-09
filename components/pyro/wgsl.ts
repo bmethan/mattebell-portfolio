@@ -1,4 +1,5 @@
 import { BB_MAX_K, BB_MIN_K } from './blackbody'
+import { FIRE_BANDS } from './physics'
 import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
 // WGSL for the pyro lab: a gas solver on a staggered (MAC) grid, as production FX solvers lay it out, and a
@@ -921,6 +922,8 @@ struct RParams {
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
+const FIRE_BANDS = ${FIRE_BANDS}u;
+const BAND_R2 = 0.02; // m2: softens each band of the fire's light over the flame's width
 const INV_PI = 0.31830989;
 const INV_2PI = 0.15915494;
 const INV_4PI = 0.07957747;
@@ -955,15 +958,35 @@ fn uvwOf(w: vec3<f32>) -> vec3<f32> { return (w - P.origin.xyz) / (vec3<f32>(P.d
 `
 
 // 9. Light: optical depth (at 550 nm) from each point of a half-resolution lattice toward the sun, and straight up
-// (the sky).
+// (the sky), and the fire's light there, shadowed by the soot.
 export const LIGHT = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var scal: texture_3d<f32>;
 @group(0) @binding(4) var lightOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(5) var<storage, read> fireSums: array<vec4<f32>>;
 
 fn density(w: vec3<f32>) -> f32 { return sigmaOf(textureSampleLevel(scal, samp, uvwOf(w), 0.0)); }
+
+// The fire's light here, shadowed by the soot: each slice of the fire's height as a point light at its brightness-
+// weighted centre, carrying its emitted intensity (I / r^2), through the optical depth on the way (12 samples). In
+// kilolux of luminance (the colour is the fire's overall colour), so it fits half precision near the flames.
+fn fireIrradiance(w: vec3<f32>) -> f32 {
+  if (P.fire.x < 0.5) { return 0.0; }
+  let vol = P.grid.x * P.grid.x * P.grid.x;
+  var e = 0.0;
+  for (var b = 0u; b < FIRE_BANDS; b++) {
+    let lum = fireSums[3u + 2u * b].w * vol;
+    if (lum <= 0.0) { continue; }
+    let d = fireSums[4u + 2u * b].xyz - w;
+    let r2 = dot(d, d);
+    var tau = 0.0;
+    for (var i = 0; i < 12; i++) { tau += density(w + d * ((f32(i) + 0.5) / 12.0)); }
+    e += lum * exp(-tau * sqrt(r2) / 12.0) / (r2 + BAND_R2);
+  }
+  return 0.001 * e;
+}
 
 fn depth(w: vec3<f32>, d: vec3<f32>, ds: f32) -> f32 {
   let te = boxHit(w, d, P.origin.xyz, domainHi()).y;
@@ -999,7 +1022,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // Every cell gets its depths, smoke or not: the floor's shadow and sky lookups land in empty cells too.
   let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x);
   let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x);
-  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, 0.0));
+  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w)));
 }
 `
 
@@ -1074,21 +1097,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
 `
 
 export const FIRE_SUM_TOTAL = /* wgsl */ `
-@group(0) @binding(0) var<uniform> C: vec4<u32>; // x: number of partial sums
+// x: the number of partial sums (one per workgroup of FIRE_SUM); y, z, w: its workgroups along x, y and z.
+@group(0) @binding(0) var<uniform> C: vec4<u32>;
 @group(0) @binding(1) var<storage, read> partial: array<vec4<f32>>;
-// The emitted intensity summed over cells, per unit of cell volume (rgb, and its luminance); the centre; the bed's
-// area (m2) and the heat release rate (W).
+// 0: the emitted intensity summed over cells, per unit of cell volume (rgb, and its luminance); 1: its centre; 2: the
+// bed's area (m2) and the heat release rate (W); then for each of FIRE_BANDS slices of the grid's height, its emitted
+// intensity (as 0) and its centre.
 @group(0) @binding(2) var<storage, read_write> result: array<vec4<f32>>;
+const FIRE_BANDS = ${FIRE_BANDS}u;
 var<workgroup> sE: array<vec4<f32>, 256>;
 var<workgroup> sP: array<vec4<f32>, 256>;
 var<workgroup> sB: array<vec4<f32>, 256>;
 
+// Workgroup 0 sums everything; workgroup 1 + b sums band b.
 @compute @workgroup_size(256)
-fn main(@builtin(local_invocation_index) li: u32) {
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+  let band = i32(wg.x) - 1;
   var e = vec4<f32>(0.0);
   var p = vec4<f32>(0.0);
   var b = vec4<f32>(0.0);
   for (var k = li; k < C.x; k += 256u) {
+    if (band >= 0 && i32(((k / C.y) % C.z) * FIRE_BANDS / C.z) != band) { continue; }
     e += partial[3u * k];
     p += partial[3u * k + 1u];
     b += partial[3u * k + 2u];
@@ -1106,9 +1135,15 @@ fn main(@builtin(local_invocation_index) li: u32) {
     workgroupBarrier();
   }
   if (li == 0u) {
-    result[0] = sE[0];
-    result[1] = vec4<f32>(sP[0].xyz / max(sE[0].w, 1e-9), 0.0);
-    result[2] = sB[0];
+    let centre = vec4<f32>(sP[0].xyz / max(sE[0].w, 1e-9), 0.0);
+    if (band < 0) {
+      result[0] = sE[0];
+      result[1] = centre;
+      result[2] = sB[0];
+    } else {
+      result[3u + 2u * u32(band)] = sE[0];
+      result[4u + 2u * u32(band)] = centre;
+    }
   }
 }
 `
@@ -1151,7 +1186,6 @@ fn jitterAt(p: vec2<f32>, frame: f32) -> f32 {
   h = h ^ (h >> 16u);
   return f32(h) * (1.0 / 4294967296.0);
 }
-const FIRE_R2 = 0.06; // m2: softens the fire's point light over the flames' size
 
 // Upres detail at a point: the noise at each layer's advected coordinates, cross-faded, with the contrast that mixing
 // two independent noises loses restored (divided by the blend's standard-deviation factor). A layer the flow has
@@ -1231,7 +1265,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let albedo = R.skyCol.w;
   let ch = chroma();
   let rot = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
-  let fireVolume = P.grid.x * P.grid.x * P.grid.x; // each cell's emission counts over its volume
+  // The fire's colour at unit luminance (its light's strength comes from the light volume).
+  let fireColour = fireLight[0].xyz / max(fireLight[0].w, 1e-12);
 
   // Radiance in cd/m2, per colour channel (soot dims blue more than red, so transmittance is a colour too).
   var col = vec3<f32>(0.0);
@@ -1266,9 +1301,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         let lsun = exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2;
         // The sky as a uniform dome over open ground (radiance E / pi), half of it seen by an isotropic scatterer.
         let amb = R.skyCol.xyz * INV_2PI * exp(-0.5 * L.y * ch);
-        // The fire as a point light at its brightness-weighted centre (softened over its size): E = I / r^2.
-        let toFire = fireLight[1].xyz - w;
-        let fireE = fireLight[0].xyz * fireVolume / (dot(toFire, toFire) + FIRE_R2);
+        // The fire's light, shadowed by the soot on the way (from the light volume, in kilolux).
+        let fireE = fireColour * 1000.0 * L.w;
         // Light scattered toward the camera per unit of extinction, cd/m2: the phase function is hg / (4 pi).
         let S = albedo * (R.sunCol.xyz * INV_4PI * lsun + amb + fireE * INV_4PI);
         // Emission (Kirchhoff's law): what the soot absorbs, it emits at the blackbody radiance of its temperature.
@@ -1303,10 +1337,19 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     if (all(uv.xz >= vec2<f32>(0.0)) && all(uv.xz <= vec2<f32>(1.0))) {
       skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y * ch);
     }
-    // Illuminance on the floor (lux): the sun, the sky and the fire (I cos / r^2), seen as Lambertian radiance E / pi.
-    let toFire = fireLight[1].xyz - pf;
-    let r2 = dot(toFire, toFire) + FIRE_R2;
-    let fireE = fireLight[0].xyz * fireVolume * max(toFire.y, 0.0) / (sqrt(r2) * r2);
+    // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
+    // light from each band of its height, I cos / r^2 (the floor reaches beyond the light volume, and smoke rises away
+    // from the light between the flames and the floor, so it goes unshadowed here).
+    var fireLux = 0.0;
+    let cellVol = P.grid.x * P.grid.x * P.grid.x;
+    for (var b = 0u; b < FIRE_BANDS; b++) {
+      let lum = fireLight[3u + 2u * b].w * cellVol;
+      if (lum <= 0.0) { continue; }
+      let d = fireLight[4u + 2u * b].xyz - pf;
+      let r2 = dot(d, d) + BAND_R2;
+      fireLux += lum * max(d.y, 0.0) / (sqrt(r2) * r2);
+    }
+    let fireE = fireColour * fireLux;
     let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis + fireE;
     col += T * R.floorCol.xyz * INV_PI * E * fade;
   }

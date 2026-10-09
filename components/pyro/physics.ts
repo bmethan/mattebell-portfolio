@@ -52,5 +52,8 @@ export const SOOT_CHROMA: [number, number] = [(REF_NM / 612) ** SOOT_ALPHA, (REF
 export const luxOfEV = (ev: number) => 2.5 * 2 ** ev
 export const exposureOfEV = (ev: number) => 1 / (1.2 * 2 ** ev)
 
+// The fire's light is gathered from this many slices of the grid's height, each a point light at its own centre.
+export const FIRE_BANDS = 8
+
 // A WGSL float literal.
 export const wf = (x: number) => (Number.isInteger(x) ? `${x}.0` : x.toPrecision(7))

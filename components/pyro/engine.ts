@@ -3,7 +3,7 @@
 // relit). WebGPU only: browsers without it get the lab's still frame.
 import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, VEL_COMBINE, COMBINE, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
-import { FUEL, G, SOOT_CHROMA, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
+import { FIRE_BANDS, FUEL, G, SOOT_CHROMA, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 
 export const SIM_DT = 1 / 30
@@ -434,12 +434,12 @@ export class PyroEngine {
     // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
     const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
     const firePartial = storage(groups * 12)
-    const fireLight = d.createBuffer({ size: 48, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const fireLight = d.createBuffer({ size: (3 + 2 * FIRE_BANDS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     // The heat release rate in each cell (W/m3), from the step's burning: for the expansion, the sums and validation.
     const hrr = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     buffers.push(fireLight, hrr)
     const fireCount = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true })
-    new Uint32Array(fireCount.getMappedRange()).set([groups, 0, 0, 0])
+    new Uint32Array(fireCount.getMappedRange()).set([groups, Math.ceil(n[0] / 4), Math.ceil(n[1] / 4), Math.ceil(n[2] / 4)])
     fireCount.unmap()
     buffers.push(fireCount)
     const P = { buffer: this.simBuf }
@@ -477,7 +477,7 @@ export class PyroEngine {
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
-        light: group(p.light, [P, R, s, v(scal[0]), v(light)]),
+        light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
         render: group(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }]),
       },
     }
@@ -709,7 +709,7 @@ export class PyroEngine {
     // The fire's light from the new scalars (zero without flames).
     pass = enc.beginComputePass()
     run(pass, p.fireSum, g.bg.fireSum, cc)
-    run(pass, p.fireTotal, g.bg.fireTotal, [1, 1, 1])
+    run(pass, p.fireTotal, g.bg.fireTotal, [1 + FIRE_BANDS, 1, 1])
     pass.end()
     this.device.queue.submit([enc.finish()])
     this.simTime += SIM_DT
@@ -968,7 +968,7 @@ export class PyroEngine {
     timed('detail', one(p.advDetail, g.bg.advDetail, cc))
     timed('fireLight', pass => {
       one(p.fireSum, g.bg.fireSum, cc)(pass)
-      one(p.fireTotal, g.bg.fireTotal, [1, 1, 1])(pass)
+      one(p.fireTotal, g.bg.fireTotal, [1 + FIRE_BANDS, 1, 1])(pass)
     })
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
     timed('light', one(p.light, g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))

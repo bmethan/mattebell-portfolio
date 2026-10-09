@@ -34,7 +34,7 @@ export const SCHMIDT_T = 0.5
 // scale, Q in kW) and l the noise's scale. TURB_C was calibrated once, on an 80 kW fire, against McCaffrey's measured
 // centreline temperatures (balancing the intermittent flame against the plume above), with FDS's mixing time in the
 // combustion; other fire sizes then follow from the scaling.
-export const TURB_C = 0.025
+export const TURB_C = 0.02
 export const fireTurbulence = (kW: number, scale: number) => (TURB_C * (1.9 * kW ** 0.2) ** 2) / scale
 
 // Soot optics. Mass-specific extinction of flame-generated smoke, 8.7 m2/g at 633 nm (Mulholland and Croarkin

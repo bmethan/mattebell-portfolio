@@ -59,8 +59,11 @@ struct Gas {
   fuel: f32, // unburned fuel, mass fraction
   soot: f32, // g per kg
 }
+// The hottest a cell's gas gets (K over ambient), well above a wood flame's; reading and writing a cell use the same
+// cap, so a cell at it keeps its masses.
+const RISE_MAX = 2200.0;
 fn gasOf(s: vec4<f32>) -> Gas {
-  let r = max(1.0 - s.y, 0.1); // rho / rho_ambient = T_ambient / T
+  let r = max(1.0 - s.y, T_AMB / (T_AMB + RISE_MAX)); // rho / rho_ambient = T_ambient / T
   return Gas(T_AMB * max(s.y, 0.0) / r, max(s.z, 0.0) / r, max(s.w, 0.0) / r, max(s.x, 0.0) / r);
 }
 fn storeGas(g: Gas) -> vec4<f32> {
@@ -120,6 +123,15 @@ fn fuelAdded(g: Gas, w: vec3<f32>, measuredArea: f32, dt: f32) -> f32 {
 }
 // The temperature rise from burning that much fuel, net of the share radiated away.
 fn heatRise(burned: f32) -> f32 { return burned * HEAT * (1.0 - P.fire.w) / CP; }
+// The rate (1/s) at which a cell's gas grows in volume. At constant pressure, gas heated by dT in dt grows at
+// (dT / dt) / T: the heat released last step, which is what the gas here is still taking up. The bed's fuel vapour
+// takes up room too (its blowing velocity, a few centimetres a second).
+fn expansionOf(g: Gas, hrrHere: f32, w: vec3<f32>, measuredArea: f32) -> f32 {
+  let heating = hrrHere * (1.0 - P.fire.w) / (RHO_T / (T_AMB + g.rise) * CP);
+  return P.fire2.x * heating / (T_AMB + g.rise) + fuelAdded(g, w, measuredArea, P.grid.y) / P.grid.y;
+}
+// Fixed point for the mass-keeping pass's atomic sums of trilinear weights.
+const SPREAD_ONE = 1048576.0;
 
 const X = vec3<i32>(1, 0, 0);
 const Y = vec3<i32>(0, 1, 0);
@@ -491,12 +503,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // incompressible.
   var expansion = 0.0;
   if (P.fire.x > 0.5) {
-    // (The heat released last step, which is what the gas here is still taking up.)
-    let g = gasOf(textureLoad(scal, c, 0));
-    let heating = hrr[cellIndex(c)] * (1.0 - P.fire.w) / (RHO_T / (T_AMB + g.rise) * CP);
-    expansion = P.fire2.x * heating / (T_AMB + g.rise);
-    // The bed's fuel vapour takes up room too: its blowing velocity, a few centimetres a second.
-    expansion += fuelAdded(g, worldOf(vec3<f32>(id) + 0.5), fireSums[2].x, P.grid.y) / P.grid.y;
+    expansion = expansionOf(gasOf(textureLoad(scal, c, 0)), hrr[cellIndex(c)], worldOf(vec3<f32>(id) + 0.5), fireSums[2].x);
   }
   rhs[cellIndex(c)] = -(div - expansion) / P.grid.y;
 }
@@ -910,6 +917,70 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
+// 7b. Keeping a fire's mass. Semi-Lagrangian advection carries each cell's value along the flow but not its mass.
+// Where the flow diverges sharply, around gas that has just burned and is swelling to several times its volume in a
+// step, the backtraces around it sample it less than the room it should fill, and the hot gas, with its fuel and
+// products, loses mass (a quarter to a third of the fire's, measured). So first every cell's backtrace scatters its
+// trilinear weights onto the cells it samples, and each cell learns over how much volume its gas was spread (in
+// cells); then each cell gets the ratio of the room its gas should fill (1 + e dt, e its expansion) to that, and the
+// advection scales what it takes from the cell by it: Lentine, Aanjaneya and Fedkiw's mass-conserving
+// semi-Lagrangian advection. (Correcting only the expanding cells is not enough: the cells around them, sampled
+// more to fill the gap, then gain what the hot gas lost.) The fields are all per unit volume: masses, and the density deficit, which is the
+// gas's heat (rho (T - T0) = rho0 T0 times the deficit), so the fire keeps its fuel, its products and its heat.
+export const CONSERVE_SPREAD = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var<storage, read_write> spread: array<atomic<u32>>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = nCells();
+  if (any(vec3<i32>(id) >= n)) { return; }
+  let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0);
+  if (!inDomain(g)) { return; }
+  let p = clamp(g - 0.5, vec3<f32>(0.0), nF() - 1.0);
+  let b = vec3<i32>(floor(p));
+  let f = p - vec3<f32>(b);
+  for (var k = 0; k < 8; k++) {
+    let o = vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+    let w = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1) * select(1.0 - f.z, f.z, o.z == 1);
+    atomicAdd(&spread[cellIndex(min(b + o, n - 1))], u32(w * SPREAD_ONE + 0.5));
+  }
+}
+`
+
+export const CONSERVE_RATIO = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var scal: texture_3d<f32>;
+@group(0) @binding(2) var<storage, read> fireSums: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> hrr: array<f32>;
+@group(0) @binding(4) var<storage, read> spread: array<u32>;
+@group(0) @binding(5) var<storage, read_write> ratio: array<f32>;
+@group(0) @binding(6) var samp: sampler;
+@group(0) @binding(7) var vel: texture_3d<f32>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let i = cellIndex(c);
+  var r = 1.0;
+  if (!cellSolid(c)) {
+    // The room this cell's gas should fill: its own cell, grown by the expansion the pressure solve made room for.
+    let grow = expansionOf(gasOf(textureLoad(scal, c, 0)), hrr[i], worldOf(vec3<f32>(id) + 0.5), fireSums[2].x) * P.grid.y;
+    r = clamp((1.0 + grow) / max(f32(spread[i]) / SPREAD_ONE, 1e-3), 0.25, 4.0);
+    // Gas on its way out of the domain is sampled less because it leaves; it is not made up.
+    let n = nF();
+    let to = backtrace(vel, samp, vec3<f32>(id) + 0.5, -1.0);
+    if (to.x < 1.0 || to.x > n.x - 1.0 || to.z < 1.0 || to.z > n.z - 1.0 || to.y > n.y - 1.0) { r = min(r, 1.0); }
+    // (An expanding cell's ratio is stored negative, which tells MacCormack's correction to stand aside there.)
+    if (grow > 1e-3) { r = -r; }
+  }
+  ratio[i] = r;
+}
+`
+
 // 8. Modified MacCormack (Selle et al. 2008): the forward result plus half the round-trip error, clamped to the
 // values the forward step interpolated between; then dissipation, cooling, the source and, in a fire, combustion.
 export const COMBINE = /* wgsl */ `
@@ -922,6 +993,7 @@ ${SIM_COMMON}
 @group(0) @binding(6) var dst: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(7) var<storage, read> fireSums: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> hrr: array<f32>; // heat release rate, W/m3
+@group(0) @binding(9) var<storage, read> ratio: array<f32>; // a fire's mass-keeping ratios (7b)
 
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -929,19 +1001,36 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = nCells();
   if (any(c >= n)) { return; }
   var phi = textureLoad(s1, c, 0);
-  if (P.stirR.w > 0.5) {
+  let mac = P.stirR.w > 0.5;
+  let fire = P.fire.x > 0.5;
+  if (mac || fire) {
     let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0);
     if (inDomain(g)) {
-      let corrected = phi + 0.5 * (textureLoad(s0, c, 0) - textureLoad(s2, c, 0));
-      let b = vec3<i32>(floor(clamp(g - 0.5, vec3<f32>(0.0), vec3<f32>(n - 1))));
+      let p = clamp(g - 0.5, vec3<f32>(0.0), nF() - 1.0);
+      let b = vec3<i32>(floor(p));
+      let f = p - vec3<f32>(b);
       var lo = vec4<f32>(1e9);
       var hi = vec4<f32>(-1e9);
+      var kept = vec4<f32>(0.0);
+      var expanding = false;
       for (var k = 0; k < 8; k++) {
-        let q = textureLoad(s0, min(b + vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1), n - 1), 0);
+        let o = vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+        let qc = min(b + o, n - 1);
+        let q = textureLoad(s0, qc, 0);
         lo = min(lo, q);
         hi = max(hi, q);
+        if (fire) {
+          let w = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1) * select(1.0 - f.z, f.z, o.z == 1);
+          let r = ratio[cellIndex(qc)];
+          kept += w * (abs(r) - 1.0) * q;
+          expanding = expanding || r < 0.0;
+        }
       }
-      phi = clamp(corrected, lo, hi);
+      // MacCormack's round trip is not mass-neutral where the gas expands (its error estimate takes in the change of
+      // volume), so there the semi-Lagrangian result stands.
+      if (mac && !expanding) { phi = clamp(phi + 0.5 * (textureLoad(s0, c, 0) - textureLoad(s2, c, 0)), lo, hi); }
+      // What the expanding cells' ratios add back (7b).
+      phi += kept;
     }
   }
   let dt = P.grid.y;
@@ -960,10 +1049,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     g.fuel = (g.fuel + a) / (1.0 + a);
     g.soot = g.soot / (1.0 + a);
     // Burning: the fuel burned heats the gas (less the share radiated away) and leaves soot at the fuel's yield.
-    let burned = fuelBurned(g, dt, mixTime(strainRate(vel, c)));
+    // (Gas at the cap burns no further until it cools: the expansion follows the heat released.)
+    let burned = min(fuelBurned(g, dt, mixTime(strainRate(vel, c))), max(RISE_MAX - g.rise, 0.0) / heatRise(1.0));
     hrr[cellIndex(c)] = burned * HEAT * RHO_T / (T_AMB + g.rise) / dt;
     g.fuel -= burned;
-    g.rise = min(g.rise + heatRise(burned), 2200.0);
+    g.rise = min(g.rise + heatRise(burned), RISE_MAX);
     g.soot += SOOT_G * P.fire.z * burned;
     phi = storeGas(g);
   } else {

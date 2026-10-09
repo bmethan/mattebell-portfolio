@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, PROJECT_REFLECT, RESOLVE, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -65,6 +65,15 @@ export interface PyroStatus {
   resolution: PyroResolution // what the engine runs (it may step down from the default on a slow GPU)
   autoStepped: boolean // it did step down
   exposureEV: number // the camera's exposure now (metered when auto)
+  ball: BallStatus | null // the wooden ball, when there is one
+}
+
+// The wooden ball, as read back a few times a second: its hottest surface (K), the heat its flames release (kW, from
+// the volatiles it gives off fast enough to burn) and the share of its surface charred.
+export interface BallStatus {
+  surfaceK: number
+  burningKW: number
+  charred: number
 }
 
 type Vec3 = [number, number, number]
@@ -105,6 +114,7 @@ interface Pipes {
   combine: GPUComputePipeline
   conserveSpread: GPUComputePipeline
   conserveRatio: GPUComputePipeline
+  ballHeat: GPUComputePipeline
   diffuse: GPUComputePipeline
   light: GPUComputePipeline
   render: GPURenderPipeline
@@ -132,6 +142,9 @@ interface Grids {
   fireLight: GPUBuffer // the grid sums: fire light, its centre, the bed's area and the heat release rate
   hrr: GPUBuffer // heat release rate per cell, W/m3
   spread: GPUBuffer // a fire's mass keeping: the volume over which each cell's gas was spread (fixed point)
+  skin: GPUBuffer // the wooden ball's skin (SKIN_W x SKIN_H texels, four floats each), and its next step
+  skinNext: GPUBuffer
+  flame: GPUTexture // a fire's heat release rate per cell (MW/m3), for the renderer
   detA: [GPUTexture, GPUTexture]
   detB: [GPUTexture, GPUTexture]
   lightDims: Vec3
@@ -154,6 +167,7 @@ interface Grids {
     combine: GPUBindGroup
     conserveSpread: GPUBindGroup
     conserveRatio: GPUBindGroup
+    ballHeat: GPUBindGroup
     diffuse: GPUBindGroup
     advDetail: GPUBindGroup
     fireSum: GPUBindGroup
@@ -187,7 +201,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, diffuse, light, upres, render, resolve] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, diffuse, light, upres, render, resolve] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -211,6 +225,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(COMBINE),
     compute(CONSERVE_SPREAD),
     compute(CONSERVE_RATIO),
+    compute(BALL_HEAT),
     compute(DIFFUSE),
     compute(LIGHT),
     compute(UPRES),
@@ -227,7 +242,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, diffuse, light, upres, render, resolve }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, diffuse, light, upres, render, resolve }
 }
 
 export function prewarmPyro() {
@@ -312,6 +327,9 @@ export class PyroEngine {
   private histIndex = 0
   private taaCount = 0
   private renderFrame = 0
+  // The wooden ball, as last read back for the HUD.
+  private ballStatus: BallStatus | null = null
+  private readingBall = false
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
   private metering = false
@@ -456,6 +474,8 @@ export class PyroEngine {
     const detA: [GPUTexture, GPUTexture] = [tex(n, true), tex(n, true)]
     const detB: [GPUTexture, GPUTexture] = [tex(n, true), tex(n, true)]
     const curl = tex(n)
+    // A fire's heat release rate per cell (MW/m3), filterable, for rendering the flame sheets.
+    const flame = tex(n)
     const lightDims: Vec3 = [Math.ceil(n[0] / 2), Math.ceil(n[1] / 2), Math.ceil(n[2] / 2)]
     const light = tex(lightDims)
     const v = (t: GPUTexture) => t.createView()
@@ -528,6 +548,17 @@ export class PyroEngine {
     const spread = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
     const ratio = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE })
     buffers.push(fireLight, hrr, spread, ratio)
+    // The wooden ball's skin, fresh wood at the air's temperature, and the buffer its heating step writes.
+    const skinBytes = SKIN_W * SKIN_H * 16
+    const skin = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
+    const skinNext = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    buffers.push(skin, skinNext)
+    // The kernels that read the skin (binding 31: the ball's volatiles feed the fire, and the renderer draws it).
+    const withSkin = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[]) =>
+      d.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: [...resources.map((resource, binding) => ({ binding, resource })), { binding: 31, resource: { buffer: skin } }],
+      })
     const fireCount = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true })
     new Uint32Array(fireCount.getMappedRange()).set([groups, Math.ceil(n[0] / 4), Math.ceil(n[1] / 4), Math.ceil(n[2] / 4)])
     fireCount.unmap()
@@ -537,7 +568,7 @@ export class PyroEngine {
     const s = this.sampler
     this.grids = {
       n,
-      textures: [...vel, ...scal, ...detA, ...detB, curl, light],
+      textures: [...vel, ...scal, ...detA, ...detB, curl, light, flame],
       buffers,
       levels,
       vel,
@@ -545,6 +576,9 @@ export class PyroEngine {
       fireLight,
       hrr,
       spread,
+      skin,
+      skinNext,
+      flame,
       detA,
       detB,
       lightDims,
@@ -559,22 +593,24 @@ export class PyroEngine {
         projectReflect: group(p.projectReflect, [P, v(vel[0]), { buffer: pressure }, v(vel[1]), v(vel[2])]),
         curl: group(p.curl, [P, v(vel[3]), v(curl)]),
         forces: group(p.forces, [P, v(vel[3]), v(scal[0]), v(curl), v(vel[0])]),
-        divergence: group(p.divergence, [P, v(vel[0]), { buffer: div }, v(scal[0]), { buffer: fireLight }, { buffer: hrr }]),
+        divergence: withSkin(p.divergence, [P, v(vel[0]), { buffer: div }, v(scal[0]), { buffer: fireLight }, { buffer: hrr }]),
         sor: [0, 1].map(k => group(p.sor, [P, { buffer: this.parityBufs[k] }, { buffer: div }, { buffer: pressure }])) as [GPUBindGroup, GPUBindGroup],
         project: group(p.project, [P, v(vel[0]), { buffer: pressure }, v(vel[1])]),
         advFwd: group(p.advFwd, [P, s, v(vel[0]), v(scal[0]), v(scal[1])]),
         advBwd: group(p.advBwd, [P, s, v(vel[0]), v(scal[1]), v(scal[2])]),
-        combine: group(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }]),
+        combine: withSkin(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }, v(flame)]),
         conserveSpread: group(p.conserveSpread, [P, s, v(vel[0]), { buffer: spread }]),
-        conserveRatio: group(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
+        conserveRatio: withSkin(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
+        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
-        render: group(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView(), this.dummy3d.createView()]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView(), this.dummy3d.createView(), v(flame)]),
       },
     }
+    this.resetSkin()
     this.simTime = 0
     this.frame = 0
     this.lightDirty = true
@@ -596,6 +632,7 @@ export class PyroEngine {
       this.makeGrids()
       this.layoutCamera()
     }
+    if ((this.state.ball && !prev.ball) || (this.state.ballBurns && !prev.ballBurns)) this.resetSkin()
     // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh.
     this.lightDirty = true
     this.needsRender = true
@@ -696,6 +733,20 @@ export class PyroEngine {
 
   // Moves the collision ball to under the pointer, on the plane through the domain's middle, and gives it the
   // velocity of the move, so it pushes the gas.
+  // Sets the ball down beside the fire, ready to be dragged into it.
+  ballBeside() {
+    if (!this.grids) return
+    const s = this.state
+    const half = DOMAIN_WIDTH / 2 - s.ballRadius - 0.05
+    const x = s.srcX + s.srcRadius + s.ballRadius + 0.3
+    this.ballPos = [x <= half ? x : s.srcX - s.srcRadius - s.ballRadius - 0.3, s.ballRadius + 0.3, 0]
+    this.ballVel = [0, 0, 0]
+    this.lightDirty = true
+    this.needsRender = true
+    this.taaCount = 0
+    this.kick()
+  }
+
   ballTo(x: number, y: number) {
     if (!this.grids) return
     const { o, dir } = this.rayAt(x, y)
@@ -824,6 +875,15 @@ export class PyroEngine {
     const p = this.pipes!
     this.writeSim()
     const enc = this.device.createCommandEncoder()
+    // The wooden ball's skin heats (or cools) first, so this step's fire takes in its volatiles.
+    if (this.ballBurning()) {
+      const skinPass = enc.beginComputePass()
+      skinPass.setPipeline(p.ballHeat)
+      skinPass.setBindGroup(0, g.bg.ballHeat)
+      skinPass.dispatchWorkgroups(SKIN_W / 8, SKIN_H / 8, 1)
+      skinPass.end()
+      enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_W * SKIN_H * 16)
+    }
     const [nx, ny, nz] = g.n
     const cv: Vec3 = [Math.ceil((nx + 1) / 4), Math.ceil((ny + 1) / 4), Math.ceil((nz + 1) / 4)]
     const cc: Vec3 = [Math.ceil(nx / 4), Math.ceil(ny / 4), Math.ceil(nz / 4)]
@@ -982,7 +1042,7 @@ export class PyroEngine {
     if (performance.now() - this.ballDragAt > 120) this.ballVel = this.ballVel.map(v => v * 0.6) as Vec3
     const radius = s.ball ? s.ballRadius : 0
     f.set([...this.ballPos, radius], 56)
-    f.set([...this.ballVel, 0], 60)
+    f.set([...this.ballVel, s.ball && s.ballBurns ? 1 : 0], 60)
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
     this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx]))
   }
@@ -1072,7 +1132,10 @@ export class PyroEngine {
       })
       const render = d.createBindGroup({
         layout: p.render.getBindGroupLayout(0),
-        entries: entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView(), v(tex[0])]),
+        entries: [
+          ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView(), v(tex[0]), v(g.flame)]),
+          { binding: 31, resource: { buffer: g.skin } },
+        ],
       })
       this.upres = { tex, group, render }
       this.upresInit = true
@@ -1199,11 +1262,79 @@ export class PyroEngine {
     this.metering = false
   }
 
+  private ballBurning() {
+    return this.state.ball && this.state.ballBurns
+  }
+
+  // A fresh wooden ball: unburned, at the air's temperature.
+  private resetSkin() {
+    if (!this.grids) return
+    const fresh = new Float32Array(SKIN_W * SKIN_H * 4)
+    for (let i = 0; i < SKIN_W * SKIN_H; i++) fresh.set([T_AMBIENT, T_AMBIENT, 0, 0], i * 4)
+    this.device.queue.writeBuffer(this.grids.skin, 0, fresh)
+    this.ballStatus = null
+    this.needsRender = true
+    this.taaCount = 0
+  }
+
+  // Swaps the charred ball for a fresh one.
+  newBall() {
+    this.resetSkin()
+    this.kick()
+    this.report(true)
+  }
+
+  // The wooden ball's state for the HUD, as the solver works it out (see charRate and ballFuelFlux in wgsl.ts).
+  private async readBall() {
+    if (this.readingBall || !this.grids || !this.ballBurning()) {
+      if (!this.ballBurning()) this.ballStatus = null
+      return
+    }
+    this.readingBall = true
+    const d = this.device
+    const bytes = SKIN_W * SKIN_H * 16
+    const read = d.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    enc.copyBufferToBuffer(this.grids.skin, 0, read, 0, bytes)
+    d.queue.submit([enc.finish()])
+    try {
+      await read.mapAsync(GPUMapMode.READ)
+      const a = new Float32Array(read.getMappedRange())
+      const r = this.state.ballRadius
+      let hottest = 0
+      let fuel = 0
+      let charredArea = 0
+      let area = 0
+      const smooth = (e0: number, e1: number, x: number) => {
+        const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1)
+        return t * t * (3 - 2 * t)
+      }
+      for (let j = 0; j < SKIN_H; j++) {
+        const texel = r * r * Math.sin((Math.PI * (j + 0.5)) / SKIN_H) * (Math.PI / SKIN_H) * ((2 * Math.PI) / SKIN_W)
+        for (let i = 0; i < SKIN_W; i++) {
+          const k = (j * SKIN_W + i) * 4
+          const [t1, t2, char] = [a[k], a[k + 1], a[k + 2]]
+          hottest = Math.max(hottest, t1)
+          const front = t1 + (t2 - t1) * Math.min(Math.max(char / 4, 0), 1)
+          const m = 500 * 0.75 * Math.min(9.5 * Math.exp(-8230 / Math.max(front, 300)), 6e-5)
+          fuel += m * smooth(0.0015, 0.0025, m) * texel
+          if (char > 0.3) charredArea += texel
+          area += texel
+        }
+      }
+      read.unmap()
+      if (this.ballBurning()) this.ballStatus = { surfaceK: hottest, burningKW: (fuel * FUEL.heatPerFuel) / 1000, charred: charredArea / area }
+    } catch {}
+    read.destroy()
+    this.readingBall = false
+  }
+
   private report(force: boolean) {
     const now = performance.now()
     if (!force && now - this.lastStatus < STATUS_MS) return
     this.lastStatus = now
     void this.readFire()
+    void this.readBall()
     while (this.stepTimes.length && now - this.stepTimes[0] > 1000) this.stepTimes.shift()
     this.onStatus({
       ready: !!this.grids,
@@ -1215,6 +1346,7 @@ export class PyroEngine {
       resolution: this.state.resolution,
       autoStepped: this.autoStepped,
       exposureEV: this.state.exposureMode === 'manual' ? this.state.exposure : (this.meterEV ?? this.targetEV()) - this.state.exposureComp,
+      ball: this.ballBurning() ? this.ballStatus : null,
     })
   }
 
@@ -1250,6 +1382,10 @@ export class PyroEngine {
     }
     const scheme = this.state.velocity
     const solveLabel = this.state.pressure === 'sor' ? `sor x${this.state.pressureIters}` : `multigrid x${this.state.vcycles}`
+    if (this.ballBurning()) {
+      timed('ballHeat', one(p.ballHeat, g.bg.ballHeat, [SKIN_W / 8, SKIN_H / 8, 1]))
+      enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_W * SKIN_H * 16)
+    }
     if (scheme === 'ar') {
       timed('advectVel', one(p.advectVelHalf, g.bg.arAdvect1, cv))
     } else if (scheme === 'mac') {

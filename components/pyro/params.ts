@@ -67,6 +67,7 @@ export interface PyroState {
   // Interaction
   ball: boolean // a solid ball in the flow, dragged by the visitor
   ballRadius: number // m
+  ballBurns: boolean // the ball is wood, which heats, chars and catches fire (else inert)
   // Upres detail
   detail: number // 0 = off
   detailScale: number // m, the largest noise feature
@@ -115,6 +116,7 @@ export const PYRO_DEFAULTS: PyroState = {
   upresStrength: 1,
   ball: false,
   ballRadius: 0.22,
+  ballBurns: true,
   detail: 1,
   detailScale: 0.05,
 }

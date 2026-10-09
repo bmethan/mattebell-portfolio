@@ -63,6 +63,17 @@ body {
 .lab-hud-left { left: 14px; }
 .lab-hud-right { right: 14px; text-align: right; }
 .lab-hud-bottom { top: auto; bottom: 12px; left: 14px; text-transform: none; letter-spacing: 0.04em; }
+/* A callout over the image that invites a visitor to try something new (the wooden ball). */
+.lab-callout { position: absolute; left: 14px; bottom: 12px; max-width: min(420px, calc(100% - 28px)); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 10px 12px; background: rgba(6, 6, 7, 0.78); border: 0.5px solid var(--border-teal); font-size: 12px; line-height: 1.5; color: var(--text-soft); }
+.lab-callout b { color: var(--accent); font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; font-size: 10px; margin-right: 6px; }
+.lab-callout p { margin: 0; flex: 1 1 220px; }
+.lab-callout .lab-pill { background: rgba(6, 6, 7, 0.6); }
+.lab-callout-actions { display: flex; gap: 8px; }
+@media (max-width: 640px) {
+  .lab-callout { left: 8px; right: 8px; bottom: 8px; max-width: none; padding: 7px 9px; gap: 6px 8px; font-size: 11px; line-height: 1.4; }
+  .lab-callout p { flex-basis: 100%; }
+  .lab-callout .lab-pill { padding: 5px 9px; }
+}
 .lab-progress { position: absolute; left: 0; bottom: 0; width: 100%; height: 1px; background: var(--accent); transform-origin: left; opacity: 0.6; pointer-events: none; }
 .lab-marker { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border: 1px solid var(--accent); border-radius: 50%; opacity: 0.8; pointer-events: none; }
 .lab-marker::after { content: ''; position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px; border-radius: 50%; background: var(--accent); }

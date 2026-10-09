@@ -3,7 +3,7 @@
 // across the image, with the solver's controls below. It mounts when the Lab switch first selects it, and starts
 // at once (choosing it is the visitor's go-ahead).
 import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
-import { PyroEngine, type PyroStatus } from './pyro/engine'
+import { PyroEngine, type BallStatus, type PyroStatus } from './pyro/engine'
 import { ZipStore } from './pyro/vdb'
 import { PRESETS, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, SOURCE_LOOKS, type PyroState, type SourceType } from './pyro/params'
 import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
@@ -49,7 +49,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Flames',
-    'Nothing glows but soot. Hot soot emits what it absorbs times the blackbody radiance of its temperature (Kirchhoff’s law), so a flame’s colour and brightness follow from the simulated temperature and soot alone: Planck’s law through the CIE colour matching functions, in absolute units (a blackbody at 2042 K comes out at 600,000 cd/m², the old definition of the candle). The soot’s extinction is the measured 8.7 m²/g of flame smoke and its albedo 0.25, and it absorbs blue more than red (as 1/λ), so it reddens what shines through it. Below about 1000 K its glow is too faint to see, which is where the visible flame ends. A cell’s temperature is an average, and a blackbody’s glow climbs so steeply with temperature that the average glow is far from the glow at the average temperature (the turbulence-radiation interaction), so the renderer adds the temperature fluctuation finer than the grid: its size from the resolved temperature gradient, as large-eddy simulations model a subgrid variance (Pierce and Moin), only its shape from a noise that rises with the flames and churns (Flame detail scales it; 0 renders the cell averages). The fire lights its own smoke and the floor: its emitted light is summed on the GPU every step in eight slices of its height, each a point light at its brightness-weighted centre, and each point of the smoke gathers them through the soot in the way, so dense smoke shadows the fire’s light as it does the sun’s. (The floor takes the same eight lights unshadowed: the smoke rises away from the light between them.)',
+    'Nothing glows but soot. Hot soot emits what it absorbs times the blackbody radiance of its temperature (Kirchhoff’s law), so a flame’s colour and brightness follow from the simulated temperature and soot alone: Planck’s law through the CIE colour matching functions, in absolute units (a blackbody at 2042 K comes out at 600,000 cd/m², the old definition of the candle). The soot’s extinction is the measured 8.7 m²/g of flame smoke and its albedo 0.25, and it absorbs blue more than red (as 1/λ), so it reddens what shines through it. Below about 1000 K its glow is too faint to see, which is where the visible flame ends. A cell’s temperature is an average, and a blackbody’s glow climbs so steeply with temperature that the average glow is far from the glow at the average temperature (the turbulence-radiation interaction), so the renderer adds the temperature fluctuation finer than the grid: its size from the resolved temperature gradient, as large-eddy simulations model a subgrid variance (Pierce and Moin), only its shape from a noise that rises with the flames and churns (Flame detail scales it; 0 renders the cell averages). For the same reason, where fuel is burning the soot radiates at the temperature of the flame sheet it forms in, about 1400 K, rather than its cell’s mean: the burning happens in sheets far thinner than a cell, and the cell spreads their heat over all of it (a thin flame along a burning surface would otherwise never glow). The fire lights its own smoke and the floor: its emitted light is summed on the GPU every step in eight slices of its height, each a point light at its brightness-weighted centre, and each point of the smoke gathers them through the soot in the way, so dense smoke shadows the fire’s light as it does the sun’s. (The floor takes the same eight lights unshadowed: the smoke rises away from the light between them.)',
   ],
   [
     'Detail',
@@ -62,7 +62,11 @@ const TECH_NOTES: [string, string][] = [
   ['Boundaries', 'A solid floor, and open sides and top: smoke leaves the box, and the air that flows in carries none. And the collision ball, when there is one (see Interaction).'],
   [
     'Interaction',
-    'Drag to stir the gas, move the source along the floor, or move a solid ball through the flow; the arrow keys do the same. The ball is a solid in the solver: the pressure solve treats its cells as walls at every multigrid level (a cell is solid when its centre is inside it, so the coarse levels see it too), and the faces around it move with its velocity, so a moving ball pushes the gas and the gas flows around it. It casts soft shadows from the sun on the floor and the smoke, hides its share of the sky (its view factor from the floor, (r/d)² cos θ), and is lit by the fire’s shadowed light. Each starting point sets a source, its look and the wind, and starts again.',
+    'Drag to stir the gas, move the source along the floor, or move a solid ball through the flow; the arrow keys do the same. The ball is a solid in the solver: the pressure solve treats its cells as walls at every multigrid level (a cell is solid when its centre is inside it, so the coarse levels see it too), and the faces around it move with its velocity, so a moving ball pushes the gas and the gas flows around it. It casts soft shadows from the sun on the floor and the smoke, and from the fire on the smoke (a penumbra as wide as the bed’s), hides its share of the sky (its view factor from the floor, (r/d)² cos θ), and is lit by the fire: by the flames touching it, and by each slice of the fire as a light as wide as the bed, through the soot in the way. The grid holds it as a staircase of cells, which the gas within a cell or two of its surface takes the shape of, so there the renderer fades the gas out and draws the true sphere. Each starting point sets a source, its look and the wind, and starts again.',
+  ],
+  [
+    'Burning',
+    'The ball is wood, a pine of 500 kg/m³, and it burns as wood does. A map of its surface, 128 by 64 patches, each a 1.5 mm surface layer over a 6 mm layer over the cool core, takes in the fire’s heat every step: radiation from the soot just outside it (the absorption coefficient FDS uses for soot, with the flames’ emissivity held to 0.35, a wood flame’s some 30 cm thick), the radiant share of the fire’s heat from further off, and convection. It loses heat by its own radiation and by conduction inward. Above about 550 K the wood chars and gives off its volatiles, the char front advancing at an Arrhenius rate in the temperature at the front (about 2 mm a minute at 650 K); the char insulates, so the front cools as it deepens. Once the volatiles come off faster than about 2 g/m² a second, wood’s critical mass flux for flaming, they reach the gas as fuel and burn in the solver’s own combustion, with the bed fuel’s heat, soot and smoke. The flame along a burning surface is thinner than a cell, so two of its effects are modelled rather than resolved: its heat on the wood above a burning patch, which grows with the burning height beneath to about 30 kW/m² (which is how fire climbs a surface, and why a small new patch goes out without outside heat while a tall one keeps going), and its look, which the renderer draws as tongues rising from the burning patches, as tall as a wall flame of that strength. Held in a 180 kW bonfire’s flames the ball scorches within seconds and catches in 5 to 10 s. Pulled out soon after, its flames die; after a minute in the flames it keeps burning and the fire climbs it, until its char grows thick enough to starve it. Glowing char oxidises while there is oxygen at its surface, crazes into cracks that glow hotter, and ash builds on char that glows long enough. Fresh ball starts again; Burning ball off makes it inert grey.',
   ],
   [
     'Rendering',
@@ -127,6 +131,14 @@ function Slider({
   )
 }
 
+// The wooden ball on the HUD: its hottest surface, and whether it is alight or how much of it has charred.
+function ballLine(b: BallStatus) {
+  const c = Math.round(b.surfaceK - 273.15)
+  if (b.burningKW >= 0.5) return `\nBall ${c} °C  burning ${b.burningKW.toFixed(0)} kW`
+  if (b.charred >= 0.01) return `\nBall ${c} °C  ${Math.round(b.charred * 100)}% charred`
+  return `\nBall ${c} °C`
+}
+
 export default function PyroLab() {
   const frameRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -143,6 +155,26 @@ export default function PyroLab() {
   const exportCancel = useRef(false)
   // What a drag on the image does: stir the gas, move the source along the floor, or move the collision ball.
   const [tool, setTool] = useState<'stir' | 'source' | 'ball'>('stir')
+  // The callout inviting visitors to burn the wooden ball, until they try it or wave it away (remembered here).
+  const [calloutGone, setCalloutGone] = useState(() => {
+    try {
+      return localStorage.getItem('pyro-wood-ball-callout') === 'done'
+    } catch {
+      return false
+    }
+  })
+  const dismissCallout = () => {
+    setCalloutGone(true)
+    try {
+      localStorage.setItem('pyro-wood-ball-callout', 'done')
+    } catch {}
+  }
+  const tryBall = () => {
+    dismissCallout()
+    update({ ball: true, ballBurns: true })
+    setTool('ball')
+    engineRef.current?.ballBeside()
+  }
   const [renderer, setRenderer] = useState('')
   const tabsId = useId()
   const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
@@ -374,6 +406,8 @@ export default function PyroLab() {
           </>
         ) : tool === 'source' ? (
           <>Drag along the floor to move the {pyro.sourceType === 'fire' ? 'fire' : 'smoke'}</>
+        ) : pyro.ballBurns && pyro.sourceType === 'fire' ? (
+          <>Drag the ball into the flames and hold it there</>
         ) : (
           <>Drag the ball through the {pyro.sourceType === 'fire' ? 'flames' : 'smoke'}</>
         )}
@@ -416,10 +450,26 @@ export default function PyroLab() {
             : mode === 'starting'
               ? 'Starting the solver'
               : `${pyro.sourceType === 'fire' ? 'Fire' : 'Smoke'}  ${dims.join(' × ')}`}
+          {mode === 'live' && status?.ball && ballLine(status.ball)}
         </div>
         {mode === 'live' && status && (
           <div className="lab-hud lab-hud-right">
             {paused ? `Paused  ${status.simTime.toFixed(1)} s` : `${status.simTime.toFixed(1)} s  ${status.stepsPerSec} steps/s`}
+          </div>
+        )}
+        {mode === 'live' && shown && !calloutGone && pyro.sourceType === 'fire' && pyro.ballBurns && (
+          <div className="lab-callout" role="note">
+            <p>
+              <b>New</b>The ball is wood. Hold it in the flames and it scorches, chars and catches fire.
+            </p>
+            <div className="lab-callout-actions">
+              <Pill on={false} onClick={tryBall}>
+                Try it
+              </Pill>
+              <Pill on={false} onClick={dismissCallout}>
+                Not now
+              </Pill>
+            </div>
           </div>
         )}
         {debugOn && (
@@ -518,6 +568,19 @@ export default function PyroLab() {
                 {pyro.ball && (
                   <div className="lab-row">
                     <Slider label="Ball radius" min={0.1} max={0.4} step={0.01} value={pyro.ballRadius} unit=" m" onChange={v => update({ ballRadius: v })} />
+                    <Group label="Burning ball">
+                      <Pill on={pyro.ballBurns} onClick={() => update({ ballBurns: true })}>
+                        On
+                      </Pill>
+                      <Pill on={!pyro.ballBurns} onClick={() => update({ ballBurns: false })}>
+                        Off
+                      </Pill>
+                    </Group>
+                    {pyro.ballBurns && (
+                      <Pill on={false} onClick={() => engineRef.current?.newBall()}>
+                        Fresh ball
+                      </Pill>
+                    )}
                   </div>
                 )}
               </>

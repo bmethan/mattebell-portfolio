@@ -63,6 +63,14 @@ body {
 .lab-hud-left { left: 14px; }
 .lab-hud-right { right: 14px; text-align: right; }
 .lab-hud-bottom { top: auto; bottom: 12px; left: 14px; text-transform: none; letter-spacing: 0.04em; }
+/* The path-traced reference's wipe: dragged anywhere over the frame; the live render left of the line, the traced right. */
+.lab-wipe { position: absolute; inset: 0; cursor: ew-resize; touch-action: none; }
+.lab-wipe-line { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: rgba(240, 240, 240, 0.8); box-shadow: 0 0 3px rgba(0, 0, 0, 0.7); outline: none; }
+.lab-wipe-line::after { content: ''; position: absolute; top: 50%; left: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; background: rgba(6, 6, 7, 0.75); border: 1px solid rgba(240, 240, 240, 0.85); }
+.lab-wipe-line:focus-visible::after { border-color: var(--accent); }
+.lab-wipe-tag { top: auto; bottom: 12px; }
+.lab-wipe-live { left: 14px; }
+.lab-wipe-traced { right: 14px; text-align: right; }
 /* A callout over the image that invites a visitor to try something new (the wooden ball). */
 .lab-callout { position: absolute; left: 14px; bottom: 12px; max-width: min(420px, calc(100% - 28px)); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 10px 12px; background: rgba(6, 6, 7, 0.78); border: 0.5px solid var(--border-teal); font-size: 12px; line-height: 1.5; color: var(--text-soft); }
 .lab-callout b { color: var(--accent); font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; font-size: 10px; margin-right: 6px; }

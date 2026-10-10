@@ -2332,7 +2332,8 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 // octaves (a = b = c = 1/2, which conserves energy) and Henyey-Greenstein phase, by the sky through the optical depth
 // above, and by the fire; hot soot glows at its blackbody radiance; then a floor that catches the smoke's shadow,
 // fading to black. Written exposed, at high dynamic range, for the accumulation pass.
-export const RENDER = /* wgsl */ `
+// (Its library, which the path-traced reference shares: the bindings, the scene and the gas.)
+const RENDER_LIB = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
 @group(0) @binding(2) var samp: sampler;
@@ -3165,6 +3166,10 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
   return col;
 }
 
+`
+
+export const RENDER = /* wgsl */ `
+${RENDER_LIB}
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   // Each frame's rays pass through a different point of their pixel (the R2 sequence), which the accumulation turns
@@ -3343,6 +3348,497 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 
   // Exposed (as a fraction of the luminance the camera maps to white), for the accumulation pass.
   return vec4<f32>(col * R.camUp.w, 1.0);
+}
+`
+
+// 12. The path-traced reference (paused, the Path trace button): the same scene and the same gas, its light
+// carried exactly, one path per pixel each frame, averaged. It checks the image pass's shortcuts: multiple scattering
+// as octaves of the sun's light, the fire's light as eight point lights through a half-resolution light volume, the
+// sky through the optical depth straight up, the floor lit by the fire unshadowed, the environment as nine spherical
+// harmonics. Here the flames themselves are the fire's light, reached by the paths that find them.
+//
+//   the gas       the image pass's own: its tricubic density, detail and subgrid flame temperature, the soot formed by
+//                 now, the flame's own blue light, the burning ball's flames, at one moment of the shutter per path
+//                 (the motion blur); each march step's gas held constant over the step, as the image pass holds it
+//   free flight   step by step (half a cell): in each, the soot's glow, then a collision at the step's chance of
+//                 one (by the most opaque colour; the others weighted), a scattering by the albedo; so the medium is
+//                 the image pass's piecewise-constant one, with no bias against it
+//   scattering    Henyey-Greenstein at the lab's anisotropy, sampled exactly
+//   lights        the sun's disc (0.53 degrees), an HDR map's key in the cone it was taken from, the rig's softboxes
+//                 as cones of their solid angles: each sampled at every scattering and surface (next-event estimation,
+//                 shadowed through the gas by its optical depth, and by the balls, the set and the cyc), and seen as
+//                 such by camera rays and the chrome ball
+//   the flames    sampled too, at every scattering and surface: a point in one of the eight slices of the fire's
+//                 height, the slice chosen by its light (the image pass's sums), mostly in an upright cylinder about
+//                 its brightness-weighted centre and otherwise anywhere across the slice (the hot plume spreads wider);
+//                 its glow and the flame's blue toward the point sampled from, through the gas between, over the
+//                 point's probability. A path that leaves such a point then counts only the glow that sampling cannot
+//                 reach (within two cells of the point, where a sampled point would bring light without limit), so
+//                 nothing is counted twice and nothing missed
+//   sky           what a path that leaves finds: under the open sky the sky as drawn, in the studio or on the cyc the
+//                 flat dome the image pass lights by (unseen by the camera), with a map the map without its key
+//   surfaces      the floor and cyc Lambertian; the balls, the chart and the stands as the image pass's OpenPBR (a
+//                 Lambertian base under a GGX layer, ash as part of the base), the chrome ball a mirror
+//   paths         Russian roulette after the fourth event, capped at maxBounce
+export const PATH_TRACE = /* wgsl */ `
+${RENDER_LIB}
+struct PtParams {
+  frame: u32,     // seeds this frame's paths
+  n: u32,         // paths averaged so far
+  maxBounce: u32,
+  pad: u32,
+  l0d: vec4<f32>, // three cone lights: toward each, the cosine of its half-angle (0: off)
+  l0e: vec4<f32>, // and its illuminance at normal incidence (lux, by colour)
+  l1d: vec4<f32>,
+  l1e: vec4<f32>,
+  l2d: vec4<f32>,
+  l2e: vec4<f32>,
+}
+@group(0) @binding(36) var ptPrev: texture_2d<f32>;
+@group(0) @binding(37) var<uniform> Q: PtParams;
+@group(0) @binding(38) var envRes: texture_2d<f32>; // the HDR map without its key (environment.ts)
+
+var<private> rng: u32;
+fn pcg(v: u32) -> u32 {
+  let s = v * 747796405u + 2891336453u;
+  let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+fn rand() -> f32 {
+  rng = pcg(rng);
+  return f32(rng >> 8u) * (1.0 / 16777216.0);
+}
+fn around(axis: vec3<f32>, c: f32) -> vec3<f32> {
+  let s = sqrt(max(1.0 - c * c, 0.0));
+  let phi = TWO_PI * rand();
+  let F = tangentFrame(axis);
+  return normalize(F[0] * (s * cos(phi)) + F[1] * (s * sin(phi)) + axis * c);
+}
+fn cosineDir(n: vec3<f32>) -> vec3<f32> { return around(n, sqrt(rand())); }
+// The direction scattered from travel along d (forward for g > 0).
+fn hgSample(d: vec3<f32>, g: f32) -> vec3<f32> {
+  let u = rand();
+  var c = 1.0 - 2.0 * u;
+  if (abs(g) > 1e-3) {
+    let s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u);
+    c = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+  }
+  return around(d, c);
+}
+
+struct Cone { d: vec3<f32>, c: f32, e: vec3<f32> }
+fn coneOf(i: i32) -> Cone {
+  if (i == 0) { return Cone(Q.l0d.xyz, Q.l0d.w, Q.l0e.xyz); }
+  if (i == 1) { return Cone(Q.l1d.xyz, Q.l1d.w, Q.l1e.xyz); }
+  return Cone(Q.l2d.xyz, Q.l2d.w, Q.l2e.xyz);
+}
+
+// The gas at w (the image pass's, step for step): extinction at 550 nm, the soot's glow per unit absorbed, the flame's
+// own light per metre.
+struct Gas3 { sig: f32, glow: vec3<f32>, chem: vec3<f32> }
+const ROT = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
+fn gasAt(w: vec3<f32>, tau: f32, withLight: bool) -> Gas3 {
+  var wm = w;
+  if (R.camera.x > 0.0) {
+    let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
+    wm = w - u * tau;
+  }
+  let uvm = uvwOf(wm);
+  let s4 = scalSmooth(uvm);
+  let fade = edgeFade(uvm) * offBallStairs(wm);
+  var sig = sigmaOf(s4) * fade;
+  let upres = R.wb2.w > 0.5;
+  if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvm, 0.0).x, 0.0) * fade; }
+  var out = Gas3(0.0, vec3<f32>(0.0), vec3<f32>(0.0));
+  var heat = 0.0;
+  if (R.fire.x > 0.5) {
+    heat = textureSampleLevel(flameTex, samp, uvm, 0.0).x * offBallShell(wm);
+    if (heat > 0.0) {
+      sig *= sootFormed(gasOf(s4), heat);
+      if (withLight) { out.chem = CHEMI_COLOUR * (CHEMI_CD * heat * fade); }
+    }
+  }
+  if (sig > 1e-3) {
+    if (R.detail.z > 0.0 && !upres) {
+      let thin = 1.0 - smoothstep(0.2, 4.0, sig);
+      let faint = smoothstep(0.0, 1.0, sig);
+      sig *= clamp(1.0 + 2.0 * R.detail.z * detail(wm, uvm) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
+    }
+    let rise = riseOf(s4);
+    if (withLight && R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
+      var kelvin = radiatingKelvin(T_AMB + rise, heat);
+      if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, ROT)); }
+      out.glow = (1.0 - R.skyCol.w) * planck(kelvin);
+    }
+  }
+  out.sig = sig;
+  return out;
+}
+
+// How much of the light from dist along l reaches p: none past a surface (the floor, the cyc, the balls, the set);
+// through the gas, its transmittance (the optical depth marched a cell at a step). shadowT: from a light far off.
+fn transTo(p: vec3<f32>, l: vec3<f32>, dist: f32, tau: f32) -> vec3<f32> {
+  if (l.y < 0.0 && p.y > 0.0 && -p.y / l.y < dist) { return vec3<f32>(0.0); }
+  if (ballHit(p, l) < dist || refHit(p, l).t < dist) { return vec3<f32>(0.0); }
+  if (R.scene.x > 1.5 && cycHit(p, l).x < dist) { return vec3<f32>(0.0); }
+  let box = boxHit(p, l, P.origin.xyz, domainHi());
+  let tEnd = min(box.y, dist);
+  if (tEnd <= max(box.x, 0.0)) { return vec3<f32>(1.0); }
+  let ds = P.grid.x;
+  var od = 0.0;
+  var t = max(box.x, 0.0) + rand() * ds;
+  for (var i = 0; i < 1024; i++) {
+    if (t > tEnd || od > 40.0) { break; }
+    let w = p + l * t;
+    if (textureSampleLevel(light, samp, uvwOf(w), 0.0).z < 1e-4) {
+      t += 2.0 * ds;
+      continue;
+    }
+    od += gasAt(w, tau, false).sig * ds;
+    t += ds;
+  }
+  return exp(-od * chroma());
+}
+fn shadowT(p: vec3<f32>, l: vec3<f32>, tau: f32) -> vec3<f32> { return transTo(p, l, 1e9, tau); }
+
+// The flames as a light (the header): the slices' light, the cylinders, a point and its probability (per m3).
+var<private> fireTot: f32;
+const FIRE_WIDE = 0.15; // the share of the points drawn anywhere across the slice
+fn fireSlab() -> f32 { return f32(P.dims.y) * P.grid.x / f32(FIRE_BANDS); }
+fn fireRadius() -> f32 { return max(1.5 * P.src.w, 0.3); }
+fn firePdf(x: vec3<f32>) -> f32 {
+  if (fireTot <= 0.0) { return 0.0; }
+  let h = fireSlab();
+  let b = floor(x.y / h);
+  let lo = P.origin.xyz;
+  let hi = domainHi();
+  if (b < 0.0 || b >= f32(FIRE_BANDS) || any(x.xz < lo.xz) || any(x.xz > hi.xz)) { return 0.0; }
+  let bi = u32(b);
+  let lum = fireLight[3u + 2u * bi].w;
+  // (A slice with no light has no centre.)
+  if (!(lum > 0.0)) { return 0.0; }
+  let r = fireRadius();
+  var pdf = FIRE_WIDE / ((hi.x - lo.x) * (hi.z - lo.z) * h);
+  if (distance(x.xz, fireLight[4u + 2u * bi].xz) <= r) { pdf += (1.0 - FIRE_WIDE) / (PI * r * r * h); }
+  return lum / fireTot * pdf;
+}
+fn fireSample() -> vec3<f32> {
+  var u = rand() * fireTot;
+  var bi = 0u;
+  for (var b = 0u; b < FIRE_BANDS; b++) {
+    let lum = max(fireLight[3u + 2u * b].w, 0.0);
+    if (lum <= 0.0) { continue; }
+    bi = b;
+    if (u < lum) { break; }
+    u -= lum;
+  }
+  let y = (f32(bi) + rand()) * fireSlab();
+  if (rand() < FIRE_WIDE) {
+    let lo = P.origin.xyz;
+    let hi = domainHi();
+    return vec3<f32>(mix(lo.x, hi.x, rand()), y, mix(lo.z, hi.z, rand()));
+  }
+  let rr = fireRadius() * sqrt(rand());
+  let a = TWO_PI * rand();
+  let c = fireLight[4u + 2u * bi].xyz;
+  return vec3<f32>(c.x + rr * cos(a), y, c.z + rr * sin(a));
+}
+// From p: the direction to a sampled point of the flames, and the light it brings, over its probability (the glow per
+// metre toward p, through the gas between, over the distance squared). Most of a cylinder holds little glow and its
+// sheets a great deal, so the point is chosen from FIRE_CANDIDATES drawn as above, in proportion to the light each
+// would bring unshadowed, as the scattering (the phase toward rd, g) or the surface (its cosine about n) takes it
+// (resampled importance sampling; Talbot et al. 2005): unbiased, with the weight the average of the candidates' over
+// the chosen one's, which keeps the bright sheets from making speckles. (The caller applies the phase or the surface's
+// reflectance; the chosen point's share of it is divided out here.) Glow within FIRE_NEAR cells
+// of the point sampled from is left to the path's next segment instead (its march counts it, smoothly): sampled, a
+// point that near would bring light without limit, as one over its distance squared.
+const FIRE_CANDIDATES = 8u; // candidates drawn each time the flames are sampled
+const FIRE_NEAR = 2.0; // cells about the point sampled from
+struct FireLight { l: vec3<f32>, L: vec3<f32> }
+fn fireToward(p: vec3<f32>, tau: f32, ch: vec3<f32>, surface: bool, dir: vec3<f32>, g: f32) -> FireLight {
+  var f = FireLight(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
+  if (fireTot <= 0.0) { return f; }
+  var sum = 0.0;
+  var x = vec3<f32>(0.0);
+  var S = vec3<f32>(0.0);
+  var chosen = 0.0;
+  for (var i = 0u; i < FIRE_CANDIDATES; i++) {
+    let xi = fireSample();
+    let pdf = firePdf(xi);
+    if (pdf <= 0.0) { continue; }
+    let m = gasAt(xi, tau, true);
+    let Si = m.sig * ch * m.glow + m.chem;
+    let d = xi - p;
+    let dd = dot(d, d);
+    if (dd < sq(FIRE_NEAR * P.grid.x)) { continue; }
+    let li = d / sqrt(dd);
+    let ti = ap1Lum(Si) / dd * select(hg(dot(dir, li), g), max(dot(dir, li), 0.0), surface);
+    let wi = ti / pdf;
+    if (wi <= 0.0) { continue; }
+    sum += wi;
+    if (rand() * sum < wi) {
+      x = xi;
+      S = Si;
+      chosen = ti;
+    }
+  }
+  if (sum <= 0.0 || chosen <= 0.0) { return f; }
+  let d = x - p;
+  let d2 = dot(d, d);
+  let dist = sqrt(d2);
+  f.l = d / dist;
+  f.L = S / d2 / chosen * (sum / f32(FIRE_CANDIDATES)) * transTo(p, f.l, dist, tau);
+  return f;
+}
+
+// What a path that leaves the scene finds. seen: a camera ray, or one off the chrome ball.
+fn leaving(d: vec3<f32>, seen: bool) -> vec3<f32> {
+  var L = vec3<f32>(0.0);
+  if (envOn()) {
+    // A map (the rig's studio has none): seen whole, lit by without its key (a light of its own).
+    if (R.env.w > 0.0) {
+      if (seen) {
+        L = envBackdrop(d);
+      } else {
+        let e = toEnv(d);
+        let uv = vec2<f32>(fract(atan2(e.x, -e.z) * INV_2PI + 0.5), acos(clamp(e.y, -1.0, 1.0)) * INV_PI);
+        L = textureSampleLevel(envRes, noiseSamp, uv, 0.0).xyz * R.env.w;
+      }
+    }
+  } else if (R.scene.x > 0.5 && R.scene.x < 1.5) {
+    L = R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(d.y, 0.0)));
+  } else if (!seen && d.y > 0.0) {
+    L = R.skyCol.xyz * INV_PI;
+  }
+  // The lights, where seen: their radiance, illuminance over solid angle.
+  if (seen) {
+    for (var i = 0; i < 3; i++) {
+      let c = coneOf(i);
+      if (c.c > 0.0 && dot(d, c.d) > c.c) { L += c.e / (TWO_PI * (1.0 - c.c)); }
+    }
+  }
+  return L;
+}
+
+// A surface met: the floor or the cyc, the collision ball, the set (its chrome ball a mirror).
+struct Surf { n: vec3<f32>, ng: vec3<f32>, m: BallMat, glow: vec3<f32>, mirror: bool }
+fn surfaceAt(p: vec3<f32>, kind: i32, nGeo: vec3<f32>, what: i32) -> Surf {
+  var s = Surf(nGeo, nGeo, BallMat(vec3<f32>(0.0), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5), vec3<f32>(0.0), false);
+  if (kind == 0) {
+    let fade = select(exp(-dot(p.xz, p.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
+    s.m.base = R.floorCol.xyz * fade;
+  } else if (kind == 1) {
+    s.m = BallMat(vec3<f32>(BALL_ALBEDO), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5);
+    if (ballBurns()) {
+      let lp = (p - P.ball.xyz) / P.ball.w;
+      let sk = skinAt(nGeo);
+      let crack = charCracks(lp, sk);
+      s.m = ballMat(lp, sk, crack);
+      s.n = crackNormal(lp, nGeo, sk, crack);
+      s.glow = charGlow(sk, crack);
+    }
+  } else {
+    s.mirror = what == 1;
+    s.m = refMat(what);
+  }
+  return s;
+}
+// The surface's reflectance toward v of light from l, times the cosine: the base (what the specular layer passes,
+// the fuzz folded into it) over pi, and the specular lobe.
+fn surfF(s: Surf, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
+  let nl = dot(s.n, l);
+  if (nl <= 0.0 || dot(s.ng, l) <= 0.0) { return vec3<f32>(0.0); }
+  let nv = max(dot(s.n, v), 1e-4);
+  let eFuzz = select(0.0, fuzzDirAlbedo(nv, s.m.fuzzRough), s.m.fuzzW > 0.0);
+  let base = (s.m.base * (1.0 - s.m.fuzzW * eFuzz) + s.m.fuzzW * eFuzz * s.m.fuzzColor) * (1.0 - s.m.specW * envBRDF(s.m.f0, s.m.rough, nv));
+  return base * INV_PI * nl + s.m.specW * ggxSpec(s.n, v, l, s.m.rough, s.m.f0);
+}
+
+@fragment
+fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  let px = vec2<i32>(fc.xy);
+  rng = pcg(u32(px.x) + u32(px.y) * 8192u + pcg(Q.frame));
+  // (The image pass's bindings, in full, so the two share their resources.)
+  _ = fireLight[0];
+  _ = textureNumLayers(blueTex);
+  _ = textureDimensions(light2);
+  // A ray through a random point of the pixel, at a random moment of the shutter.
+  let ndc = vec2<f32>((floor(fc.x) + rand()) / R.size.x * 2.0 - 1.0, 1.0 - (floor(fc.y) + rand()) / R.size.y * 2.0);
+  let tanY = R.camPos.w;
+  var rd = normalize(R.camFwd.xyz + R.camRight.xyz * ndc.x * tanY * R.camFwd.w + R.camUp.xyz * ndc.y * tanY);
+  var ro = R.camPos.xyz;
+  let tau = (rand() - 0.5) * R.camera.x;
+  let ch = chroma();
+  let g = R.sunDir.w;
+  let albedo = R.skyCol.w;
+  var L = vec3<f32>(0.0);
+  var beta = vec3<f32>(1.0);
+  var seen = true;
+  var events = 0u;
+  // The fire's light in the slices (0 for a smoke source), and whether this segment leaves a vertex where the flames
+  // were sampled (its glow inside the cylinders then already counted).
+  fireTot = 0.0;
+  if (R.fire.x > 0.5) {
+    for (var b = 0u; b < FIRE_BANDS; b++) { fireTot += max(fireLight[3u + 2u * b].w, 0.0); }
+  }
+  var sampled = false;
+  var pv = vec3<f32>(0.0); // the vertex the segment leaves
+  for (var bounce = 0u; bounce < 64u; bounce++) {
+    // The surface ahead: the floor (or the cyc), the collision ball, the set.
+    var tS = select(1e9, -ro.y / rd.y, rd.y < -1e-5 && ro.y > 0.0);
+    var nS = vec3<f32>(0.0, 1.0, 0.0);
+    if (R.scene.x > 1.5) {
+      let cy = cycHit(ro, rd);
+      tS = cy.x;
+      nS = cy.yzw;
+    }
+    var kind = 0;
+    var what = -1;
+    let tB = ballHit(ro, rd);
+    if (tB < tS) {
+      tS = tB;
+      nS = normalize(ro + rd * tB - P.ball.xyz);
+      kind = 1;
+    }
+    let rh = refHit(ro, rd);
+    if (rh.t < tS) {
+      tS = rh.t;
+      nS = rh.n;
+      kind = 2;
+      what = rh.what;
+    }
+    // The gas up to it: glow, and a collision or not, step by step.
+    var scattered = false;
+    let box = boxHit(ro, rd, P.origin.xyz, domainHi());
+    if (box.y > max(box.x, 0.0) && box.x < tS) {
+      let ds = 0.5 * P.grid.x;
+      let tEnd = min(box.y, tS);
+      var t = max(box.x, 0.0) + rand() * ds;
+      for (var i = 0; i < 4096; i++) {
+        if (t > tEnd) { break; }
+        let w = ro + rd * t;
+        let toBall = distance(w, P.ball.xyz) - P.ball.w;
+        let nearFlames = ballBurns() && toBall < BALL_FLAME_REACH;
+        let nearBall = P.ball.w > 0.0 && toBall < 0.15;
+        if (textureSampleLevel(light, samp, uvwOf(w), 0.0).z < 1e-4 && !nearFlames && !nearBall) {
+          t += 3.0 * ds;
+          continue;
+        }
+        if (nearFlames) {
+          let bf = ballFlame(w);
+          if (bf.x > 0.0) {
+            let tf = exp(-bf.x * ds);
+            L += beta * (1.0 - tf) * (1.0 - albedo) * planck(bf.y);
+            beta *= tf;
+          }
+        }
+        let m = gasAt(w, tau, true);
+        let counted = sampled && firePdf(w) > 0.0 && distance(w, pv) >= FIRE_NEAR * P.grid.x;
+        if (!counted) { L += beta * m.chem * ds; }
+        if (m.sig > 1e-3) {
+          let sc = m.sig * ch;
+          let Ts = exp(-sc * ds);
+          if (!counted) { L += beta * (1.0 - Ts) * m.glow; }
+          let sm = max(sc.x, max(sc.y, sc.z));
+          let q = 1.0 - exp(-sm * ds);
+          if (rand() < q) {
+            // A collision, somewhere in the step: scattered (the albedo's share; the rest absorbed, in the weight).
+            let tc = t + min(-log(max(1.0 - rand() * q, 1e-7)) / sm, ds);
+            beta *= albedo * (1.0 - Ts) / q;
+            let p = ro + rd * tc;
+            for (var k = 0; k < 3; k++) {
+              let c = coneOf(k);
+              if (c.c <= 0.0) { continue; }
+              let l = around(c.d, 1.0 - rand() * (1.0 - c.c));
+              L += beta * c.e * shadowT(p, l, tau) * hg(dot(rd, l), g) * INV_4PI;
+            }
+            let fl = fireToward(p, tau, ch, false, rd, g);
+            L += beta * fl.L * hg(dot(rd, fl.l), g) * INV_4PI;
+            sampled = fireTot > 0.0;
+            pv = p;
+            ro = p;
+            rd = hgSample(rd, g);
+            scattered = true;
+            break;
+          }
+          beta *= Ts / (1.0 - q);
+        }
+        t += ds;
+      }
+    }
+    if (!scattered) {
+      if (tS >= 1e8) {
+        L += beta * leaving(rd, seen);
+        break;
+      }
+      let p = ro + rd * tS;
+      // Under the open sky the far floor fades into the horizon's haze, as the image pass draws it.
+      if (kind == 0 && R.scene.x > 0.5 && R.scene.x < 1.5 && rand() > exp(-tS / 40.0)) {
+        L += beta * select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
+        break;
+      }
+      let s = surfaceAt(p, kind, nS, what);
+      let v = -rd;
+      if (s.mirror) {
+        beta *= chromeFresnel(max(dot(s.n, v), 0.0));
+        ro = p + s.ng * 1e-3;
+        rd = reflect(rd, s.n);
+        sampled = false;
+        continue;
+      }
+      L += beta * s.glow;
+      let po = p + s.ng * 1e-3;
+      for (var k = 0; k < 3; k++) {
+        let c = coneOf(k);
+        if (c.c <= 0.0) { continue; }
+        let l = around(c.d, 1.0 - rand() * (1.0 - c.c));
+        L += beta * c.e * shadowT(po, l, tau) * surfF(s, v, l);
+      }
+      let fl = fireToward(po, tau, ch, true, s.ng, 0.0);
+      L += beta * fl.L * surfF(s, v, fl.l);
+      sampled = fireTot > 0.0;
+      pv = po;
+      let l = cosineDir(s.n);
+      let nl = dot(s.n, l);
+      if (nl <= 0.0 || dot(s.ng, l) <= 0.0) { break; }
+      beta *= surfF(s, v, l) * PI / nl;
+      ro = po;
+      rd = l;
+    }
+    seen = false;
+    events++;
+    if (events >= Q.maxBounce) { break; }
+    if (events > 3u) {
+      let keep = clamp(max(beta.x, max(beta.y, beta.z)), 0.05, 0.95);
+      if (rand() > keep) { break; }
+      beta /= keep;
+    }
+  }
+  // The running mean, exposed as the image pass writes its frames. (A path that went numerically wrong, which none
+  // should, is dropped rather than left to stick in the mean.)
+  var sample = L * R.camUp.w;
+  if (!all(sample == sample) || any(abs(sample) > vec3<f32>(1e30))) { sample = vec3<f32>(0.0); }
+  let prev = select(vec3<f32>(0.0), textureLoad(ptPrev, px, 0).xyz, Q.n > 0u);
+  return vec4<f32>(prev + (sample - prev) / f32(Q.n + 1u), 1.0);
+}
+`
+
+// The wipe: the live frame left of a column, the traced right of it, into the texture the glare and display read.
+export const PT_COMPOSITE = /* wgsl */ `
+@group(0) @binding(0) var live: texture_2d<f32>;
+@group(0) @binding(1) var traced: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> W: vec4<f32>; // the wipe's pixel column
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  let p = vec2<i32>(fc.xy);
+  if (fc.x < W.x) { return textureLoad(live, p, 0); }
+  return vec4<f32>(textureLoad(traced, p, 0).xyz, 1.0);
 }
 `
 

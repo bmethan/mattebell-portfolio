@@ -19,14 +19,17 @@ export type PyroEnv = Exclude<Env, 'none'>
 type Vec3 = [number, number, number]
 
 export interface EnvLight {
-  // The key, in the map's frame: toward it, and its illuminance at normal incidence by colour; or null.
-  key: { dir: Vec3; irradiance: Vec3 } | null
+  // The key, in the map's frame: toward it, its illuminance at normal incidence by colour, and the half-angle of the
+  // cone it was taken from (degrees); or null.
+  key: { dir: Vec3; irradiance: Vec3; cone: number } | null
   // Where the map's light centres (the key, or the brightest region of a map without one): the lab's light azimuth
   // turns the map so this faces it.
   anchor: Vec3
   sh: Float32Array // 9 coefficients x rgb (the rest of the map, the floor below the horizon)
   illuminance: number // on open ground (lux in the map's units), key included
   backdrop: { w: number; h: number; rgba: Float32Array }
+  // The same without the key (the path-traced reference lights with the key as a light of its own).
+  residual: { w: number; h: number; rgba: Float32Array }
 }
 
 export const BACKDROP_W = 256
@@ -128,7 +131,7 @@ async function prepare(env: PyroEnv): Promise<EnvLight> {
     if (len <= 0) continue
     const dir: Vec3 = [d[0] / len, d[1] / len, d[2] / len]
     if (lum(...e) * Math.max(dir[1], 0) < share * eh) continue
-    key = { dir, irradiance: e }
+    key = { dir, irradiance: e, cone }
     for (const k of inside) for (let ch = 0; ch < 3; ch++) residual[4 * k + ch] = Math.min(rgba[4 * k + ch], base[ch])
     break
   }
@@ -155,21 +158,25 @@ async function prepare(env: PyroEnv): Promise<EnvLight> {
     }
   }
 
-  // The backdrop: the map in blocks, as a softened copy (the sun's disc spread over its block).
+  // The backdrop: the map in blocks, as a softened copy (the sun's disc spread over its block); and the same of the map
+  // without its key.
   const fx = w / BACKDROP_W, fy = h / BACKDROP_H
-  const bd = new Float32Array(BACKDROP_W * BACKDROP_H * 4)
-  for (let j = 0; j < BACKDROP_H; j++) {
-    for (let i = 0; i < BACKDROP_W; i++) {
-      const s = [0, 0, 0]
-      for (let y = 0; y < fy; y++) for (let x = 0; x < fx; x++) {
-        const k = (j * fy + y) * w + i * fx + x
-        for (let ch = 0; ch < 3; ch++) s[ch] += rgba[4 * k + ch]
+  const blocks = (src: Float32Array) => {
+    const bd = new Float32Array(BACKDROP_W * BACKDROP_H * 4)
+    for (let j = 0; j < BACKDROP_H; j++) {
+      for (let i = 0; i < BACKDROP_W; i++) {
+        const s = [0, 0, 0]
+        for (let y = 0; y < fy; y++) for (let x = 0; x < fx; x++) {
+          const k = (j * fy + y) * w + i * fx + x
+          for (let ch = 0; ch < 3; ch++) s[ch] += src[4 * k + ch]
+        }
+        const o = 4 * (j * BACKDROP_W + i)
+        bd.set([s[0] / (fx * fy), s[1] / (fx * fy), s[2] / (fx * fy), 1], o)
       }
-      const o = 4 * (j * BACKDROP_W + i)
-      bd.set([s[0] / (fx * fy), s[1] / (fx * fy), s[2] / (fx * fy), 1], o)
     }
+    return { w: BACKDROP_W, h: BACKDROP_H, rgba: bd }
   }
-  return { key, anchor: key ? key.dir : pd, sh: Float32Array.from(sh), illuminance: eh, backdrop: { w: BACKDROP_W, h: BACKDROP_H, rgba: bd } }
+  return { key, anchor: key ? key.dir : pd, sh: Float32Array.from(sh), illuminance: eh, backdrop: blocks(rgba), residual: blocks(residual) }
 }
 
 export { ENVIRONMENTS }

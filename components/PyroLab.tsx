@@ -102,6 +102,10 @@ const TECH_NOTES: [string, string][] = [
     'The Lookdev lab’s reference set stands beside the fire, as a lighting team shoots one on set to record the light where an effect will go: its ColorChecker (X-Rite’s published values), an 18% grey ball and a chrome ball, the balls 16 cm across on thin stands at about the middle of the flames’ height, the chart on the floor in front of them, turned to the camera and a little toward the fire. It stands in the bonfire’s opening scene, and the Shading tab turns it on or off for any other. It stands on the fire’s upwind side (the right, in still air), clear of the bed and inside the frame; where the frame leaves no room upwind, it stands downwind, as far from the fire as the frame allows. The balls and the chart are solids in the simulation, as the collision ball is, so the gas flows around them (the stands, thinner than a cell, are left out). The grey ball and the chart are lit as the burning ball is, by the sun, the sky and the fire through the smoke, so the chart shows the firelight’s colour against the camera’s white balance. The chrome ball is a mirror with OpenPBR’s metal Fresnel (its F82 tint): each ray that meets it is reflected and marched again through the gas, more lightly than the camera’s rays (twice the step, without the motion blur or the subgrid detail), so it shows the fire, its smoke, the stage, the collision ball and the rest of the set as they stand, and the sun and the rig’s softboxes as highlights. The set’s pieces shadow each other, the collision ball and the floor, from the sun, the rig’s rim and each slice of the fire.',
   ],
   [
+    'Path-traced reference',
+    'Paused, the Path trace button traces the same frame with its light carried exactly, one path a pixel each frame, averaged, behind a wipe against the live render (drag it). The gas is the live render’s own, step for step: its density, detail and subgrid flame temperature, the soot formed by now and the flame’s blue light, each path at its own moment of the shutter. What the reference carries exactly is what the live render takes shortcuts with: light scattered any number of times through the smoke (the live render folds multiple scattering into octaves of the sun’s light); the fire’s light from the flames themselves, shadowed by the smoke on the way (the live render’s is eight point lights through a light volume at half resolution, and the floor’s unshadowed); the sky through the smoke in every direction (not only straight up); an HDR map in full (not nine spherical harmonics). At every scattering and surface a path samples the sun’s disc, a map’s key or the rig’s softboxes, and the flames: a point drawn in one of eight slices of the fire’s height by its light, chosen from eight candidates in proportion to what each would bring (resampled importance sampling, after Talbot, Cline and Egbert). Paths end by Russian roulette, and the reference stops at 4,096 paths a pixel. The surfaces are the live render’s materials, simplified (the chrome ball a mirror, the rest a matte base under a glossy layer).',
+  ],
+  [
     'Export',
     'The Solver tab writes the simulation as OpenVDB, the volume format of film effects work, so a frame or a two-second sequence can be rendered in Houdini, Blender or any other program that reads it. The writer is the lab’s own, a few hundred lines: each grid a standard OpenVDB tree (a root, internal nodes of 32³ and 16³ children, leaves of 8³ voxels), with only the leaves that hold smoke, heat or fuel written, and values as 32-bit floats with OpenVDB’s active-mask compression. Every grid reads back bit for bit in OpenVDB 13, the version Blender 5.2 bundles, and the frames render in Blender’s Cycles.',
   ],
@@ -355,6 +359,23 @@ export default function PyroLab() {
     setPaused(!paused)
     engineRef.current?.setPaused(!paused)
   }
+  // The path-traced reference (paused): a wipe across the frame, the live render left of it, the traced right.
+  const tracing = paused && !!status?.pathTrace.on
+  const [wipe, setWipeAt] = useState(0.5)
+  const moveWipe = (share: number) => {
+    const w = Math.min(Math.max(share, 0), 1)
+    setWipeAt(w)
+    engineRef.current?.setWipe(w)
+  }
+  const toggleTrace = () => {
+    engineRef.current?.setWipe(wipe)
+    engineRef.current?.setPathTrace(!tracing)
+  }
+  const wipeDrag = useRef<number | null>(null)
+  const wipeAt = (e: React.PointerEvent<HTMLDivElement>) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    moveWipe((e.clientX - r.left) / r.width)
+  }
 
   // Stirring: a mouse or pen stirs at once; a finger must first travel sideways (a vertical swipe scrolls).
   const drag = useRef<{ id: number; x: number; y: number; t: number; live: boolean } | null>(null)
@@ -493,7 +514,7 @@ export default function PyroLab() {
             {paused ? `Paused  ${status.simTime.toFixed(1)} s` : `${status.simTime.toFixed(1)} s  ${status.stepsPerSec} steps/s`}
           </div>
         )}
-        {mode === 'live' && shown && !calloutGone && pyro.sourceType === 'fire' && pyro.ballBurns && (
+        {mode === 'live' && shown && !calloutGone && !tracing && pyro.sourceType === 'fire' && pyro.ballBurns && (
           <div className="lab-callout" role="note">
             <p>
               <b>New</b>The ball is wood. Hold it in the flames and it scorches, chars and catches fire.
@@ -505,6 +526,42 @@ export default function PyroLab() {
               <Pill on={false} onClick={dismissCallout}>
                 Not now
               </Pill>
+            </div>
+          </div>
+        )}
+        {mode === 'live' && tracing && status && (
+          <div
+            className="lab-wipe"
+            onPointerDown={e => {
+              wipeDrag.current = e.pointerId
+              e.currentTarget.setPointerCapture(e.pointerId)
+              wipeAt(e)
+            }}
+            onPointerMove={e => {
+              if (wipeDrag.current === e.pointerId) wipeAt(e)
+            }}
+            onPointerUp={() => (wipeDrag.current = null)}
+            onPointerCancel={() => (wipeDrag.current = null)}
+          >
+            <div
+              className="lab-wipe-line"
+              style={{ left: `${wipe * 100}%` }}
+              role="slider"
+              tabIndex={0}
+              aria-label="Wipe between the live render and the path-traced reference"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(wipe * 100)}
+              onKeyDown={e => {
+                const step = e.key === 'ArrowLeft' ? -0.05 : e.key === 'ArrowRight' ? 0.05 : 0
+                if (!step) return
+                e.preventDefault()
+                moveWipe(wipe + step)
+              }}
+            />
+            <div className="lab-hud lab-wipe-tag lab-wipe-live">Live</div>
+            <div className="lab-hud lab-wipe-tag lab-wipe-traced">
+              {status.pathTrace.compiling ? 'Path traced, compiling' : `Path traced, ${status.pathTrace.samples} ${status.pathTrace.samples === 1 ? 'path' : 'paths'} a pixel`}
             </div>
           </div>
         )}
@@ -549,6 +606,11 @@ export default function PyroLab() {
             >
               Reset controls
             </Pill>
+            {paused && (
+              <Pill on={tracing} onClick={toggleTrace}>
+                Path trace
+              </Pill>
+            )}
           </div>
           <div className="lab-row">
             <Group label="Drag to">

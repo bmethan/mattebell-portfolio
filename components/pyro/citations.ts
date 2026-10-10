@@ -262,6 +262,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
   },
   // The ball's surface, shaded as the Lookdev lab's materials are (its citations, as verified there).
   {
+    id: 'talbot-ris',
+    group: 'Rendering',
+    authors: 'Justin Talbot, David Cline, Parris Egbert',
+    title: 'Importance Resampling for Global Illumination',
+    venue: 'Eurographics Symposium on Rendering, the path-traced reference’s sampling of the flames',
+    year: '2005',
+    url: 'https://doi.org/10.2312/EGWR/EGSR05/139-146',
+  },
+  {
     id: 'colorchecker',
     group: 'Rendering',
     authors: 'X-Rite; Colour Developers',

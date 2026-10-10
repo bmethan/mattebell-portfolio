@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -57,6 +57,11 @@ const TAA_WEIGHT = 0.2 // the current frame's share of the accumulated image whi
 const STBN_SLICES = 16
 const STBN_URL = '/pyro/stbn-64x64x16.bin'
 const TAA_SETTLE = 24 // frames a paused image accumulates (a running average) before it stops redrawing
+// The path-traced reference (PATH_TRACE): paths per pixel it stops at, and scattering or surface events per path.
+const PT_SAMPLES = 4096
+const PT_BOUNCES = 32
+// The sun's half-angle (its disc is 0.53 degrees across).
+const SUN_HALF_ANGLE = (0.2665 * Math.PI) / 180
 // The sun's and the sky's colours (authored in Rec.709, carried into ACEScg, the working space), each scaled to unit
 // luminance (the EV controls set the illuminance).
 const unitLum = (c709: Vec3): Vec3 => {
@@ -71,10 +76,12 @@ const SKY_COLOUR = unitLum([0.42, 0.52, 0.72])
 // radiance times solid angle from the centre of that scene: the key 20 x 0.16 sr, the fill 1.8 x 0.28 sr (about 1:6),
 // the rim 36 x 0.085 sr (about as strong as the key). The key's illuminance is the Key EV (the sun's).
 const RIG = {
-  key: { kelvin: 4300 },
-  fill: { az: 0.95, el: 0.18, kelvin: 8000, ratio: (1.8 * 0.28) / (20 * 0.16) },
-  rim: { az: 2.45, el: 0.45, kelvin: 4300, ratio: (36 * 0.085) / (20 * 0.16) },
+  key: { kelvin: 4300, omega: 0.16 },
+  fill: { az: 0.95, el: 0.18, kelvin: 8000, ratio: (1.8 * 0.28) / (20 * 0.16), omega: 0.28 },
+  rim: { az: 2.45, el: 0.45, kelvin: 4300, ratio: (36 * 0.085) / (20 * 0.16), omega: 0.085 },
 }
+// A cone of solid angle omega (sr): the cosine of its half-angle.
+const coneCos = (omega: number) => 1 - omega / (2 * Math.PI)
 // The on-set reference (referenceSet), in metres: positions along the floor are out from the bed's edge (never
 // nearer the middle than `clear`), and the set takes `span` of room. Balls 16 cm across on stands 1.6 cm thick; the
 // Lookdev lab's chart (its patches and gaps, CHART_GAP 0.18) 26 cm wide, leaning back 15 degrees.
@@ -123,6 +130,7 @@ export interface PyroStatus {
   autoStepped: boolean // it did step down
   exposureEV: number // the camera's exposure now (metered when auto)
   ball: BallStatus | null // the wooden ball, when there is one
+  pathTrace: { on: boolean; samples: number; compiling: boolean } // the path-traced reference (paused)
 }
 
 // The wooden ball, as read back a few times a second: its hottest surface (K), the heat its flames release (kW, from
@@ -232,6 +240,7 @@ interface Pipes {
   glareDown: GPURenderPipeline
   glareUp: GPURenderPipeline
   upres: GPUComputePipeline
+  ptComposite: GPURenderPipeline
 }
 
 // One multigrid level: its cells, and bind groups for smoothing (by colour), the residual, restriction into the
@@ -364,6 +373,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
   const resolveModule = d.createShaderModule({ code: RESOLVE })
   const displayModule = d.createShaderModule({ code: DISPLAY })
   const glareModule = d.createShaderModule({ code: GLARE })
+  const compositeModule = d.createShaderModule({ code: PT_COMPOSITE })
   const glarePipe = (entryPoint: string, add: boolean) =>
     d.createRenderPipelineAsync({
       layout: 'auto',
@@ -375,7 +385,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       },
       primitive: { topology: 'triangle-list' },
     })
-  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -440,8 +450,14 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     glarePipe('fsDownFirst', false),
     glarePipe('fsDown', false),
     glarePipe('fsUp', true),
+    d.createRenderPipelineAsync({
+      layout: 'auto',
+      vertex: { module: compositeModule, entryPoint: 'vs' },
+      fragment: { module: compositeModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
+      primitive: { topology: 'triangle-list' },
+    }),
   ])
-  return { fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp }
+  return { fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
 }
 
 export function prewarmPyro() {
@@ -582,6 +598,16 @@ export class PyroEngine {
   // An HDR environment's light (environment.ts), once loaded, and its backdrop (cleared to black without one).
   private envLight: EnvLight | null = null
   private envTex: GPUTexture
+  private envResTex: GPUTexture // the map without its key, for the path-traced reference
+  // The path-traced reference: its pipeline (compiled the first time it is asked for), uniforms, lights, targets.
+  private ptPipe: GPURenderPipeline | null = null
+  private ptCompiling = false
+  private ptBuf: GPUBuffer
+  private wipeBuf: GPUBuffer
+  private pt = { on: false, n: 0, idx: 0, wipe: 0.5, key: '', frame: 0 }
+  private ptLights = new Float32Array(24)
+  private ptT: { targets: Targets; upres: boolean; accum: [GPUTexture, GPUTexture]; comp: GPUTexture; trace: [GPUBindGroup, GPUBindGroup]; composite: GPUBindGroup[][]; display: GPUBindGroup } | null = null
+  private stateVersion = 0
   // The ACES 2.0 view's LUT (a 1 x 1 stand-in until it has loaded; AgX shows meanwhile), shared with the Lookdev lab.
   private lut: GPUTexture
   private lutSampler: GPUSampler
@@ -693,6 +719,9 @@ export class PyroEngine {
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.envTex = d.createTexture({ size: [BACKDROP_W, BACKDROP_H], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    this.envResTex = d.createTexture({ size: [BACKDROP_W, BACKDROP_H], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    this.ptBuf = d.createBuffer({ size: 112, usage: U.UNIFORM | U.COPY_DST })
+    this.wipeBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
     this.syncEnv()
     this.lut = d.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.lutSampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' })
@@ -1082,7 +1111,8 @@ export class PyroEngine {
     }
     if ((this.state.ball && !prev.ball) || (this.state.ballBurns && !prev.ballBurns)) this.resetSkin()
     if (this.state.env !== prev.env) this.syncEnv()
-    // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh.
+    // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh (traced too).
+    this.stateVersion++
     this.lightDirty = true
     this.needsRender = true
     this.taaCount = 0
@@ -1091,6 +1121,7 @@ export class PyroEngine {
 
   setPaused(paused: boolean) {
     this.paused = paused
+    if (!paused) this.pt.on = false
     this.acc = 0
     this.kick()
     this.report(true)
@@ -1728,6 +1759,12 @@ export class PyroEngine {
         sunLux = e.key.irradiance.map(v => v * k)
       } else sunLux = [0, 0, 0]
     }
+    // The path-traced reference's lights (PATH_TRACE): each a cone (toward it, the cosine of its half-angle, 0 for
+    // none) and its illuminance at normal incidence. The sun's disc, or an HDR map's key in the cone it was taken from;
+    // with the rig (below), its three softboxes at their solid angles.
+    const pl = this.ptLights.fill(0)
+    const keyCos = e ? (e.key ? Math.cos((e.key.cone * Math.PI) / 180) : 0) : Math.cos(SUN_HALF_ANGLE)
+    pl.set([...sun, keyCos, ...sunLux, 0], 0)
     // The floor's albedo: the lab's own, or the Lookdev lab's cyc in charcoal (its studio floor) or gray.
     const floorAlbedo = s.background === 'charcoal' ? 0.05 : s.background === 'gray' ? 0.18 : 0.14
     // The Lookdev lab's softbox rig (RIG): the key in the sun's place, where the light azimuth and elevation put it; the
@@ -1745,6 +1782,9 @@ export class PyroEngine {
       const rimDir = dirOf(-side * RIG.rim.az, RIG.rim.el)
       const rimLux: Vec3 = s.rigRim ? tint(RIG.rim.kelvin, lux * RIG.rim.ratio) : [0, 0, 0]
       rim.set([...rimDir, s.rigRim ? 1 : 0, ...rimLux, 0])
+      pl.set([...sun, s.rigKey ? coneCos(RIG.key.omega) : 0, ...sunLux, 0], 0)
+      pl.set([...fillDir, s.rigFill ? coneCos(RIG.fill.omega) : 0, ...fillLux, 0], 8)
+      pl.set([...rimDir, s.rigRim ? coneCos(RIG.rim.omega) : 0, ...rimLux, 0], 16)
       // The fill as a small source (its irradiance times the basis toward it); the floor's bounce over the lower
       // hemisphere (where only the constant band and the vertical one survive).
       const sh = new Float64Array(27)
@@ -1847,9 +1887,10 @@ export class PyroEngine {
       this.targets.glare.destroy()
     }
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-    const tex = () => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage })
+    const tex = (more = 0) => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: usage | more })
     const hdr = tex()
-    const hist: [GPUTexture, GPUTexture] = [tex(), tex()]
+    // (The history is readable, for the probes that compare it with the path-traced reference.)
+    const hist: [GPUTexture, GPUTexture] = [tex(GPUTextureUsage.COPY_SRC), tex(GPUTextureUsage.COPY_SRC)]
     const gw = Math.max(1, w >> 1)
     const gh = Math.max(1, h >> 1)
     const levels = Math.max(1, Math.min(GLARE_LEVELS, Math.floor(Math.log2(Math.min(gw, gh))) + 1))
@@ -2004,6 +2045,10 @@ export class PyroEngine {
     this.needsRender = false
     this.writeRender()
     const t = this.ensureTargets()
+    if (this.pt.on && this.paused && this.ptPipe && this.taaCount >= TAA_SETTLE) {
+      this.renderTraced(screen, t)
+      return
+    }
     // The current frame's weight: a running average while nothing changes (paused), a fixed share while simulating.
     const weight = this.taaCount === 0 ? 1 : this.paused ? Math.max(1 / (this.taaCount + 1), 1 / TAA_SETTLE) : TAA_WEIGHT
     this.device.queue.writeBuffer(this.taaBuf, 0, new Float32Array([this.taaCount > 0 ? 1 : 0, weight, 0, 0]))
@@ -2027,8 +2072,162 @@ export class PyroEngine {
     this.device.queue.submit([enc.finish()])
     this.taaCount++
     this.renderFrame++
-    // Paused, keep drawing until the history has settled.
-    if (this.paused && this.taaCount < TAA_SETTLE) this.needsRender = true
+    // Paused, keep drawing until the history has settled (and then, tracing, go on to the traced frames).
+    if (this.paused && (this.taaCount < TAA_SETTLE || (this.pt.on && this.ptPipe))) this.needsRender = true
+  }
+
+  // The path-traced reference, while paused: one more path per pixel into the running average, then the wipe (the
+  // settled live frame left of it, the traced right), the glare and the display. Anything changed since the last
+  // traced frame starts the average afresh.
+  private renderTraced(screen: GPUTexture, t: Targets) {
+    const p = this.pipes!
+    const pt = this.ensurePt(t)
+    const key = `${this.stateVersion}|${this.simTime}|${this.ballPos.join(',')}|${t.w}x${t.h}|${this.upresActive()}|${this.envLight ? 1 : 0}`
+    if (key !== this.pt.key) {
+      this.pt.key = key
+      this.pt.n = 0
+    }
+    const head = new Uint32Array([this.pt.frame++, this.pt.n, PT_BOUNCES, 0]) // (the seed, the count, the cap)
+    const buf = new ArrayBuffer(112)
+    new Uint32Array(buf, 0, 4).set(head)
+    new Float32Array(buf, 16, 24).set(this.ptLights)
+    this.device.queue.writeBuffer(this.ptBuf, 0, buf)
+    this.device.queue.writeBuffer(this.wipeBuf, 0, new Float32Array([Math.round(this.pt.wipe * t.w), 0, 0, 0]))
+    const enc = this.device.createCommandEncoder()
+    const black = { r: 0, g: 0, b: 0, a: 1 }
+    const draw = (view: GPUTextureView, pipe: GPURenderPipeline, group: GPUBindGroup, load = false) => {
+      const rp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: load ? 'load' : 'clear', storeOp: 'store', clearValue: black }] })
+      rp.setPipeline(pipe)
+      rp.setBindGroup(0, group)
+      rp.draw(3)
+      rp.end()
+    }
+    const next = 1 - this.pt.idx
+    draw(pt.accum[next].createView(), this.ptPipe!, pt.trace[this.pt.idx])
+    draw(pt.comp.createView(), p.ptComposite, pt.composite[next][this.histIndex])
+    if (this.state.glare > 0) {
+      const L = t.glareViews.length
+      // (The glare from the live frame, on both sides: a traced frame's early outliers would spread over the whole.)
+      draw(t.glareViews[0], p.glareFirst, t.glareFirst[this.histIndex])
+      for (let i = 1; i < L; i++) draw(t.glareViews[i], p.glareDown, t.glareDown[i]!)
+      for (let i = L - 2; i >= 0; i--) draw(t.glareViews[i], p.glareUp, t.glareUp[i]!, true)
+    }
+    draw(screen.createView(), p.display, pt.display)
+    this.device.queue.submit([enc.finish()])
+    this.pt.idx = next
+    this.pt.n++
+    this.renderFrame++
+    this.needsRender = this.pt.n < PT_SAMPLES
+  }
+
+  // The traced frame's targets and bind groups (made again with the frame's own): the running average (two, swapped
+  // each frame, full float; readable, for the probes), the wipe's composite, and the passes that read them.
+  private ensurePt(t: Targets) {
+    const upres = this.upresActive() && !!this.upres
+    if (this.ptT && this.ptT.targets === t && this.ptT.upres === upres) return this.ptT
+    if (this.ptT) {
+      this.ptT.accum.forEach(a => a.destroy())
+      this.ptT.comp.destroy()
+    }
+    const d = this.device
+    const p = this.pipes!
+    const g = this.grids!
+    const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    const accum: [GPUTexture, GPUTexture] = [0, 1].map(() => d.createTexture({ size: [t.w, t.h], format: 'rgba32float', usage: usage | GPUTextureUsage.COPY_SRC })) as [GPUTexture, GPUTexture]
+    const comp = d.createTexture({ size: [t.w, t.h], format: 'rgba16float', usage })
+    const v = (x: GPUTexture) => x.createView()
+    const entries = (res: GPUBindingResource[]) => res.map((resource, binding) => ({ binding, resource }))
+    const trace = [0, 1].map(k =>
+      d.createBindGroup({
+        layout: this.ptPipe!.getBindGroupLayout(0),
+        entries: [
+          ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView({ dimension: '2d-array' }), upres ? v(this.upres!.tex[0]) : this.dummy3d.createView(), v(g.flame)]),
+          { binding: 31, resource: { buffer: g.skin } },
+          { binding: 32, resource: { buffer: g.ballSheet } },
+          { binding: 33, resource: this.envTex.createView() },
+          { binding: 34, resource: v(g.light2) },
+          { binding: 35, resource: v(g.vel[0]) },
+          { binding: 36, resource: v(accum[k]) },
+          { binding: 37, resource: { buffer: this.ptBuf } },
+          { binding: 38, resource: this.envResTex.createView() },
+        ],
+      }),
+    ) as [GPUBindGroup, GPUBindGroup]
+    const composite = [0, 1].map(k =>
+      [0, 1].map(h =>
+        d.createBindGroup({
+          layout: p.ptComposite.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: v(t.hist[h]) },
+            { binding: 1, resource: v(accum[k]) },
+            { binding: 2, resource: { buffer: this.wipeBuf } },
+          ],
+        }),
+      ),
+    )
+    const display = d.createBindGroup({
+      layout: p.display.getBindGroupLayout(0),
+      entries: [
+        { binding: 1, resource: { buffer: this.renderBuf } },
+        { binding: 2, resource: v(comp) },
+        { binding: 3, resource: t.glareViews[0] },
+        { binding: 4, resource: this.glareSampler },
+        { binding: 5, resource: this.lut.createView() },
+        { binding: 6, resource: this.lutSampler },
+      ],
+    })
+    this.ptT = { targets: t, upres, accum, comp, trace, composite, display }
+    this.pt.key = ''
+    return this.ptT
+  }
+
+  // The path-traced reference (PATH_TRACE), while paused: on, traced frames accumulate behind the wipe; off (or
+  // resuming), the live frame alone. Its pipeline compiles the first time it is asked for.
+  setPathTrace(on: boolean) {
+    this.pt.on = on && this.paused
+    this.pt.key = ''
+    this.pt.n = 0
+    // Both sides at one exposure: the meter settles at once (as for a still), and the live frame settles again at it
+    // before the traced frames begin.
+    if (this.pt.on) {
+      this.meterEV = this.targetEV()
+      this.taaCount = 0
+    }
+    if (this.pt.on && !this.ptPipe && !this.ptCompiling) {
+      this.ptCompiling = true
+      const m = this.device.createShaderModule({ code: PATH_TRACE })
+      this.device
+        .createRenderPipelineAsync({
+          layout: 'auto',
+          vertex: { module: m, entryPoint: 'vs' },
+          fragment: { module: m, entryPoint: 'pt', targets: [{ format: 'rgba32float' }] },
+          primitive: { topology: 'triangle-list' },
+        })
+        .then(pipe => {
+          this.ptPipe = pipe
+          this.needsRender = true
+          this.kick()
+        })
+        .catch(err => {
+          console.warn('Pyro: the path tracer did not compile', err)
+          this.pt.on = false
+        })
+        .finally(() => {
+          this.ptCompiling = false
+          this.report(true)
+        })
+    }
+    this.needsRender = true
+    this.kick()
+    this.report(true)
+  }
+  // The wipe's place, as a share of the frame's width from the left (the live frame left of it).
+  setWipe(share: number) {
+    this.pt.wipe = Math.min(Math.max(share, 0), 1)
+    if (this.pt.on) {
+      this.needsRender = true
+      this.kick()
+    }
   }
 
 
@@ -2096,6 +2295,8 @@ export class PyroEngine {
   private exposureEV() {
     const s = this.state
     if (s.exposureMode === 'manual') return s.exposure
+    // (Tracing, the meter holds where it settled, so the live frame and the traced one share one exposure.)
+    if (this.pt.on && this.meterEV !== null) return this.meterEV - s.exposureComp
     const target = this.targetEV()
     const now = performance.now()
     if (this.meterEV === null) this.meterEV = target
@@ -2139,6 +2340,7 @@ export class PyroEngine {
         if (this.disposed || this.state.env !== env) return
         this.envLight = e
         this.device.queue.writeTexture({ texture: this.envTex }, toHalf(e.backdrop.rgba), { bytesPerRow: BACKDROP_W * 8 }, [BACKDROP_W, BACKDROP_H])
+        this.device.queue.writeTexture({ texture: this.envResTex }, toHalf(e.residual.rgba), { bytesPerRow: BACKDROP_W * 8 }, [BACKDROP_W, BACKDROP_H])
         this.lightDirty = true
         this.needsRender = true
         this.taaCount = 0
@@ -2228,6 +2430,7 @@ export class PyroEngine {
       autoStepped: this.autoStepped,
       exposureEV: this.state.exposureMode === 'manual' ? this.state.exposure : (this.meterEV ?? this.targetEV()) - this.state.exposureComp,
       ball: this.ballBurning() ? this.ballStatus : null,
+      pathTrace: { on: this.pt.on, samples: this.pt.on && this.ptPipe ? this.pt.n : 0, compiling: this.ptCompiling },
     })
   }
 

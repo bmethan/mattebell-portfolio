@@ -1696,6 +1696,10 @@ ${SIM_COMMON}
 @group(0) @binding(2) var scal: texture_3d<f32>;
 @group(0) @binding(3) var<storage, read> fireSums: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> skinOut: array<vec4<f32>>;
+// The fuel flowing up along the surface past each texel (kg per metre of width per second), for the drawn flames.
+@group(0) @binding(5) var<storage, read_write> sheetOut: array<f32>;
+@group(0) @binding(6) var noiseTex: texture_3d<f32>;
+@group(0) @binding(7) var noiseSamp: sampler;
 const SIGMA = 5.670374e-8;
 const EPS_WOOD = 0.9;
 const H_CONV = 10.0;
@@ -1708,6 +1712,21 @@ const L_PYRO = 3.0e5; // J per kg of volatiles
 const Q_OX = 12000.0; // W / m2, glowing char
 fn gasAt(w: vec3<f32>) -> Gas { return gasOf(scalAt(scal, samp, (w - P.origin.xyz) / P.grid.x)); }
 fn t4(t: f32) -> f32 { let t2 = t * t; return t2 * t2; }
+// The wood is not uniform. Its late wood, in the growth rings the renderer draws (the same rings), is denser than its
+// early wood, and the whole ball varies a little from patch to patch: where it is lighter its surface heats faster and
+// catches sooner, so the burning front climbs raggedly, along the grain, rather than in a level line (Scots pine's late
+// wood is some 1.41 times its rings' mean density and its early wood 0.77; Fernandes et al. 2017). Scaled so the ball as
+// a whole heats as fast as wood of its mean density: light early wood heats faster by more than dense late wood heats
+// slower, and unscaled the pattern heated the surface some 12% faster on average, enough that a ball held a minute in
+// the fire burned on to nothing instead of starving under its char (1.118 is the mean of 1 / density over the rings).
+fn woodDensity(n: vec3<f32>) -> f32 {
+  let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
+  let wave = textureSampleLevel(noiseTex, noiseSamp, n * 0.3 + 0.5, 0.0).x - 0.5;
+  let ring = fract(length(n - dot(n, axis) * axis) * 16.0 + 0.6 * wave);
+  let late = smoothstep(0.5, 0.8, ring) * (1.0 - smoothstep(0.85, 1.0, ring));
+  return 1.118 * mix(0.77, 1.41, late) * (0.85 + 0.3 * fbm(n * 3.0 + 11.0));
+}
+fn burning(m: f32) -> f32 { return m * smoothstep(0.0015, 0.0025, m); }
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1768,7 +1787,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     below += row / 8.0;
   }
-  let qWall = 25000.0 * below;
+  // The flame flickers, a pattern rising over the surface at a couple of hertz, so the front advances in fingers.
+  let flicker = 0.5 + fbm(n * 5.0 + vec3<f32>(0.0, -2.0 * P.grid.z, 0.0));
+  let qWall = 25000.0 * below * flicker;
   let o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
   let charred = clamp(s.z / 0.5, 0.0, 1.0);
   let rate = charRate(s);
@@ -1777,12 +1798,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     - WOOD_RHO * (1.0 - CHAR_YIELD) * rate * L_PYRO - G12 * (s.x - s.y);
   let q2 = G12 * (s.x - s.y) - G2C * (s.y - T_AMB);
   let dt = P.grid.y;
+  // (The grain sets how fast the wood heats until it chars; char is char.)
+  let dens = mix(woodDensity(n), 1.0, charred);
   var next = s;
-  next.x = clamp(s.x + dt * q1 / C1, T_AMB - 30.0, 1500.0);
+  next.x = clamp(s.x + dt * q1 / (C1 * dens), T_AMB - 30.0, 1500.0);
   next.y = clamp(s.y + dt * q2 / C2, T_AMB - 30.0, 1500.0);
   next.z = s.z + dt * 1000.0 * rate;
   next.w = min(s.w + dt * smoothstep(700.0, 850.0, s.x) * charred / 90.0, 1.0);
   skinOut[i] = next;
+  // The volatiles burn as they flow up the surface, so the flame at a texel carries all the fuel that came off below it
+  // (per metre of width: the circles of latitude narrow toward the poles), the column and its two neighbours.
+  var sheet = 0.0;
+  for (var j = id.y; j < SKIN_H; j++) {
+    var f = 0.0;
+    for (var di = -1; di <= 1; di++) { f += burning(pyrolysisOf(skin[j * SKIN_W + u32((i32(id.x) + di + i32(SKIN_W)) % i32(SKIN_W))])); }
+    sheet += f / 3.0 * sin(3.1415927 * (f32(j) + 0.5) / f32(SKIN_H));
+  }
+  let ds = 3.1415927 * P.ball.w / f32(SKIN_H);
+  sheetOut[i] = sheet * ds / max(sin(3.1415927 * (f32(id.y) + 0.5) / f32(SKIN_H)), 0.15);
 }
 `
 
@@ -2213,6 +2246,7 @@ ${fireCommon(9)}
 @group(0) @binding(11) var blueTex: texture_2d_array<f32>; // spatiotemporal blue noise, a slice a frame
 @group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
+@group(0) @binding(32) var<storage, read> ballSheet: array<f32>; // the fuel flowing up the burning ball (BALL_HEAT)
 
 // The fire's light on the collision ball (lux, by colour). Flames touching it: the radiance of the gas within about
 // 10 cm of its surface along the normal, as from a hemisphere of it, pi L. The fire further off: each band of its
@@ -2259,27 +2293,78 @@ fn ballFireLight(ph: vec3<f32>, nb: vec3<f32>, shadowed: f32, fireColour: vec3<f
 
 // The burning ball's own flames. Its volatiles burn in a layer along its surface far thinner than a cell, which the
 // grid smears into a dim, blocky shell, so the renderer draws that layer itself (as production renderers draw the
-// flames of burning objects): tongues rising from wherever the skin gives off volatiles fast enough to burn, as tall as
-// a wall flame of that strength (8 to 40 cm), climbing round the ball as they rise and flickering upward, their soot at
-// 1450 K at the root and cooler toward the tips. Returns the flame's extinction (1/m) and its soot's temperature.
+// flames of burning objects), shaped by the physics' map of the fuel flowing up the surface. Along the surface the
+// flame is a thin layer, clinging, dim where its flow begins at the lowest burning wood and thicker as more fuel joins
+// it on the way up: 0.8 to 3 cm (a laminar wall flame stands some 6 mm off the surface near its leading edge, a
+// turbulent one about a sixteenth of its height; Coutin et al. 2003, Orloff et al. via Mitler 1987). Over the surface
+// it burns in narrow licks that come and go as they rise, with the char showing between them (a continuous flame film,
+// even a faint one, would outshine char glowing at 800 K many times over and coat the ball in orange); at the ball's
+// rim, where a line of sight runs along the layer through many licks, it reads as a bright edge. It clings over the
+// upper half too, until the flows from every side meet over the top and leave it together in tongues, a plume that
+// narrows as it climbs. The flame is present half the time some 2 to 12 cm above the top, and its tips flicker to twice
+// that: the heights wall-fire correlations give for this ball's 10 to 30 kW per metre of its girth (Delichatsios 1984
+// and Hasemi 1984, about 0.044 and, for the uppermost tips, 0.057 Q'^(2/3) m). Its soot absorbs 3 per metre, as small
+// wood flames' does (2 to 3.5 measured; Pastor et al. 2002), and is at 1400 K at the root, cooling to 1050 K at the
+// tips (wood fires average 1300 to 1370 K, with brief peaks near 1470 K; Bova and Dickinson 2008). Returns the flame's
+// extinction (1/m) and its soot's temperature.
 const BALL_FLAME_REACH = 0.45; // m above the surface
+const SHEET_REF = 0.002; // kg of fuel per metre of width per second, some 35 kW/m: a ball well alight
+// The fuel flow where the outward normal n meets the surface, bilinear like skinAt.
+fn sheetAt(n: vec3<f32>) -> f32 {
+  let x = fract(atan2(n.z, n.x) * 0.15915494 + 1.0) * f32(SKIN_W) - 0.5;
+  let y = clamp(acos(clamp(n.y, -1.0, 1.0)) * 0.31830989 * f32(SKIN_H) - 0.5, 0.0, f32(SKIN_H) - 1.0);
+  let x0 = floor(x);
+  let y0 = floor(y);
+  let i0 = u32((i32(x0) + i32(SKIN_W)) % i32(SKIN_W));
+  let i1 = (i0 + 1u) % SKIN_W;
+  let j0 = u32(y0);
+  let j1 = min(j0 + 1u, SKIN_H - 1u);
+  let a = mix(ballSheet[j0 * SKIN_W + i0], ballSheet[j0 * SKIN_W + i1], x - x0);
+  let b = mix(ballSheet[j1 * SKIN_W + i0], ballSheet[j1 * SKIN_W + i1], x - x0);
+  return mix(a, b, y - y0) / SHEET_REF;
+}
+// The layer's thickness (m) for a fuel flow s (in SHEET_REF), and how sooty, so bright, the flame is (the layer a third
+// as sooty as the tongues it feeds).
+fn flameLayer(s: f32) -> f32 { return 0.008 + 0.022 * smoothstep(0.0, 1.0, s); }
+fn flameSoot(s: f32) -> f32 { return 3.0 * smoothstep(0.05, 0.5, s); }
 fn ballFlame(w: vec3<f32>) -> vec2<f32> {
   if (!ballBurns()) { return vec2<f32>(0.0); }
+  let r = P.ball.w;
   let rel = w - P.ball.xyz;
-  let d = length(rel) - P.ball.w;
+  let dist = length(rel);
+  let d = dist - r;
   if (d < 0.0 || d > BALL_FLAME_REACH) { return vec2<f32>(0.0); }
-  // The flame here rose from the surface below it, the lower on the ball the higher it has climbed.
-  let m = ballFuelFlux(normalize(rel - vec3<f32>(0.0, 1.1 * d, 0.0)));
-  if (m <= 0.0) { return vec2<f32>(0.0); }
-  // Under the ball the flame clings to the surface; up its sides and over its top it stands up in tongues.
-  let up = rel.y / (d + P.ball.w);
-  let h = d / ((0.08 + 0.34 * smoothstep(0.002, 0.012, m)) * mix(0.12, 1.0, smoothstep(-0.5, 0.5, up)));
-  if (h >= 1.0) { return vec2<f32>(0.0); }
-  // Tongues: noise stretched upward and rising at 1.6 m/s, thinning toward the tips.
-  let q = vec3<f32>(w.x * 7.0, w.y * 1.8 - R.size.z * 1.6, w.z * 7.0);
-  let n = textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x + 0.5 * (textureSampleLevel(noiseTex, noiseSamp, q * 2.3 + 0.37, 0.0).y - 0.5);
-  let tongue = smoothstep(0.0, 0.15, n - 0.25 - 0.6 * h);
-  return vec2<f32>(9.0 * tongue, mix(1450.0, 1050.0, h));
+  var out = vec2<f32>(0.0);
+  // The layer along the surface: licks some 4 cm across and 20 cm long, rising over it at 2 m/s.
+  let s1 = sheetAt(rel / dist);
+  let thick = flameLayer(s1);
+  if (s1 > 0.0 && d < thick) {
+    let q = vec3<f32>(w.x * 25.0, w.y * 5.0 - R.size.z * 2.0, w.z * 25.0);
+    let lick = smoothstep(0.5, 0.75, textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x);
+    out = vec2<f32>(flameSoot(s1) * lick * (1.0 - smoothstep(0.5, 1.0, d / thick)), 1400.0 - 100.0 * d / thick);
+  }
+  // The tongues: over the top the flows from every side meet and leave the surface together, rising as a plume that
+  // narrows as it climbs (noise stretched upward and rising at 1.6 m/s, thinning toward the tips). Below the top they
+  // stay in the layer above, clinging.
+  let rho = length(rel.xz);
+  let cap = 0.8 * r;
+  if (rel.y > 0.0 && rho < cap) {
+    let ys = sqrt(r * r - rho * rho);
+    let z = rel.y - ys;
+    let s2 = sheetAt(vec3<f32>(rel.x, ys, rel.z) / r);
+    if (z > 0.0 && s2 > 0.0) {
+      // h runs to the uppermost tips, twice the height where flame is present half the time (2 to 12 cm).
+      let h = z / (2.1 * (0.02 + 0.10 * smoothstep(0.0, 1.0, s2)));
+      let edge = cap * (1.0 - 0.5 * h);
+      if (h < 1.0 && rho < edge) {
+        let q = vec3<f32>(w.x * 7.0, w.y * 1.8 - R.size.z * 1.6, w.z * 7.0);
+        let n = textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x + 0.5 * (textureSampleLevel(noiseTex, noiseSamp, q * 2.3 + 0.37, 0.0).y - 0.5);
+        let k = flameSoot(s2) * smoothstep(0.0, 0.15, n - 0.25 - 0.6 * h) * (1.0 - smoothstep(0.6, 1.0, rho / edge));
+        if (k > out.x) { out = vec2<f32>(k, mix(1400.0, 1050.0, h)); }
+      }
+    }
+  }
+  return out;
 }
 // Against the collision ball, a weight that fades the gas out within a cell or two of its true surface.
 fn offBallStairs(w: vec3<f32>) -> f32 {

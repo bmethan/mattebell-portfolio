@@ -167,6 +167,7 @@ interface Grids {
   spread: GPUBuffer // a fire's mass keeping: the volume over which each cell's gas was spread (fixed point)
   skin: GPUBuffer // the wooden ball's skin (SKIN_W x SKIN_H texels, four floats each), and its next step
   skinNext: GPUBuffer
+  ballSheet: GPUBuffer // the fuel flowing up the burning ball's surface, per skin texel
   flame: GPUTexture // a fire's heat release rate per cell (MW/m3), for the renderer
   // IVOCK: the three components of the vector potential, each with its own finest multigrid level.
   // BiMocq2: the maps (the backward one's current level, ping-ponged; its previous level; the forward one,
@@ -772,12 +773,13 @@ export class PyroEngine {
     const skinBytes = SKIN_W * SKIN_H * 16
     const skin = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
     const skinNext = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
-    buffers.push(skin, skinNext)
+    const ballSheet = d.createBuffer({ size: SKIN_W * SKIN_H * 4, usage: GPUBufferUsage.STORAGE })
+    buffers.push(skin, skinNext, ballSheet)
     // The kernels that read the skin (binding 31: the ball's volatiles feed the fire, and the renderer draws it).
-    const withSkin = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[]) =>
+    const withSkin = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[], extra: GPUBindGroupEntry[] = []) =>
       d.createBindGroup({
         layout: pipe.getBindGroupLayout(0),
-        entries: [...resources.map((resource, binding) => ({ binding, resource })), { binding: 31, resource: { buffer: skin } }],
+        entries: [...resources.map((resource, binding) => ({ binding, resource })), { binding: 31, resource: { buffer: skin } }, ...extra],
       })
     const fireCount = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true })
     new Uint32Array(fireCount.getMappedRange()).set([groups, Math.ceil(n[0] / 4), Math.ceil(n[1] / 4), Math.ceil(n[2] / 4)])
@@ -798,6 +800,7 @@ export class PyroEngine {
       spread,
       skin,
       skinNext,
+      ballSheet,
       flame,
       bimocq,
       ivockRhs,
@@ -844,13 +847,13 @@ export class PyroEngine {
         combine: withSkin(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }, v(flame)]),
         conserveSpread: group(p.conserveSpread, [P, s, v(vel[0]), { buffer: spread }]),
         conserveRatio: withSkin(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
-        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }]),
+        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }]),
       },
     }
     this.resetSkin()

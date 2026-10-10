@@ -1,7 +1,7 @@
 // References for the pyro lab's technical notes, grouped by topic. Every entry was checked against its primary
 // source (the publisher's DOI record, the authors' or organisation's own pages, or the official repository) before
 // it went on the page.
-export const PYRO_CITATION_GROUPS = ['Solver', 'Combustion', 'Rendering', 'Camera', 'Validation'] as const
+export const PYRO_CITATION_GROUPS = ['Solver', 'Combustion', 'Burning ball', 'Rendering', 'Camera', 'Validation'] as const
 export type PyroCitationGroup = (typeof PYRO_CITATION_GROUPS)[number]
 
 export interface PyroCitation {
@@ -196,6 +196,69 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     venue: 'Fire Safety Science 5, Douglas-fir volatiles as C3.4H6.2O2.5',
     year: '1997',
     url: 'https://doi.org/10.3801/IAFSS.FSS.5-177',
+  },
+  {
+    id: 'bamford',
+    group: 'Burning ball',
+    authors: 'C. H. Bamford, J. Crank, D. H. Malan',
+    title: 'The Combustion of Wood. Part I',
+    venue: 'Proceedings of the Cambridge Philosophical Society 42(2), the critical mass flux for flaming',
+    year: '1946',
+    url: 'https://doi.org/10.1017/S030500410002288X',
+  },
+  {
+    id: 'kuang-chung',
+    group: 'Burning ball',
+    authors: 'T. Kuang-chung, J. Turnbull, G. Will, D. Drysdale',
+    title: 'Upward Flame Spread: Heat Transfer to the Unburned Surface',
+    venue: 'Fire Safety Science 7, the surface flame’s heat on the wood above it',
+    year: '2003',
+    url: 'https://doi.org/10.3801/IAFSS.FSS.7-117',
+  },
+  {
+    id: 'rinta-paavola',
+    group: 'Burning ball',
+    authors: 'Aleksi Rinta-Paavola, Simo Hostikka',
+    title: 'A model for the pyrolysis of two Nordic structural timbers',
+    venue: 'Fire and Materials 46(1), pine’s char yield',
+    year: '2022',
+    url: 'https://doi.org/10.1002/fam.2947',
+  },
+  {
+    id: 'johnston',
+    group: 'Burning ball',
+    authors: 'J. M. Johnston, M. J. Wooster, T. J. Lynham',
+    title: 'Experimental confirmation of the MWIR and LWIR grey body assumption for vegetation fire flame emissivity',
+    venue: 'International Journal of Wildland Fire 23(4), wood flames’ absorption',
+    year: '2014',
+    url: 'https://doi.org/10.1071/WF12197',
+  },
+  {
+    id: 'quintiere-hasemi',
+    group: 'Burning ball',
+    authors: 'James G. Quintiere, Margaret Harkleroad, Yuji Hasemi',
+    title: 'Wall Flames and Implications for Upward Flame Spread',
+    venue: 'US Federal Aviation Administration report DOT/FAA/CT-85/2, wall-flame heights (Delichatsios’s and Hasemi’s correlations)',
+    year: '1985',
+    url: 'https://rosap.ntl.bts.gov/view/dot/92629',
+  },
+  {
+    id: 'bova-dickinson',
+    group: 'Burning ball',
+    authors: 'Anthony S. Bova, Matthew B. Dickinson',
+    title: 'Beyond “fire temperatures”: calibrating thermocouple probes and modeling their response to surface fires in hardwood fuels',
+    venue: 'Canadian Journal of Forest Research 38(5), measured flame temperatures and small flames’ absorption',
+    year: '2008',
+    url: 'https://doi.org/10.1139/X07-204',
+  },
+  {
+    id: 'fernandes',
+    group: 'Burning ball',
+    authors: 'C. Fernandes, M. J. Gaspar, J. Pires, A. Alves, R. Simões, J. C. Rodrigues, M. E. Silva, A. Carvalho, J. E. Brito, J. L. Lousada',
+    title: 'Physical, chemical and mechanical properties of Pinus sylvestris wood at five sites in Portugal',
+    venue: 'iForest 10(4), early- and late-wood density',
+    year: '2017',
+    url: 'https://doi.org/10.3832/ifor2254-010',
   },
   {
     id: 'stbn',

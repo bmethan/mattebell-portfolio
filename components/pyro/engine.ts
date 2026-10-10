@@ -81,6 +81,7 @@ const RIG = {
 const REF = {
   clear: 0.3,
   span: 0.75,
+  margin: 0.05,
   ballR: 0.08,
   ballY: 0.45,
   ballZ: -0.12,
@@ -530,8 +531,8 @@ export class PyroEngine {
   private simBuf: GPUBuffer
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
-  private simData = new ArrayBuffer(256)
-  private renderData = new Float32Array(132)
+  private simData = new ArrayBuffer(336)
+  private renderData = new Float32Array(112)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
@@ -619,6 +620,8 @@ export class PyroEngine {
   private lastStatus = 0
   private stir: { centre: Vec3; vel: Vec3 } | null = null
   private cam = { pos: [0, 0, 0] as Vec3, fwd: [0, 0, -1] as Vec3, right: [1, 0, 0] as Vec3, up: [0, 1, 0] as Vec3, tanY: 0, aspect: 1 }
+  // The lab's framing (layoutCamera): the camera's distance along z, the tangent of half its field of view, its aspect.
+  private framing = { z: 0, tanY: 0, aspect: 1 }
 
   private constructor(
     private canvas: HTMLCanvasElement,
@@ -686,7 +689,7 @@ export class PyroEngine {
       })
       .catch(() => {})
     this.taaBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
-    this.ballBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
+    this.ballBuf = d.createBuffer({ size: 112, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.envTex = d.createTexture({ size: [BACKDROP_W, BACKDROP_H], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
@@ -1149,6 +1152,7 @@ export class PyroEngine {
     const right = norm(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
     this.cam = { pos, fwd, right, up, tanY, aspect }
+    this.framing = { z: pos[2], tanY, aspect }
   }
 
   // A drag on the image: ndc (x, y in -1..1, y up) and how far it moved (ndc units) in dtMs. The stir pushes the
@@ -1692,8 +1696,10 @@ export class PyroEngine {
     const radius = s.ball ? s.ballRadius : 0
     f.set([...this.ballPos, radius], 56)
     f.set([...this.ballVel, s.ball && s.ballBurns ? 1 : 0], 60)
+    const set = this.referenceSet(s)
+    f.set(set, 64)
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
-    this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx]))
+    this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx, ...set]))
   }
 
   private writeRender() {
@@ -1785,34 +1791,47 @@ export class PyroEngine {
     // The camera: a film camera's shutter at 24 frames a second (180 degrees is open 1/48 s), and the glare's share and
     // levels.
     r.set([(s.shutter / 360) / 24, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, 0], 108)
-    r.set(this.referenceSet(s), 112)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
+    // The reference set is the simulation's (a solid in it), but turned on or off it shows at once, paused or not.
+    this.device.queue.writeBuffer(this.simBuf, 256, new Float32Array(this.referenceSet(s)))
   }
 
-  // The on-set reference's layout (wgsl.ts refHit), or zeros when it is off: the colour chart standing on the floor,
-  // leaning back, turned to the camera and a little toward the fire; behind it the grey and chrome balls on stands, at
-  // about the middle of the flames' height. Beside the source on its upwind side (the right, in still air), clear of
-  // its bed, or on the other side when that side has no room for it.
+  // The on-set reference's layout (wgsl.ts refHit and setSolid), or zeros when it is off: the colour chart standing on
+  // the floor, leaning back, turned to the camera and a little toward the fire; behind it the grey and chrome balls on
+  // stands, at about the middle of the flames' height. Beside the source on its upwind side (the right, in still air),
+  // clear of its bed and within the frame; if that side has no room in the frame, the other side, as far from the fire
+  // as the frame allows when that is downwind (out of the flames that lean that way).
   private referenceSet(s: PyroState): number[] {
     if (!s.reference) return new Array(20).fill(0)
     const right = Math.max(s.srcX + s.srcRadius, REF.clear)
     const left = Math.min(s.srcX - s.srcRadius, -REF.clear)
-    let side = s.wind > 0.05 ? -1 : 1
-    const room = (sd: number) => (sd > 0 ? DOMAIN_WIDTH / 2 - right : DOMAIN_WIDTH / 2 + left)
-    if (room(side) < REF.span) side = -side
-    const at = (u: number) => (side > 0 ? right : left) + side * u
+    // The frame's half width where the balls stand (the camera looks along -z), and the domain's.
+    const f = this.framing
+    const seen = f.tanY > 0 ? (f.z - REF.ballZ) * f.tanY * f.aspect - REF.margin : Infinity
+    const edge = Math.min(seen, DOMAIN_WIDTH / 2 - REF.margin)
+    const room = (sd: number) => (sd > 0 ? edge - right : edge + left)
+    const upwind = s.wind > 0.05 ? -1 : 1
+    const side = room(upwind) >= REF.span || room(upwind) >= room(-upwind) ? upwind : -upwind
+    // Pushed out along its side: downwind, to the frame's edge; otherwise only in, if the frame is too narrow.
+    const downwind = side !== upwind && Math.abs(s.wind) > 0.05
+    const push = downwind ? room(side) - REF.span : Math.min(room(side) - REF.span, 0)
+    const at = (u: number) => (side > 0 ? right : left) + side * (u + push)
     const cx = at(REF.chartAt)
-    const yaw = Math.atan2(this.cam.pos[0] - cx, this.cam.pos[2] - REF.chartZ) - side * REF.chartTurn
+    const yaw = Math.atan2(-cx, f.z - REF.chartZ) - side * REF.chartTurn
     const w = REF.chartW
     const h = w * REF.chartAspect
     const U = [Math.cos(yaw) * w, 0, -Math.sin(yaw) * w]
     const V = [-Math.sin(REF.chartTilt) * Math.sin(yaw) * h, Math.cos(REF.chartTilt) * h, -Math.sin(REF.chartTilt) * Math.cos(yaw) * h]
+    // (And the set's extent along x, for the simulation's quick test.)
+    const xs = [at(REF.greyAt), at(REF.chromeAt)]
+    const lo = Math.min(...xs, cx - Math.abs(U[0]) / 2 - Math.abs(V[0])) - REF.ballR
+    const hi = Math.max(...xs, cx + Math.abs(U[0]) / 2 + Math.abs(V[0])) + REF.ballR
     return [
-      ...[at(REF.greyAt), REF.ballY, REF.ballZ, REF.ballR],
-      ...[at(REF.chromeAt), REF.ballY, REF.ballZ, REF.ballR],
+      ...[xs[0], REF.ballY, REF.ballZ, REF.ballR],
+      ...[xs[1], REF.ballY, REF.ballZ, REF.ballR],
       ...[cx - U[0] / 2, 0.002, REF.chartZ - U[2] / 2, REF.standR],
-      ...U, 0,
-      ...V, 0,
+      ...U, lo,
+      ...V, hi,
     ]
   }
 

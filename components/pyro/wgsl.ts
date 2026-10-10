@@ -27,6 +27,24 @@ export const LFM_N = 4
 export const SKIN_W = 128
 export const SKIN_H = 64
 
+// The on-set reference as a solid (engine.ts referenceSet), from a uniform S holding its fields: its two balls, and
+// its chart as a card one cell (h) thick, which a thinner card would let the gas through between cell centres. Its
+// stands, thinner than a cell, are left out.
+const setSolid = (S: string) => /* wgsl */ `
+fn inSet(w: vec3<f32>, h: f32) -> bool {
+  // (Most cells are nowhere near it: first, the set's extent, along x, up to the balls' tops, back to their backs.)
+  if (${S}.refGrey.w <= 0.0 || w.x < ${S}.refChartU.w - h || w.x > ${S}.refChartV.w + h) { return false; }
+  if (w.y > ${S}.refGrey.y + ${S}.refGrey.w + h || w.z < ${S}.refGrey.z - ${S}.refGrey.w - h) { return false; }
+  if (distance(w, ${S}.refGrey.xyz) < ${S}.refGrey.w || distance(w, ${S}.refChrome.xyz) < ${S}.refChrome.w) { return true; }
+  let U = ${S}.refChartU.xyz;
+  let V = ${S}.refChartV.xyz;
+  let N = normalize(cross(U, V));
+  let q = w - ${S}.refChartO.xyz;
+  let a = dot(q, U) / dot(U, U);
+  let b = dot(q, V) / dot(V, V);
+  return abs(dot(q, N)) < 0.5 * h * (abs(N.x) + abs(N.y) + abs(N.z)) && a >= 0.0 && a <= 1.0 && b >= 0.0 && b <= 1.0;
+}`
+
 export const SIM_COMMON = /* wgsl */ `
 struct Params {
   dims: vec4<u32>,      // nx, ny, nz, frame
@@ -45,12 +63,27 @@ struct Params {
   fire2: vec4<f32>,     // expansion (1 = physical), mixing time (s), the bed's nominal area (m2), unused
   ball: vec4<f32>,      // the collision ball's centre (m), radius (m; 0 = none)
   ballVel: vec4<f32>,   // its velocity (m/s), whether it is wood that burns (0 or 1)
+  refGrey: vec4<f32>,   // the on-set reference (engine.ts): the grey ball's centre and radius (0: no reference)
+  refChrome: vec4<f32>, // the chrome ball's
+  refChartO: vec4<f32>, // the colour chart's lower corner; the stands' radius
+  refChartU: vec4<f32>, // the chart's width, along its lower edge; the set's least x
+  refChartV: vec4<f32>, // its height, up its face; the set's greatest x
 }
 @group(0) @binding(0) var<uniform> P: Params;
 
-// The collision ball: a solid sphere. A cell (or a face) is solid when its centre is inside it.
-fn solidAt(w: vec3<f32>) -> bool { return P.ball.w > 0.0 && distance(w, P.ball.xyz) < P.ball.w; }
+// The solids: the collision ball, a sphere, and the on-set reference when it stands. A cell (or a face) is solid when
+// its centre is inside one. The ball's faces move with it; the set's stand still.
+fn inBall(w: vec3<f32>) -> bool { return P.ball.w > 0.0 && distance(w, P.ball.xyz) < P.ball.w; }
+${setSolid('P')}
+fn solidAt(w: vec3<f32>) -> bool { return inBall(w) || inSet(w, P.grid.x); }
 fn cellSolid(c: vec3<i32>) -> bool { return solidAt(P.origin.xyz + (vec3<f32>(c) + 0.5) * P.grid.x); }
+fn anySolid() -> bool { return P.ball.w > 0.0 || P.refGrey.w > 0.0; }
+// The velocity of a face between cells a and b, one of them solid: the collision ball's, or none (the set's).
+fn wallVel(a: vec3<i32>, b: vec3<i32>) -> vec3<f32> {
+  let wa = P.origin.xyz + (vec3<f32>(a) + 0.5) * P.grid.x;
+  let wb = P.origin.xyz + (vec3<f32>(b) + 0.5) * P.grid.x;
+  return select(vec3<f32>(0.0), P.ballVel.xyz, inBall(wa) || inBall(wb));
+}
 
 // The ball as wood (a pine, 500 kg/m3) that heats, chars and burns. Its skin is a map of its surface, equirectangular
 // (u around the vertical from +x, v down from the top), and holds per texel: x the surface's temperature (K), y the
@@ -480,6 +513,12 @@ fn ivockMask(c: vec3<i32>) -> f32 {
   var m = smoothstep(2.0, 6.0, side) * smoothstep(1.0, 3.0, f32(c.y));
   if (P.ball.w > 0.0) {
     let gap = distance(worldOf(vec3<f32>(c) + 0.5), P.ball.xyz) - P.ball.w;
+    m *= smoothstep(1.0, 2.5, gap / P.grid.x);
+  }
+  // (And near the reference set's balls.)
+  if (P.refGrey.w > 0.0) {
+    let wc = worldOf(vec3<f32>(c) + 0.5);
+    let gap = min(distance(wc, P.refGrey.xyz) - P.refGrey.w, distance(wc, P.refChrome.xyz) - P.refChrome.w);
     m *= smoothstep(1.0, 2.5, gap / P.grid.x);
   }
   return m;
@@ -999,11 +1038,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     wz = (wz + stir(w).z * dt / P.grid.y) * keep;
     v.z = clamp(wz, -vmax, vmax);
   }
-  // Faces inside the collision ball move with it.
-  if (P.ball.w > 0.0) {
-    if (solidAt(worldOf(vec3<f32>(f.x, f.y + 0.5, f.z + 0.5)))) { v.x = P.ballVel.x; }
-    if (solidAt(worldOf(vec3<f32>(f.x + 0.5, f.y, f.z + 0.5)))) { v.y = P.ballVel.y; }
-    if (solidAt(worldOf(vec3<f32>(f.x + 0.5, f.y + 0.5, f.z)))) { v.z = P.ballVel.z; }
+  // Faces inside the collision ball move with it; inside the reference set they stand still.
+  if (anySolid()) {
+    let fx = worldOf(vec3<f32>(f.x, f.y + 0.5, f.z + 0.5));
+    let fy = worldOf(vec3<f32>(f.x + 0.5, f.y, f.z + 0.5));
+    let fz = worldOf(vec3<f32>(f.x + 0.5, f.y + 0.5, f.z));
+    if (solidAt(fx)) { v.x = select(0.0, P.ballVel.x, inBall(fx)); }
+    if (solidAt(fy)) { v.y = select(0.0, P.ballVel.y, inBall(fy)); }
+    if (solidAt(fz)) { v.z = select(0.0, P.ballVel.z, inBall(fz)); }
   }
   textureStore(velOut, c, vec4<f32>(v, 0.0));
   textureStore(deltaOut, c, vec4<f32>(v - vIn, 0.0));
@@ -1035,14 +1077,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var y1 = textureLoad(vel, c + Y, 0).y;
   var z0 = a.z;
   var z1 = textureLoad(vel, c + Z, 0).z;
-  // A face against the collision ball moves with it.
-  if (P.ball.w > 0.0) {
-    if (cellSolid(c - X)) { x0 = P.ballVel.x; }
-    if (cellSolid(c + X)) { x1 = P.ballVel.x; }
-    if (cellSolid(c - Y)) { y0 = P.ballVel.y; }
-    if (cellSolid(c + Y)) { y1 = P.ballVel.y; }
-    if (cellSolid(c - Z)) { z0 = P.ballVel.z; }
-    if (cellSolid(c + Z)) { z1 = P.ballVel.z; }
+  // A face against a solid moves with it (the collision ball) or stands still (the reference set).
+  if (anySolid()) {
+    if (cellSolid(c - X)) { x0 = wallVel(c - X, c - X).x; }
+    if (cellSolid(c + X)) { x1 = wallVel(c + X, c + X).x; }
+    if (cellSolid(c - Y)) { y0 = wallVel(c - Y, c - Y).y; }
+    if (cellSolid(c + Y)) { y1 = wallVel(c + Y, c + Y).y; }
+    if (cellSolid(c - Z)) { z0 = wallVel(c - Z, c - Z).z; }
+    if (cellSolid(c + Z)) { z1 = wallVel(c + Z, c + Z).z; }
   }
   let div = ((x1 - x0) + (y1 - y0) + (z1 - z0)) / P.grid.x;
   // Burning gas expands. At constant pressure, gas heated by dT in dt grows in volume at (dT / dt) / T, so where
@@ -1106,14 +1148,24 @@ struct Level {
 @group(0) @binding(0) var<uniform> L: Level;
 fn nL() -> vec3<i32> { return vec3<i32>(L.n.xyz); }
 fn at(c: vec3<i32>, n: vec3<i32>) -> i32 { return c.x + n.x * (c.y + n.y * c.z); }
-// The collision ball (centre, radius; radius 0 = none) and the grid's origin and finest cell size: a cell of any level
-// is solid when its centre is inside the ball, so the coarse levels see it too.
-struct Ball { s: vec4<f32>, o: vec4<f32> }
+// The collision ball (centre, radius; radius 0 = none), the grid's origin and finest cell size, and the on-set
+// reference (Params' fields): a cell of any level is solid when its centre is inside one, so the coarse levels see
+// them too.
+struct Ball {
+  s: vec4<f32>,
+  o: vec4<f32>,
+  refGrey: vec4<f32>,
+  refChrome: vec4<f32>,
+  refChartO: vec4<f32>,
+  refChartU: vec4<f32>,
+  refChartV: vec4<f32>,
+}
 @group(0) @binding(5) var<uniform> B: Ball;
+${setSolid('B')}
 fn solidL(c: vec3<i32>) -> bool {
-  if (B.s.w <= 0.0) { return false; }
-  let w = B.o.xyz + (vec3<f32>(c) + 0.5) * sqrt(L.h.x);
-  return distance(w, B.s.xyz) < B.s.w;
+  let h = sqrt(L.h.x);
+  let w = B.o.xyz + (vec3<f32>(c) + 0.5) * h;
+  return (B.s.w > 0.0 && distance(w, B.s.xyz) < B.s.w) || inSet(w, h);
 }
 `
 
@@ -1264,13 +1316,13 @@ fn pAt(c: vec3<i32>) -> f32 {
   if (any(c < vec3<i32>(0)) || any(c >= nCells())) { return 0.0; }
   return p[cellIndex(c)];
 }
-// A face between a solid cell (the collision ball) and any other moves with the ball.
+// A face between a solid cell and any other moves with the solid (the collision ball) or stands still (the set).
 fn ballFaces(c: vec3<i32>, v0: vec3<f32>) -> vec3<f32> {
   var v = v0;
-  if (P.ball.w > 0.0) {
-    if (cellSolid(c) || cellSolid(c - X)) { v.x = P.ballVel.x; }
-    if (cellSolid(c) || cellSolid(c - Y)) { v.y = P.ballVel.y; }
-    if (cellSolid(c) || cellSolid(c - Z)) { v.z = P.ballVel.z; }
+  if (anySolid()) {
+    if (cellSolid(c) || cellSolid(c - X)) { v.x = wallVel(c, c - X).x; }
+    if (cellSolid(c) || cellSolid(c - Y)) { v.y = wallVel(c, c - Y).y; }
+    if (cellSolid(c) || cellSolid(c - Z)) { v.z = wallVel(c, c - Z).z; }
   }
   return v;
 }
@@ -1325,10 +1377,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     proj.y = 0.0;
     refl.y = 0.0;
   }
-  if (P.ball.w > 0.0) {
-    if (cellSolid(c) || cellSolid(c - X)) { proj.x = P.ballVel.x; refl.x = P.ballVel.x; }
-    if (cellSolid(c) || cellSolid(c - Y)) { proj.y = P.ballVel.y; refl.y = P.ballVel.y; }
-    if (cellSolid(c) || cellSolid(c - Z)) { proj.z = P.ballVel.z; refl.z = P.ballVel.z; }
+  if (anySolid()) {
+    if (cellSolid(c) || cellSolid(c - X)) { proj.x = wallVel(c, c - X).x; refl.x = proj.x; }
+    if (cellSolid(c) || cellSolid(c - Y)) { proj.y = wallVel(c, c - Y).y; refl.y = proj.y; }
+    if (cellSolid(c) || cellSolid(c - Z)) { proj.z = wallVel(c, c - Z).z; refl.z = proj.z; }
   }
   textureStore(velOut, c, vec4<f32>(proj, 0.0));
   textureStore(velRefl, c, vec4<f32>(refl, 0.0));
@@ -1977,11 +2029,6 @@ struct RParams {
   rimDir: vec4<f32>,   // the softbox rig's rim: toward it, on (0 or 1)
   rimCol: vec4<f32>,   // its illuminance (lux) by colour
   camera: vec4<f32>,   // the shutter's open time (s, 0 for none); the glare's share of the light
-  refGrey: vec4<f32>,  // the on-set reference (engine.ts): the grey ball's centre and radius (0: no reference)
-  refChrome: vec4<f32>, // the chrome ball's
-  refChartO: vec4<f32>, // the colour chart's lower corner; the stands' radius
-  refChartU: vec4<f32>, // the chart's width, along its lower edge
-  refChartV: vec4<f32>, // its height, up its face
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -2387,7 +2434,8 @@ fn envBackdrop(d: vec3<f32>) -> vec3<f32> {
 // height as a light, I cos / r^2, through the soot on the way (the light volume's shadowed light just outside the
 // surface over the same bands' unshadowed light gives the mean transmittance). Close to the fire a band is no point
 // but a slice of flame as wide as the bed, which lights a surface turned partly away from its centre too: its cosine
-// wraps round by how large the slice looms, r_bed^2 / (r^2 + r_bed^2).
+// wraps round by how large the slice looms, r_bed^2 / (r^2 + r_bed^2). The reference set shadows each band (all its
+// pieces but skip, the one the surface belongs to; -1 for none).
 // With the ball's surface (ballMat): the fire's light on it as irradiance for the base (e, lux), its reflection in the
 // specular layer (spec, cd/m2), and what the fuzz takes of it (fuzz: the lobe-weighted illuminance, or the radiance of
 // flames all around). The flames touching it act as surroundings; each band of the fire as a light of its own.
@@ -2396,7 +2444,7 @@ struct BallFire {
   spec: vec3<f32>,
   fuzz: vec3<f32>,
 }
-fn ballFire(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat, shadowed: f32, fireColour: vec3<f32>, ch: vec3<f32>) -> BallFire {
+fn ballFire(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat, shadowed: f32, fireColour: vec3<f32>, ch: vec3<f32>, skip: i32) -> BallFire {
   var out = BallFire(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
   if (R.fire.x < 0.5) { return out; }
   let F = tangentFrame(n);
@@ -2423,7 +2471,7 @@ fn ballFire(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat
     // surface faces made the transmittance jump where a band's light leaves it, a seam across the surface.)
     seen += lum / r2;
     if (c > 0.0) {
-      let e = lum / r2 * smoothstep(0.05, 0.15, dist);
+      let e = lum / r2 * smoothstep(0.05, 0.15, dist) * refShadow(ph, l, dist, P.grid.x, sqrt(bed2) / max(dist, 1e-4), skip);
       far += e * c;
       if (m.specW > 0.0) { spec += e * ggxSpec(n, v, l, m.rough, m.f0); }
       if (m.fuzzW > 0.0) { fuzz += e * fuzzLobe(F, v, l, m.fuzzRough); }
@@ -2777,9 +2825,27 @@ fn chartColour(i: i32) -> vec3<f32> {
   return c[i];
 }
 const CHROME_F0 = vec3<f32>(${SCENE_MATERIALS.chrome.base_color.map(wf).join(', ')});
-fn refOn() -> bool { return R.refGrey.w > 0.0; }
-// What a ray meets of the set first: the grey ball (what 0), the chrome ball (1), a stand (2), or the chart, a patch
-// (3 + its index, row by row from dark skin) or its black frame (3 + 24). t is 1e9 for nothing.
+const CHROME_TINT = vec3<f32>(${SCENE_MATERIALS.chrome.specular_color.map(wf).join(', ')});
+// Its reflectance, OpenPBR's metal Fresnel ("F82-tint", the Lookdev lab's fresnelF82Tint): Schlick's from the base
+// colour, less a term that brings it, at cos 1/7 (about 82 degrees), to the specular colour's share of Schlick's.
+fn schlick3(f0: vec3<f32>, mu: f32) -> vec3<f32> {
+  let m = clamp(1.0 - mu, 0.0, 1.0);
+  let m2 = m * m;
+  return f0 + (1.0 - f0) * (m2 * m2 * m);
+}
+fn chromeFresnel(mu: f32) -> vec3<f32> {
+  let muBar = 1.0 / 7.0;
+  let b1 = 1.0 - muBar;
+  let b3 = b1 * b1 * b1;
+  let a = schlick3(CHROME_F0, muBar) * (1.0 - CHROME_TINT) / (muBar * b3 * b3);
+  let x = clamp(mu, 0.0, 1.0);
+  let y3 = (1.0 - x) * (1.0 - x) * (1.0 - x);
+  return max(schlick3(CHROME_F0, x) - a * x * (y3 * y3), vec3<f32>(0.0));
+}
+fn refOn() -> bool { return P.refGrey.w > 0.0; }
+// What a ray meets of the set first: the grey ball (what 0), the chrome ball (1), the grey ball's stand (2), the chrome
+// ball's (3), or the chart (4 + a patch's index, row by row from dark skin, or 4 + 24 its black card). t is 1e9 for
+// nothing. (The set's pieces, for refShadow: 0 to 3, and 4 the chart.)
 struct RefHit { t: f32, n: vec3<f32>, what: i32 }
 fn sphereT(ro: vec3<f32>, rd: vec3<f32>, s: vec4<f32>) -> f32 {
   let oc = ro - s.xyz;
@@ -2796,7 +2862,7 @@ fn standT(ro: vec3<f32>, rd: vec3<f32>, s: vec4<f32>) -> f32 {
   let a = dot(d, d);
   if (a < 1e-10) { return 1e9; }
   let b = dot(o, d);
-  let h = b * b - a * (dot(o, o) - R.refChartO.w * R.refChartO.w);
+  let h = b * b - a * (dot(o, o) - P.refChartO.w * P.refChartO.w);
   if (h < 0.0) { return 1e9; }
   let t = (-b - sqrt(h)) / a;
   let y = ro.y + rd.y * t;
@@ -2806,24 +2872,24 @@ fn refHit(ro: vec3<f32>, rd: vec3<f32>) -> RefHit {
   var h = RefHit(1e9, vec3<f32>(0.0, 1.0, 0.0), -1);
   if (!refOn()) { return h; }
   for (var k = 0; k < 2; k++) {
-    let s = select(R.refGrey, R.refChrome, k == 1);
+    let s = select(P.refGrey, P.refChrome, k == 1);
     let tb = sphereT(ro, rd, s);
     if (tb < h.t) { h = RefHit(tb, normalize(ro + rd * tb - s.xyz), k); }
     let ts = standT(ro, rd, s);
     if (ts < h.t) {
       let q = ro + rd * ts - s.xyz;
-      h = RefHit(ts, normalize(vec3<f32>(q.x, 0.0, q.z)), 2);
+      h = RefHit(ts, normalize(vec3<f32>(q.x, 0.0, q.z)), 2 + k);
     }
   }
   // The chart (the Lookdev lab's layout): six patches across, four down, on a black card; its back is the card.
-  let U = R.refChartU.xyz;
-  let V = R.refChartV.xyz;
+  let U = P.refChartU.xyz;
+  let V = P.refChartV.xyz;
   let N = normalize(cross(U, V));
   let dn = dot(rd, N);
   if (abs(dn) > 1e-8) {
-    let t = dot(R.refChartO.xyz - ro, N) / dn;
+    let t = dot(P.refChartO.xyz - ro, N) / dn;
     if (t > 1e-4 && t < h.t) {
-      let q = ro + rd * t - R.refChartO.xyz;
+      let q = ro + rd * t - P.refChartO.xyz;
       let ab = vec2<f32>(dot(q, U) / dot(U, U), dot(q, V) / dot(V, V));
       if (all(ab >= vec2<f32>(0.0)) && all(ab <= vec2<f32>(1.0))) {
         var cell = 24;
@@ -2833,7 +2899,7 @@ fn refHit(ro: vec3<f32>, rd: vec3<f32>) -> RefHit {
           let f = gr - c * (1.0 + CHART_GAP);
           if (c.x >= 0.0 && c.y >= 0.0 && c.x < 6.0 && c.y < 4.0 && f.x < 1.0 && f.y < 1.0) { cell = i32(c.x) + 6 * (3 - i32(c.y)); }
         }
-        h = RefHit(t, select(-N, N, dn < 0.0), 3 + cell);
+        h = RefHit(t, select(-N, N, dn < 0.0), 4 + cell);
       }
     }
   }
@@ -2844,16 +2910,17 @@ fn refHit(ro: vec3<f32>, rd: vec3<f32>) -> RefHit {
 fn refMat(what: i32) -> BallMat {
   var base = vec3<f32>(0.18);
   var rough = 0.9;
-  if (what == 2) {
+  if (what == 2 || what == 3) {
     base = vec3<f32>(0.03);
     rough = 0.45;
-  } else if (what >= 3) {
-    base = chartColour(min(what - 3, 24));
+  } else if (what >= 4) {
+    base = chartColour(min(what - 4, 24));
   }
   return BallMat(base, 1.0, rough, 0.04, 0.0, vec3<f32>(0.0), 0.5);
 }
-// How much of a light at distance dist along l reaches p past the set (its balls, their stands and the chart), soft
-// over a penumbra that widens with the distance behind each, pen0 + penK x (as for the collision ball).
+// How much of a light at distance dist along l reaches p past the set (its balls, their stands and the chart; all but
+// the piece skip, the one p is on), soft over a penumbra that widens with the distance behind each, pen0 + penK x (as
+// for the collision ball).
 fn sphereVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK: f32) -> f32 {
   let tb = s.xyz - p;
   let along = dot(tb, l);
@@ -2870,22 +2937,26 @@ fn standVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK
   let y = p.y + l.y * t;
   if (t <= 0.0 || t >= dist || y < 0.0 || y > s.y - s.w) { return 1.0; }
   let pen = pen0 + penK * t;
-  let r = R.refChartO.w;
+  let r = P.refChartO.w;
   return smoothstep(r - pen, r + pen, length(p.xz + l.xz * t - s.xz));
 }
-fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32) -> f32 {
+fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32, skip: i32) -> f32 {
   if (!refOn()) { return 1.0; }
-  var vis = sphereVis(p, l, dist, R.refGrey, pen0, penK) * sphereVis(p, l, dist, R.refChrome, pen0, penK);
-  vis *= standVis(p, l, dist, R.refGrey, pen0, penK) * standVis(p, l, dist, R.refChrome, pen0, penK);
+  var vis = 1.0;
+  if (skip != 0) { vis *= sphereVis(p, l, dist, P.refGrey, pen0, penK); }
+  if (skip != 1) { vis *= sphereVis(p, l, dist, P.refChrome, pen0, penK); }
+  if (skip != 2) { vis *= standVis(p, l, dist, P.refGrey, pen0, penK); }
+  if (skip != 3) { vis *= standVis(p, l, dist, P.refChrome, pen0, penK); }
+  if (skip == 4) { return vis; }
   // The chart: where the way to the light crosses it, how far inside its edges, against the penumbra there.
-  let U = R.refChartU.xyz;
-  let V = R.refChartV.xyz;
+  let U = P.refChartU.xyz;
+  let V = P.refChartV.xyz;
   let N = normalize(cross(U, V));
   let dn = dot(l, N);
   if (abs(dn) > 1e-6) {
-    let t = dot(R.refChartO.xyz - p, N) / dn;
+    let t = dot(P.refChartO.xyz - p, N) / dn;
     if (t > 0.0 && t < dist) {
-      let q = p + l * t - R.refChartO.xyz;
+      let q = p + l * t - P.refChartO.xyz;
       let lu = length(U);
       let lv = length(V);
       let a = dot(q, U) / lu;
@@ -2900,9 +2971,9 @@ fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32) -> f32
 
 // A surface's light toward v (cd/m2), with OpenPBR's layering (BallMat): lit by the sun and the rig's rim through the
 // smoke (the light volume just outside it, along its geometric normal nb) and past the collision ball (unless it is
-// the ball), by the sky or the environment through the smoke above, and by the fire (ballFire). n is the shading
-// normal. The reference set's surfaces (the collision ball's, in the image pass, are shaded the same way inline).
-fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat, ch: vec3<f32>, fireColour: vec3<f32>, isBall: bool) -> vec3<f32> {
+// the ball) and the reference set (but its piece skip), by the sky or the environment through the smoke above, and by
+// the fire (ballFire). n is the shading normal. The collision ball's surface (ballSurface) and the set's.
+fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat, ch: vec3<f32>, fireColour: vec3<f32>, isBall: bool, skip: i32) -> vec3<f32> {
   let sun = R.sunDir.xyz;
   let rimDir = R.rimDir.xyz;
   let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
@@ -2910,13 +2981,13 @@ fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: Bal
   let nv = max(dot(n, v), 1e-4);
   // Each light's illuminance at normal incidence (shadowed): the base takes its cosine share, the specular layer
   // and the fuzz their lobes'.
-  let sunE = R.sunCol.xyz * exp(-lb.x * ch) * select(ballSun(ph, sun), 1.0, isBall);
+  let sunE = R.sunCol.xyz * exp(-lb.x * ch) * select(ballSun(ph, sun), 1.0, isBall) * refShadow(ph, sun, 1e9, 0.004, 0.0046, skip);
   var E = sunE * max(dot(n, sun), 0.0);
   var spec = sunE * ggxSpec(n, v, sun, m.rough, m.f0);
   var fuzz = sunE * fuzzLobe(F, v, sun, m.fuzzRough);
   if (rimOn()) {
     let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0).x;
-    let rimE = R.rimCol.xyz * exp(-lb2 * ch) * select(ballSun(ph, rimDir), 1.0, isBall);
+    let rimE = R.rimCol.xyz * exp(-lb2 * ch) * select(ballSun(ph, rimDir), 1.0, isBall) * refShadow(ph, rimDir, 1e9, 0.01, 0.15, skip);
     E += rimE * max(dot(n, rimDir), 0.0);
     spec += rimE * ggxSpec(n, v, rimDir, m.rough, m.f0);
     fuzz += rimE * fuzzLobe(F, v, rimDir, m.fuzzRough);
@@ -2927,7 +2998,7 @@ fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: Bal
   E += skyE;
   spec += glossyEnv(reflect(-v, n), m.rough) * envBRDF(m.f0, m.rough, nv) * occ;
   fuzz += skyE * INV_PI;
-  let bf = ballFire(ph, nb, n, v, m, lb.w, fireColour, ch);
+  let bf = ballFire(ph, nb, n, v, m, lb.w, fireColour, ch, skip);
   E += bf.e;
   spec += bf.spec;
   fuzz += bf.fuzz;
@@ -2937,6 +3008,25 @@ fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: Bal
   let tFuzz = 1.0 - m.fuzzW * eFuzz;
   let base = m.base * INV_PI * E * (1.0 - m.specW * envBRDF(m.f0, m.rough, nv));
   return tFuzz * (base + m.specW * spec) + m.fuzzW * eFuzz * m.fuzzColor * fuzz;
+}
+
+// The collision ball's light toward the camera along rd, met at ph: lit by the sun and the sky through the smoke (the
+// light volume just outside its surface) and by the fire; matte grey, or wood that scorches, chars, glows and turns to
+// ash as its skin heats, shaded as an OpenPBR surface (ballMat).
+fn ballSurface(ph: vec3<f32>, rd: vec3<f32>, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
+  let nb = normalize(ph - P.ball.xyz);
+  var m = BallMat(vec3<f32>(BALL_ALBEDO), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5);
+  var n = nb;
+  var glow = vec3<f32>(0.0);
+  if (ballBurns()) {
+    let lp = (ph - P.ball.xyz) / P.ball.w;
+    let sk = skinAt(nb);
+    let crack = charCracks(lp, sk);
+    m = ballMat(lp, sk, crack);
+    n = crackNormal(lp, nb, sk, crack);
+    glow = charGlow(sk, crack);
+  }
+  return shadeSurface(ph, nb, n, -rd, m, ch, fireColour, true, -1) + glow;
 }
 
 // The floor's (or the cyc's) light toward the camera, cd/m2: at pf, facing nf, met tFloor along rd.
@@ -2956,7 +3046,7 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
   }
   // And the collision ball's and the reference set's; the ball also hides its share of the sky, its view factor from
   // the floor, (r / d)^2 cos.
-  shadow *= ballSun(pf, sun) * refShadow(pf, sun, 1e9, 0.004, 0.0046);
+  shadow *= ballSun(pf, sun) * refShadow(pf, sun, 1e9, 0.004, 0.0046, -1);
   var ballSky = 1.0;
   if (P.ball.w > 0.0) {
     let tb = P.ball.xyz - pf;
@@ -2979,13 +3069,13 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
     let d = fireLight[4u + 2u * b].xyz - pf;
     let r2 = dot(d, d) + BAND_R2;
     let dl = length(d);
-    fireLux += lum * max(dot(d, nf), 0.0) / (sqrt(r2) * r2) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4));
+    fireLux += lum * max(dot(d, nf), 0.0) / (sqrt(r2) * r2) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
   }
   let fireE = fireColour * fireLux;
   // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
   let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
   var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
-  if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch) * refShadow(pf, rimDir, 1e9, 0.01, 0.15); }
+  if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch) * refShadow(pf, rimDir, 1e9, 0.01, 0.15, -1); }
   var floorL = R.floorCol.xyz * INV_PI * E * fade;
   // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
   let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
@@ -2993,9 +3083,9 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
   return floorL;
 }
 
-// What the chrome ball reflects along rd from ro, cd/m2: the gas, then the floor or the cyc, or the sky. Marched as the
-// camera's rays are but more lightly (twice the step, trilinear, without the motion blur, the detail and the subgrid
-// flame temperature: the ball is small in the frame), and without the collision ball or the set itself.
+// What the chrome ball reflects along rd from ro, cd/m2: the gas, then the collision ball, the rest of the set, the
+// floor or the cyc, or the sky. Marched as the camera's rays are but more lightly (twice the step, trilinear, without
+// the motion blur, the detail and the subgrid flame temperature: the ball is small in the frame).
 fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
   var tFloor = select(1e9, -ro.y / rd.y, rd.y < -1e-5);
   var nFloor = vec3<f32>(0.0, 1.0, 0.0);
@@ -3005,7 +3095,9 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
     nFloor = cy.yzw;
   }
   let box = boxHit(ro, rd, P.origin.xyz, domainHi());
-  let tEnd = min(box.y, tFloor);
+  let tBall = ballHit(ro, rd);
+  let rh = refHit(ro, rd);
+  let tEnd = min(min(min(box.y, tFloor), tBall), rh.t);
   let sun = R.sunDir.xyz;
   let g = R.sunDir.w;
   let cosT = dot(rd, sun);
@@ -3060,7 +3152,12 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
       }
     }
   }
-  if (tFloor < 1e8) {
+  if (max(T.x, max(T.y, T.z)) <= 0.004) { return col; }
+  if (rh.t < min(tFloor, tBall) && rh.t < 1e8) {
+    if (rh.what != 1) { col += T * shadeSurface(ro + rd * rh.t, rh.n, rh.n, -rd, refMat(rh.what), ch, fireColour, false, min(rh.what, 4)); }
+  } else if (tBall < tFloor && tBall < 1e8) {
+    col += T * ballSurface(ro + rd * tBall, rd, ch, fireColour);
+  } else if (tFloor < 1e8) {
     col += T * floorLight(ro + rd * tFloor, nFloor, rd, tFloor, ch, fireColour);
   } else if (R.scene.x > 0.5 && R.scene.x < 1.5) {
     col += T * select(R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0))), envBackdrop(rd), envOn());
@@ -3215,74 +3312,27 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let ph = ro + rd * rh.t;
     let v = -rd;
     if (rh.what == 1) {
-      // The chrome ball: a mirror, the Lookdev lab's chromium (its reflectance by Schlick's Fresnel). The lights a
-      // mirror shows as points it shows as highlights (the sun, unless an HDR map's backdrop shows it already; the
-      // rig's softboxes, broader); everything else as its reflected ray finds it (mirrorView), the fire included.
-      let F = CHROME_F0 + (1.0 - CHROME_F0) * pow(1.0 - max(dot(rh.n, v), 0.0), 5.0);
+      // The chrome ball: the Lookdev lab's chromium, as a mirror (its roughness, 0.02, left out), its reflectance by
+      // chromeFresnel. The lights a mirror shows as points it shows as highlights (the sun, unless an HDR map's
+      // backdrop shows it already; the rig's softboxes, broader); everything else as its reflected ray finds it
+      // (mirrorView), the fire included.
+      let F = chromeFresnel(max(dot(rh.n, v), 0.0));
       let lb = textureSampleLevel(light, samp, uvwOf(ph + rh.n * 1.5 * P.grid.x), 0.0);
       let rig = envOn() && R.env.w <= 0.0;
       var hl = vec3<f32>(0.0);
       if (!envOn() || rig) {
-        hl += R.sunCol.xyz * exp(-lb.x * ch) * ballSun(ph, sun) * ggxSpec(rh.n, v, sun, select(0.07, 0.3, rig), 1.0);
+        hl += R.sunCol.xyz * exp(-lb.x * ch) * ballSun(ph, sun) * refShadow(ph, sun, 1e9, 0.004, 0.0046, 1) * ggxSpec(rh.n, v, sun, select(0.07, 0.3, rig), 1.0);
       }
       if (rimOn()) {
         let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + rh.n * 1.5 * P.grid.x), 0.0).x;
-        hl += R.rimCol.xyz * exp(-lb2 * ch) * ballSun(ph, rimDir) * ggxSpec(rh.n, v, rimDir, 0.3, 1.0);
+        hl += R.rimCol.xyz * exp(-lb2 * ch) * ballSun(ph, rimDir) * refShadow(ph, rimDir, 1e9, 0.01, 0.15, 1) * ggxSpec(rh.n, v, rimDir, 0.3, 1.0);
       }
       col += T * F * (hl + mirrorView(ph + rh.n * 1e-3, reflect(rd, rh.n), jitter, ch, fireColour));
     } else {
-      col += T * shadeSurface(ph, rh.n, rh.n, v, refMat(rh.what), ch, fireColour, false);
+      col += T * shadeSurface(ph, rh.n, rh.n, v, refMat(rh.what), ch, fireColour, false, min(rh.what, 4));
     }
   } else if (tBall < tFloor && tBall < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
-    // The collision ball, lit by the sun and the sky through the smoke (the light volume just outside its surface)
-    // and by the fire: matte grey, or wood that scorches, chars, glows and turns to ash as its skin heats, shaded as
-    // an OpenPBR surface (ballMat).
-    let ph = ro + rd * tBall;
-    let nb = normalize(ph - P.ball.xyz);
-    let v = -rd;
-    let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
-    var m = BallMat(vec3<f32>(BALL_ALBEDO), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5);
-    var n = nb;
-    var glow = vec3<f32>(0.0);
-    if (ballBurns()) {
-      let lp = (ph - P.ball.xyz) / P.ball.w;
-      let sk = skinAt(nb);
-      let crack = charCracks(lp, sk);
-      m = ballMat(lp, sk, crack);
-      n = crackNormal(lp, nb, sk, crack);
-      glow = charGlow(sk, crack);
-    }
-    let F = tangentFrame(n);
-    let nv = max(dot(n, v), 1e-4);
-    // Each light's illuminance at normal incidence (shadowed): the base takes its cosine share, the specular layer
-    // and the fuzz their lobes'.
-    let sunE = R.sunCol.xyz * exp(-lb.x * ch);
-    var E = sunE * max(dot(n, sun), 0.0);
-    var spec = sunE * ggxSpec(n, v, sun, m.rough, m.f0);
-    var fuzz = sunE * fuzzLobe(F, v, sun, m.fuzzRough);
-    if (rimOn()) {
-      let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0).x;
-      let rimE = R.rimCol.xyz * exp(-lb2 * ch);
-      E += rimE * max(dot(n, rimDir), 0.0);
-      spec += rimE * ggxSpec(n, v, rimDir, m.rough, m.f0);
-      fuzz += rimE * fuzzLobe(F, v, rimDir, m.fuzzRough);
-    }
-    // The sky or the environment, through the smoke above.
-    let occ = exp(-0.5 * lb.y * ch);
-    let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * n.y), envIrradiance(n), envOn()) * occ;
-    E += skyE;
-    spec += glossyEnv(reflect(rd, n), m.rough) * envBRDF(m.f0, m.rough, nv) * occ;
-    fuzz += skyE * INV_PI;
-    let bf = ballFire(ph, nb, n, v, m, lb.w, fireColour, ch);
-    E += bf.e;
-    spec += bf.spec;
-    fuzz += bf.fuzz;
-    // OpenPBR's layering: the fuzz on top passes 1 - its albedo; the specular layer reflects its share and passes
-    // the rest to the base.
-    let eFuzz = select(0.0, fuzzDirAlbedo(nv, m.fuzzRough), m.fuzzW > 0.0);
-    let tFuzz = 1.0 - m.fuzzW * eFuzz;
-    let base = m.base * INV_PI * E * (1.0 - m.specW * envBRDF(m.f0, m.rough, nv));
-    col += T * (tFuzz * (base + m.specW * spec) + m.fuzzW * eFuzz * m.fuzzColor * fuzz + glow);
+    col += T * ballSurface(ro + rd * tBall, rd, ch, fireColour);
   } else if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     col += T * floorLight(ro + rd * tFloor, nFloor, rd, tFloor, ch, fireColour);
   } else if (skyStage && tBall >= 1e8 && rh.t >= 1e8) {

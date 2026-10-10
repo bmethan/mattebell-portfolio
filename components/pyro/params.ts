@@ -131,7 +131,7 @@ export const PYRO_DEFAULTS: PyroState = {
   view: 'aces',
   shutter: 180,
   glare: 0.04,
-  reference: false,
+  reference: true,
   env: 'none',
   rigKey: true,
   rigFill: true,
@@ -156,11 +156,12 @@ export const SOURCE_LOOKS: Record<SourceType, Partial<PyroState>> = {
 
 // Starting points: each sets the source, the light and the wind, and the lab restarts from it. A fire's smoke is
 // soot (dark, albedo about 0.25) when the fuel burns sooty; wood smoke also carries tarry droplets, which make it paler.
-const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, radiantFraction: FUEL.radiantFraction, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none' }
-const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none' }
+const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, radiantFraction: FUEL.radiantFraction, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none', reference: false }
+const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none', reference: false }
 export const BONFIRE_AT_DUSK: Partial<PyroState> = { ...FIRE_START, heatRelease: 180, srcRadius: 0.4, sootYield: 0.04, albedo: 0.45, sunEV: 8, skyEV: 7, lightAz: -60, lightEl: 12, whiteBalance: 5000 }
 export const PRESETS: { id: string; label: string; state: Partial<PyroState> }[] = [
-  { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'gray' } },
+  // The lab's opening scene, with the on-set reference beside it.
+  { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'gray', reference: true } },
   { id: 'campfire', label: 'Campfire at night', state: { ...FIRE_START, background: 'studio', heatRelease: 80, srcRadius: 0.3, sootYield: FUEL.sootYield, albedo: 0.35, sunEV: -1, skyEV: -2, lightAz: -45, lightEl: 35, whiteBalance: 5500 } },
   // The campfire's fire burning a fuel that makes no soot (methanol's yield is nil): its light is all the flame's own blue.
   { id: 'alcohol', label: 'Alcohol fire at night', state: { ...FIRE_START, background: 'studio', heatRelease: 80, srcRadius: 0.3, sootYield: 0, albedo: 0.35, sunEV: -1, skyEV: -2, lightAz: -45, lightEl: 35, whiteBalance: 5500 } },

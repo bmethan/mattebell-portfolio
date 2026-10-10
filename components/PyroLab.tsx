@@ -99,7 +99,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'On-set reference',
-    'The Shading tab can stand the Lookdev lab’s reference set beside the fire, as a lighting team shoots one on set to record the light where an effect will go: its ColorChecker (X-Rite’s published values), an 18% grey ball and a chrome ball, the balls 16 cm across on thin stands at about the middle of the flames’ height, the chart on the floor in front of them, turned to the camera and a little toward the fire. The set stands on the fire’s upwind side, clear of its bed (on the right in still air), and outside the simulation: the gas does not flow around it. The grey ball and the chart are lit as the burning ball is, by the sun, the sky and the fire through the smoke, so the chart shows the firelight’s colour against the camera’s white balance. The chrome ball is a mirror: each ray that meets it is reflected and marched again through the gas, more lightly than the camera’s rays (twice the step, without the motion blur or the subgrid detail), so it shows the fire, its smoke and the stage as they stand, and the sun and the rig’s softboxes as highlights. The balls, their stands and the chart cast shadows on the floor from the sun and from each slice of the fire.',
+    'The Lookdev lab’s reference set stands beside the fire, as a lighting team shoots one on set to record the light where an effect will go: its ColorChecker (X-Rite’s published values), an 18% grey ball and a chrome ball, the balls 16 cm across on thin stands at about the middle of the flames’ height, the chart on the floor in front of them, turned to the camera and a little toward the fire. It stands in the bonfire’s opening scene, and the Shading tab turns it on or off for any other. It stands on the fire’s upwind side (the right, in still air), clear of the bed and inside the frame; where the frame leaves no room upwind, it stands downwind, as far from the fire as the frame allows. The balls and the chart are solids in the simulation, as the collision ball is, so the gas flows around them (the stands, thinner than a cell, are left out). The grey ball and the chart are lit as the burning ball is, by the sun, the sky and the fire through the smoke, so the chart shows the firelight’s colour against the camera’s white balance. The chrome ball is a mirror with OpenPBR’s metal Fresnel (its F82 tint): each ray that meets it is reflected and marched again through the gas, more lightly than the camera’s rays (twice the step, without the motion blur or the subgrid detail), so it shows the fire, its smoke, the stage, the collision ball and the rest of the set as they stand, and the sun and the rig’s softboxes as highlights. The set’s pieces shadow each other, the collision ball and the floor, from the sun, the rig’s rim and each slice of the fire.',
   ],
   [
     'Export',
@@ -453,7 +453,7 @@ export default function PyroLab() {
 
       <div ref={frameRef} className="lab-frame">
         {mode === 'fallback' ? (
-          <PyroStill alt="A fire burning on the floor, its flames yellow at the base and red at the tips, its smoke rising, rendered by the pyro lab's solver" />
+          <PyroStill alt="A fire burning on the floor beside a colour chart, a grey ball and a chrome ball, its flames yellow at the base and red at the tips, its smoke rising, rendered by the pyro lab's solver" />
         ) : (
           <canvas
             ref={canvasRef}

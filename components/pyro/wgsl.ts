@@ -1965,6 +1965,8 @@ struct RParams {
   scene: vec4<f32>,    // background: the sky and a floor to the horizon (1) or a studio's black (0); extinction in
                        // green relative to 550 nm; the view transform (0 ACES 2.0, 1 AgX, 2 PBR Neutral, 3 Standard);
                        // whether the ACES 2.0 LUT has loaded (0 or 1)
+  env: vec4<f32>,      // an HDR environment (0 or 1); cos and sin of its turn into the map's frame; its scale to lux
+  sh: array<vec4<f32>, 9>, // its light but the key, as spherical harmonics (rgb, cd/m2 x sr), the floor below
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -2259,6 +2261,37 @@ ${fireCommon(9)}
 @group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
 @group(0) @binding(32) var<storage, read> ballSheet: array<f32>; // the fuel flowing up the burning ball (BALL_HEAT)
+@group(0) @binding(33) var envTex: texture_2d<f32>; // an HDR environment's backdrop, softened (environment.ts)
+
+// An HDR environment (environment.ts). A direction into the map's frame: turned about the vertical so the map's light
+// faces the light azimuth.
+fn envOn() -> bool { return R.env.x > 0.5; }
+fn toEnv(d: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(d.x * R.env.y + d.z * R.env.z, d.y, d.z * R.env.y - d.x * R.env.z);
+}
+// Its light but the key, from the spherical harmonics, with each band weighted (environment.ts shBasis, y up).
+fn shAt(d: vec3<f32>, w0: f32, w1: f32, w2: f32) -> vec3<f32> {
+  let x = d.x;
+  let y = d.y;
+  let z = d.z;
+  var c = R.sh[0].xyz * (0.282095 * w0);
+  c += (R.sh[1].xyz * y + R.sh[2].xyz * z + R.sh[3].xyz * x) * (0.488603 * w1);
+  c += (R.sh[4].xyz * (1.092548 * x * y) + R.sh[5].xyz * (1.092548 * y * z) + R.sh[6].xyz * (0.315392 * (3.0 * y * y - 1.0))
+    + R.sh[7].xyz * (1.092548 * x * z) + R.sh[8].xyz * (0.546274 * (x * x - z * z))) * w2;
+  return max(c, vec3<f32>(0.0));
+}
+// Scattered toward the camera along rd, per unit of scattering: the map convolved with the Henyey-Greenstein phase
+// function, whose bands scale by g^l (Funk-Hecke).
+fn envScatter(rd: vec3<f32>, g: f32) -> vec3<f32> { return shAt(toEnv(rd), 1.0, g, g * g); }
+// Irradiance on a surface facing n, lux: the map convolved with the clamped cosine (bands pi, 2 pi / 3, pi / 4;
+// Ramamoorthi and Hanrahan 2001).
+fn envIrradiance(n: vec3<f32>) -> vec3<f32> { return shAt(toEnv(n), 3.14159265, 2.0943951, 0.78539816); }
+// The map itself, softened, as the backdrop (the Lookdev lab's direction mapping).
+fn envBackdrop(d: vec3<f32>) -> vec3<f32> {
+  let e = toEnv(d);
+  let uv = vec2<f32>(fract(atan2(e.x, -e.z) * INV_2PI + 0.5), acos(clamp(e.y, -1.0, 1.0)) * INV_PI);
+  return textureSampleLevel(envTex, noiseSamp, uv, 0.0).xyz * R.env.w;
+}
 
 // The fire's light on the collision ball (lux, by colour). Flames touching it: the radiance of the gas within about
 // 10 cm of its surface along the normal, as from a hemisphere of it, pi L. The fire further off: each band of its
@@ -2561,6 +2594,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let rot = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
   // The fire's colour at unit luminance (its light's strength comes from the light volume).
   let fireColour = fireLight[0].xyz / max(fireLight[0].w, 1e-12);
+  // The sky's light scattered toward the camera, before the smoke above dims it: a uniform dome over open ground
+  // (radiance E / pi, half of it seen by an isotropic scatterer), or an HDR environment through the phase function.
+  let skyScatter = select(R.skyCol.xyz * INV_2PI, envScatter(rd, g), envOn());
 
   // Radiance in cd/m2, per colour channel (soot dims blue more than red, so transmittance is a colour too).
   var col = vec3<f32>(0.0);
@@ -2610,8 +2646,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         let L = textureSampleLevel(light, samp, uvw, 0.0);
         let tauS = L.x * ch;
         let lsun = (exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2) * ballSun(w, sun);
-        // The sky as a uniform dome over open ground (radiance E / pi), half of it seen by an isotropic scatterer.
-        let amb = R.skyCol.xyz * INV_2PI * exp(-0.5 * L.y * ch);
+        let amb = skyScatter * exp(-0.5 * L.y * ch);
         // The fire's light, shadowed by the soot on the way (from the light volume, in kilolux).
         let fireE = fireColour * 1000.0 * L.w;
         // Light scattered toward the camera per unit of extinction, cd/m2: the phase function is hg / (4 pi).
@@ -2640,7 +2675,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let ph = ro + rd * tBall;
     let nb = normalize(ph - P.ball.xyz);
     let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
-    let E = R.sunCol.xyz * max(dot(nb, sun), 0.0) * exp(-lb.x * ch) + R.skyCol.xyz * (0.5 + 0.5 * nb.y) * exp(-0.5 * lb.y * ch)
+    let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nb.y), envIrradiance(nb), envOn());
+    let E = R.sunCol.xyz * max(dot(nb, sun), 0.0) * exp(-lb.x * ch) + skyE * exp(-0.5 * lb.y * ch)
       + ballFireLight(ph, nb, lb.w, fireColour, ch);
     var alb = vec3<f32>(BALL_ALBEDO);
     var glow = vec3<f32>(0.0);
@@ -2689,15 +2725,17 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       fireLux += lum * max(d.y, 0.0) / (sqrt(r2) * r2);
     }
     let fireE = fireColour * fireLux;
-    let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + R.skyCol.xyz * skyVis * ballSky + fireE;
+    let skyE = select(R.skyCol.xyz, envIrradiance(vec3<f32>(0.0, 1.0, 0.0)), envOn());
+    let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + skyE * skyVis * ballSky + fireE;
     var floorL = R.floorCol.xyz * INV_PI * E * fade;
     // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
-    if (R.scene.x > 0.5) { floorL = mix(floorL, R.skyCol.xyz * INV_PI * 1.25, 1.0 - exp(-tFloor / 40.0)); }
+    let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
+    if (R.scene.x > 0.5) { floorL = mix(floorL, haze, 1.0 - exp(-tFloor / 40.0)); }
     col += T * floorL;
   } else if (R.scene.x > 0.5 && tBall >= 1e8) {
     // The sky: a dome of the sky's radiance (its illuminance on the ground over pi), a little brighter toward the
-    // horizon. At night it is too dim to see.
-    col += T * R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0)));
+    // horizon (at night too dim to see); or the HDR environment.
+    col += T * select(R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0))), envBackdrop(rd), envOn());
   }
 
   // Exposed (as a fraction of the luminance the camera maps to white), for the accumulation pass.

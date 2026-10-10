@@ -11,6 +11,11 @@ import { citeAuthors } from './lookdev/citations'
 import { Group, Pill, Range, Tabs } from './lab/ui'
 import DeviceCheck from './pyro/DeviceCheck'
 import { VIEW_TRANSFORMS } from './lab/viewTransforms'
+import { ENVIRONMENTS, ENV_ORDER, type Env } from './lookdev/environments'
+
+// Each HDR environment's illuminance on open ground when it is picked (the Environment EV; lux = 2.5 x 2^EV): a clear
+// midday about 100,000 lux, an overcast day about 15,000, the sun just set about 600, a photo studio about 1,200.
+const ENV_EV: Record<Exclude<Env, 'none'>, number> = { midday: 15.5, overcast: 12.5, sunset: 8, studio: 9 }
 
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
 const noSubscribe = () => () => {}
@@ -664,13 +669,46 @@ export default function PyroLab() {
                   <Slider label="Anisotropy" min={-0.5} max={0.9} step={0.01} value={pyro.anisotropy} onChange={v => update({ anisotropy: v })} />
                 </div>
                 <div className="lab-row">
-                  <Slider label="Light azimuth" min={-180} max={180} step={1} value={pyro.lightAz} digits={0} unit={'°'} onChange={v => update({ lightAz: v })} />
-                  <Slider label="Light elevation" min={5} max={85} step={1} value={pyro.lightEl} digits={0} unit={'°'} onChange={v => update({ lightEl: v })} />
+                  <Group label="Environment">
+                    {ENV_ORDER.map(en => (
+                      <Pill key={en} on={pyro.env === en} onClick={() => update(en === 'none' || en === pyro.env ? { env: en } : { env: en, skyEV: ENV_EV[en] })}>
+                        {en === 'none' ? 'None' : ENVIRONMENTS[en].label}
+                      </Pill>
+                    ))}
+                  </Group>
                 </div>
-                <div className="lab-row">
-                  <Slider label="Sun" min={-4} max={16} step={0.5} value={pyro.sunEV} digits={1} unit=" EV" onChange={v => update({ sunEV: v })} />
-                  <Slider label="Sky" min={-4} max={14} step={0.5} value={pyro.skyEV} digits={1} unit=" EV" onChange={v => update({ skyEV: v })} />
-                </div>
+                {pyro.env === 'none' ? (
+                  <>
+                    <div className="lab-row">
+                      <Slider label="Light azimuth" min={-180} max={180} step={1} value={pyro.lightAz} digits={0} unit={'°'} onChange={v => update({ lightAz: v })} />
+                      <Slider label="Light elevation" min={5} max={85} step={1} value={pyro.lightEl} digits={0} unit={'°'} onChange={v => update({ lightEl: v })} />
+                    </div>
+                    <div className="lab-row">
+                      <Slider label="Sun" min={-4} max={16} step={0.5} value={pyro.sunEV} digits={1} unit=" EV" onChange={v => update({ sunEV: v })} />
+                      <Slider label="Sky" min={-4} max={14} step={0.5} value={pyro.skyEV} digits={1} unit=" EV" onChange={v => update({ skyEV: v })} />
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="lab-row">
+                      <Slider label="Turn" min={-180} max={180} step={1} value={pyro.lightAz} digits={0} unit={'°'} onChange={v => update({ lightAz: v })} />
+                      <Slider label="Environment" min={-4} max={17} step={0.5} value={pyro.skyEV} digits={1} unit=" EV" onChange={v => update({ skyEV: v })} />
+                    </div>
+                    <p className="lab-credit">
+                      <span className="lab-label">Environment</span>
+                      <span>
+                        {ENVIRONMENTS[pyro.env].title} by {ENVIRONMENTS[pyro.env].authors}, Poly Haven.{' '}
+                        <a href={ENVIRONMENTS[pyro.env].url} target="_blank" rel="noopener noreferrer">
+                          Source
+                        </a>
+                        {' · '}
+                        <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener noreferrer">
+                          CC0
+                        </a>
+                      </span>
+                    </p>
+                  </>
+                )}
                 <div className="lab-row">
                   <Group label="Exposure">
                     <Pill on={pyro.exposureMode === 'auto'} onClick={() => update({ exposureMode: 'auto' })}>
@@ -697,14 +735,16 @@ export default function PyroLab() {
                   </Group>
                 </div>
                 <div className="lab-row">
-                  <Group label="Background">
-                    <Pill on={pyro.background === 'studio'} onClick={() => update({ background: 'studio' })}>
-                      Studio
-                    </Pill>
-                    <Pill on={pyro.background === 'sky'} onClick={() => update({ background: 'sky' })}>
-                      Sky
-                    </Pill>
-                  </Group>
+                  {pyro.env === 'none' && (
+                    <Group label="Background">
+                      <Pill on={pyro.background === 'studio'} onClick={() => update({ background: 'studio' })}>
+                        Studio
+                      </Pill>
+                      <Pill on={pyro.background === 'sky'} onClick={() => update({ background: 'sky' })}>
+                        Sky
+                      </Pill>
+                    </Group>
+                  )}
                   <Group label="Sampling">
                     <Pill on={!pyro.tricubic} onClick={() => update({ tricubic: false })}>
                       Trilinear

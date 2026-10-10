@@ -2,6 +2,7 @@
 // where there are some (physics.ts holds the constants).
 import { FUEL } from './physics'
 import type { ViewTransform } from '../lab/viewTransforms'
+import type { Env } from '../lookdev/environments'
 
 export type PyroResolution = 'low' | 'medium' | 'high'
 export type Advection = 'sl' | 'mac' | 'bimocq' // BiMocq2 for a smoke source; a fire then uses MacCormack
@@ -63,6 +64,10 @@ export interface PyroState {
   exposureComp: number // EV of compensation on the metered exposure: positive brightens, as on a camera's dial
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
   view: ViewTransform // the view transform the image is shown through, as in the Lookdev lab
+  // One of the Lookdev lab's HDR environments lighting the scene (environment.ts), or none (the sun and a flat sky).
+  // With one, the light azimuth turns it, the Sky EV sets its illuminance on open ground, and the floor runs to the
+  // horizon under it.
+  env: Env
   background: 'studio' | 'sky' // black around the floor's pool of light, or the sky and a floor to the horizon
   tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
   upres: boolean // a smoke source's density also on a grid twice as fine (wavelet turbulence)
@@ -115,6 +120,7 @@ export const PYRO_DEFAULTS: PyroState = {
   exposureComp: 0,
   whiteBalance: 5000,
   view: 'aces',
+  env: 'none',
   background: 'studio',
   tricubic: true,
   upres: true,
@@ -135,8 +141,8 @@ export const SOURCE_LOOKS: Record<SourceType, Partial<PyroState>> = {
 
 // Starting points: each sets the source, the light and the wind, and the lab restarts from it. A fire's smoke is
 // soot (dark, albedo about 0.25) when the fuel burns sooty; wood smoke also carries tarry droplets, which make it paler.
-const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, radiantFraction: FUEL.radiantFraction, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0 }
-const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0 }
+const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fire, srcNoise: 0.8, radiantFraction: FUEL.radiantFraction, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none' }
+const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none' }
 export const BONFIRE_AT_DUSK: Partial<PyroState> = { ...FIRE_START, heatRelease: 180, srcRadius: 0.4, sootYield: 0.04, albedo: 0.45, sunEV: 8, skyEV: 7, lightAz: -60, lightEl: 12, whiteBalance: 5000 }
 export const PRESETS: { id: string; label: string; state: Partial<PyroState> }[] = [
   { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'studio' } },

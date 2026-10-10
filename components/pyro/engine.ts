@@ -8,6 +8,7 @@ import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER
 import { writeVdb, type VdbGrid } from './vdb'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 import { REC709_TO_AP1, ap1Luminance, loadAcesLutGPU, mat3Apply, viewIndex } from '../lab/viewTransforms'
+import { BACKDROP_H, BACKDROP_W, environmentLight, type EnvLight } from './environment'
 
 export const SIM_DT = 1 / 30
 const MAX_STEPS_PER_FRAME = 2
@@ -107,6 +108,28 @@ const halfToFloat = (h: number) => {
   const f = h & 1023
   const v = e === 0 ? f * 2 ** -24 : e === 31 ? Infinity : (1 + f / 1024) * 2 ** (e - 15)
   return h & 0x8000 ? -v : v
+}
+// Floats to half floats (rounded to nearest, overflow to the largest half; the backdrop holds no negatives).
+const toHalf = (src: Float32Array) => {
+  const f = new Float32Array(1)
+  const u = new Uint32Array(f.buffer)
+  const out = new Uint16Array(src.length)
+  for (let i = 0; i < src.length; i++) {
+    f[0] = src[i]
+    const x = u[0]
+    const sign = (x >>> 16) & 0x8000
+    const e = ((x >>> 23) & 0xff) - 127 + 15
+    let m = x & 0x7fffff
+    if (e >= 31) out[i] = sign | 0x7bff
+    else if (e <= 0) {
+      if (e < -10) out[i] = sign
+      else {
+        m |= 0x800000
+        out[i] = sign | ((m >> (14 - e)) + ((m >> (13 - e)) & 1))
+      }
+    } else out[i] = sign | Math.min((e << 10) + (m >> 13) + ((m >> 12) & 1), 0x7bff)
+  }
+  return out
 }
 const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 const cross = (a: Vec3, b: Vec3): Vec3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
@@ -436,7 +459,7 @@ export class PyroEngine {
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
   private simData = new ArrayBuffer(256)
-  private renderData = new Float32Array(60)
+  private renderData = new Float32Array(100)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
@@ -483,6 +506,9 @@ export class PyroEngine {
   private upresInit = true
   private upresWasActive = false
   private dummy3d: GPUTexture
+  // An HDR environment's light (environment.ts), once loaded, and its backdrop (cleared to black without one).
+  private envLight: EnvLight | null = null
+  private envTex: GPUTexture
   // The ACES 2.0 view's LUT (a 1 x 1 stand-in until it has loaded; AgX shows meanwhile), shared with the Lookdev lab.
   private lut: GPUTexture
   private lutSampler: GPUSampler
@@ -590,6 +616,8 @@ export class PyroEngine {
     this.ballBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
+    this.envTex = d.createTexture({ size: [BACKDROP_W, BACKDROP_H], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    this.syncEnv()
     this.lut = d.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.lutSampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' })
     void loadAcesLutGPU(d).then(lut => {
@@ -942,7 +970,7 @@ export class PyroEngine {
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }]),
       },
     }
     this.resetSkin()
@@ -973,6 +1001,7 @@ export class PyroEngine {
       this.layoutCamera()
     }
     if ((this.state.ball && !prev.ball) || (this.state.ballBurns && !prev.ballBurns)) this.resetSkin()
+    if (this.state.env !== prev.env) this.syncEnv()
     // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh.
     this.lightDirty = true
     this.needsRender = true
@@ -1596,7 +1625,26 @@ export class PyroEngine {
     const az = (s.lightAz * Math.PI) / 180
     const el = (s.lightEl * Math.PI) / 180
     // Toward the sun; azimuth 0 puts it behind the camera (+z), positive swings it to camera right.
-    const sun: Vec3 = [Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)]
+    let sun: Vec3 = [Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)]
+    let sunLux = SUN_COLOUR.map(v => v * luxOfEV(s.sunEV))
+    // An HDR environment (environment.ts), turned so its light faces the light azimuth: its key takes the sun's place
+    // (at the map's own elevation), the rest lights through spherical harmonics, all scaled so the environment's
+    // illuminance on open ground, key included, meets the Sky EV.
+    const e = this.envLight
+    const envData = new Float32Array(40)
+    if (e) {
+      const k = luxOfEV(s.skyEV) / e.illuminance
+      const rho = Math.atan2(e.anchor[0], e.anchor[2]) - az
+      const cr = Math.cos(rho)
+      const sr = Math.sin(rho)
+      envData.set([1, cr, sr, k], 0)
+      for (let m = 0; m < 9; m++) envData.set([e.sh[3 * m] * k, e.sh[3 * m + 1] * k, e.sh[3 * m + 2] * k, 0], 4 + 4 * m)
+      if (e.key) {
+        const [x, y, z] = e.key.dir
+        sun = [x * cr - z * sr, y, z * cr + x * sr]
+        sunLux = e.key.irradiance.map(v => v * k)
+      } else sunLux = [0, 0, 0]
+    }
     const fire = s.sourceType === 'fire'
     if (this.wb?.kelvin !== s.whiteBalance) this.wb = { kelvin: s.whiteBalance, m: whiteBalance(s.whiteBalance) }
     const wb = this.wb.m
@@ -1606,7 +1654,7 @@ export class PyroEngine {
     r.set([...c.right, this.renderFrame % 4096], 8)
     r.set([...c.up, exposureOfEV(this.exposureEV())], 12)
     r.set([...sun, s.anisotropy], 16)
-    r.set([...SUN_COLOUR.map(v => v * luxOfEV(s.sunEV)), s.densityScale], 20)
+    r.set([...sunLux, s.densityScale], 20)
     r.set([...SKY_COLOUR.map(v => v * luxOfEV(s.skyEV)), s.albedo], 24)
     r.set([0.14, 0.14, 0.14, 3.2], 28)
     r.set([this.canvas.width, this.canvas.height, this.simTime, fire ? s.flameDetail : 0], 32)
@@ -1620,7 +1668,8 @@ export class PyroEngine {
     r.set([...wb[0], s.wind], 44)
     r.set([...wb[1], s.tricubic ? 1 : 0], 48)
     r.set([...wb[2], this.upresActive() && this.upres ? 1 : 0], 52)
-    r.set([s.background === 'sky' ? 1 : 0, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
+    r.set([s.background === 'sky' || e ? 1 : 0, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
+    r.set(envData, 60)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
@@ -1693,6 +1742,7 @@ export class PyroEngine {
           ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView({ dimension: '2d-array' }), v(tex[0]), v(g.flame)]),
           { binding: 31, resource: { buffer: g.skin } },
           { binding: 32, resource: { buffer: g.ballSheet } },
+          { binding: 33, resource: this.envTex.createView() },
         ],
       })
       this.upres = { tex, held, group, render }
@@ -1834,7 +1884,9 @@ export class PyroEngine {
   // a second, so the fire's puffing does not pump the exposure.
   private targetEV() {
     const s = this.state
-    const ambient = Math.log2((METER_AMBIENT * (luxOfEV(s.sunEV) + luxOfEV(s.skyEV))) / 2.5)
+    // (An HDR environment's illuminance on open ground, key included, is the Sky EV's.)
+    const lux = this.envLight ? luxOfEV(s.skyEV) : luxOfEV(s.sunEV) + luxOfEV(s.skyEV)
+    const ambient = Math.log2((METER_AMBIENT * lux) / 2.5)
     if (s.sourceType !== 'fire' || this.fireCd <= 0) return ambient
     return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(this.fireCd / METER_FIRE_CD))
   }
@@ -1869,6 +1921,27 @@ export class PyroEngine {
 
   private ballBurning() {
     return this.state.ball && this.state.ballBurns
+  }
+
+  // The chosen HDR environment's light, loaded and prepared (environment.ts, cached per map), then its backdrop
+  // uploaded; until then, and without one, the sun and the flat sky light the scene.
+  private syncEnv() {
+    const env = this.state.env
+    if (env === 'none') {
+      this.envLight = null
+      return
+    }
+    void environmentLight(env)
+      .then(e => {
+        if (this.disposed || this.state.env !== env) return
+        this.envLight = e
+        this.device.queue.writeTexture({ texture: this.envTex }, toHalf(e.backdrop.rgba), { bytesPerRow: BACKDROP_W * 8 }, [BACKDROP_W, BACKDROP_H])
+        this.lightDirty = true
+        this.needsRender = true
+        this.taaCount = 0
+        this.kick()
+      })
+      .catch(err => console.warn(`Pyro environment ${env} unavailable`, err))
   }
 
   // A fresh wooden ball: unburned, at the air's temperature.

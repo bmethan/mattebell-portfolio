@@ -2768,6 +2768,46 @@ fn fs(@builtin(position) fc: vec4<f32>) -> Out {
 // flow, so its eddies travel with the smoke and fade where the flow has stretched them, and is as strong as the local
 // flow, as eddies a band finer carry energy in proportion to the resolved flow's. Semi-Lagrangian: at half the cell
 // size it smears half as much. The renderer reads this density; the lighting still comes from the coarse grid.
+//
+// Most of the fine grid holds no smoke (a plume fills about a third of it, smoke in wind two fifths), so each block of
+// UPRES_BLOCK fine cells a side is marked when it holds any, and a cell whose backtrace, wherever the turbulence can
+// take it, reads only blocks that held none last step takes no density from them: it skips the turbulence and the
+// lookups, with the same result. The turbulence is read from CURL_GEN's texture, whose largest magnitude bounds how
+// far it can move the backtrace.
+export const UPRES_BLOCK = 8
+const NOISE_ROT = 'mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6)'
+
+// The upres pass's turbulence, made once with the detail noise: the curl of the noise's three channels as a vector
+// potential, by central differences half a texel apart, scaled to about unit size (the fbm's gradients run about 20 per
+// tile), at each texel of a texture the noise's size, in the noise's rotated frame. Read back with one lookup, it is
+// the field the upres pass once differenced from six (between texels, interpolated rather than recomputed). And its
+// largest magnitude anywhere, for the upres pass's bound on how far the turbulence can move a backtrace.
+export const CURL_GEN = /* wgsl */ `
+@group(0) @binding(0) var noiseTex: texture_3d<f32>;
+@group(0) @binding(1) var noiseSamp: sampler;
+@group(0) @binding(2) var dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(3) var<storage, read_write> curlMax: array<atomic<u32>>;
+const ROT = ${NOISE_ROT};
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = textureDimensions(dst);
+  if (any(id >= n)) { return; }
+  let q = (vec3<f32>(id) + 0.5) / vec3<f32>(n);
+  let h = 0.5 / 64.0;
+  let ex = ROT * vec3<f32>(h, 0.0, 0.0);
+  let ey = ROT * vec3<f32>(0.0, h, 0.0);
+  let ez = ROT * vec3<f32>(0.0, 0.0, h);
+  let dx = textureSampleLevel(noiseTex, noiseSamp, q + ex, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ex, 0.0).xyz;
+  let dy = textureSampleLevel(noiseTex, noiseSamp, q + ey, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ey, 0.0).xyz;
+  let dz = textureSampleLevel(noiseTex, noiseSamp, q + ez, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ez, 0.0).xyz;
+  let c = vec3<f32>(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) / (2.0 * h * 20.0);
+  textureStore(dst, id, vec4<f32>(c, 0.0));
+  // (A positive float's bits order as the float does.)
+  atomicMax(&curlMax[0], bitcast<u32>(length(c)));
+}
+`
+
 export const UPRES = /* wgsl */ `
 ${SIM_COMMON}
 @group(0) @binding(1) var samp: sampler;
@@ -2776,9 +2816,14 @@ ${SIM_COMMON}
 @group(0) @binding(4) var dst: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(5) var detA: texture_3d<f32>;
 @group(0) @binding(6) var detB: texture_3d<f32>;
-@group(0) @binding(7) var noiseTex: texture_3d<f32>;
+@group(0) @binding(7) var curlTex: texture_3d<f32>;
 @group(0) @binding(8) var noiseSamp: sampler;
 @group(0) @binding(9) var scal: texture_3d<f32>;
+@group(0) @binding(11) var<storage, read> curlMax: array<u32>;
+// The blocks that held smoke last step (read), and this step's (marked).
+@group(0) @binding(12) var<storage, read> heldPrev: array<u32>;
+@group(0) @binding(13) var<storage, read_write> heldNext: array<atomic<u32>>;
+var<workgroup> wgHolds: atomic<u32>;
 struct Upres {
   strength: f32, // the turbulence's speed per unit of the local flow's
   k: f32, // 1/m: noise tiles per metre
@@ -2791,52 +2836,78 @@ struct Upres {
 }
 @group(0) @binding(10) var<uniform> U: Upres;
 
-const ROT = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
-// The curl of the noise's three channels as a vector potential, by central differences half a texel apart, scaled to
-// about unit size (the fbm's gradients run about 20 per tile).
+const ROT = ${NOISE_ROT};
+const BLOCK = ${UPRES_BLOCK};
 fn curlNoise(p: vec3<f32>) -> vec3<f32> {
-  let h = 0.5 / 64.0;
-  let q = ROT * p;
-  let ex = ROT * vec3<f32>(h, 0.0, 0.0);
-  let ey = ROT * vec3<f32>(0.0, h, 0.0);
-  let ez = ROT * vec3<f32>(0.0, 0.0, h);
-  let dx = textureSampleLevel(noiseTex, noiseSamp, q + ex, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ex, 0.0).xyz;
-  let dy = textureSampleLevel(noiseTex, noiseSamp, q + ey, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ey, 0.0).xyz;
-  let dz = textureSampleLevel(noiseTex, noiseSamp, q + ez, 0.0).xyz - textureSampleLevel(noiseTex, noiseSamp, q - ez, 0.0).xyz;
-  return vec3<f32>(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) / (2.0 * h * 20.0);
+  return textureSampleLevel(curlTex, noiseSamp, ROT * p, 0.0).xyz;
+}
+fn blocksOf(nf: vec3<i32>) -> vec3<i32> { return (nf + BLOCK - 1) / BLOCK; }
+// Whether a sample anywhere from lo to hi (fine cells) can read a texel of a block that held smoke last step: the
+// texels a trilinear lookup there touches, clamped as the lookup clamps. A reach over more than three blocks a side
+// (a fast flow) is taken as yes rather than searched.
+fn mayHold(lo: vec3<f32>, hi: vec3<f32>, nf: vec3<i32>) -> bool {
+  let t0 = clamp(vec3<i32>(floor(lo - 0.5)), vec3<i32>(0), nf - 1);
+  let t1 = clamp(vec3<i32>(floor(hi - 0.5)) + 1, vec3<i32>(0), nf - 1);
+  let b0 = t0 / BLOCK;
+  let b1 = t1 / BLOCK;
+  if (any(b1 - b0 > vec3<i32>(2))) { return true; }
+  let nb = blocksOf(nf);
+  for (var z = b0.z; z <= b1.z; z++) {
+    for (var y = b0.y; y <= b1.y; y++) {
+      for (var x = b0.x; x <= b1.x; x++) {
+        if (heldPrev[(z * nb.y + y) * nb.x + x] != 0u) { return true; }
+      }
+    }
+  }
+  return false;
 }
 
 @compute @workgroup_size(4, 4, 4)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let nf = vec3<i32>(textureDimensions(dst));
   let c = vec3<i32>(id);
-  if (any(c >= nf)) { return; }
-  let gF = vec3<f32>(id) + 0.5;
-  let g = 0.5 * gF; // coarse grid coordinates
-  let w = worldOf(g);
-  if (U.init > 0.5) {
-    textureStore(dst, c, vec4<f32>(max(scalAt(scal, samp, g).x, 0.0), 0.0, 0.0, 0.0));
-    return;
+  if (all(c < nf)) {
+    let gF = vec3<f32>(id) + 0.5;
+    let g = 0.5 * gF; // coarse grid coordinates
+    let w = worldOf(g);
+    let n = vec3<f32>(nf);
+    var d = 0.0;
+    if (U.init > 0.5) {
+      d = max(scalAt(scal, samp, g).x, 0.0);
+    } else {
+      let u = velAt(vel, samp, g);
+      // Back along the flow, in fine cells (twice as many per metre): without the turbulence, and how far the
+      // turbulence can move it at most (its magnitude is at most curlMax, the two layers' blend at most root 2 times
+      // that; 1% over for the texture's half floats).
+      let back = 2.0 * P.grid.y / P.grid.x;
+      let gb0 = gF - back * u;
+      let reach = back * U.strength * length(u) * bitcast<f32>(curlMax[0]) * 1.4142136 * 1.01;
+      if (mayHold(gb0 - reach, gb0 + reach, nf)) {
+        let uvw = g / nF();
+        let a = textureSampleLevel(detA, samp, uvw, 0.0);
+        let b = textureSampleLevel(detB, samp, uvw, 0.0);
+        let wa = U.wa / (1.0 + a.w * a.w);
+        let wb = U.wb / (1.0 + b.w * b.w);
+        let turb = (curlNoise((w + a.xyz) * U.k) * wa + curlNoise((w + b.xyz) * U.k + vec3<f32>(0.37, 0.61, 0.13)) * wb) / max(sqrt(U.wa * U.wa + U.wb * U.wb), 1e-3);
+        let gb = gb0 - back * U.strength * length(u) * turb;
+        if (gb.x >= 0.0 && gb.x <= n.x && gb.z >= 0.0 && gb.z <= n.z && gb.y <= n.y) {
+          d = textureSampleLevel(src, samp, (clamp(gb - 0.5, vec3<f32>(0.0), n - 1.0) + 0.5) / n, 0.0).x;
+        }
+      }
+      let top = smoothstep(0.7, 1.0, gF.y / n.y);
+      d = max(d, 0.0) * exp(-(P.decay.y + 2.5 * top) * P.grid.y);
+      d = max(d, P.srcProps.x * sourceMask(w));
+      if (solidAt(P.origin.xyz + gF * 0.5 * P.grid.x)) { d = 0.0; }
+    }
+    textureStore(dst, c, vec4<f32>(d, 0.0, 0.0, 0.0));
+    if (d > 0.0) { atomicStore(&wgHolds, 1u); }
   }
-  let u = velAt(vel, samp, g);
-  let uvw = g / nF();
-  let a = textureSampleLevel(detA, samp, uvw, 0.0);
-  let b = textureSampleLevel(detB, samp, uvw, 0.0);
-  let wa = U.wa / (1.0 + a.w * a.w);
-  let wb = U.wb / (1.0 + b.w * b.w);
-  let turb = (curlNoise((w + a.xyz) * U.k) * wa + curlNoise((w + b.xyz) * U.k + vec3<f32>(0.37, 0.61, 0.13)) * wb) / max(sqrt(U.wa * U.wa + U.wb * U.wb), 1e-3);
-  let v = u + U.strength * length(u) * turb;
-  // Back along the flow, in fine cells (twice as many per metre).
-  let gb = gF - 2.0 * v * P.grid.y / P.grid.x;
-  let n = vec3<f32>(nf);
-  var d = 0.0;
-  if (gb.x >= 0.0 && gb.x <= n.x && gb.z >= 0.0 && gb.z <= n.z && gb.y <= n.y) {
-    d = textureSampleLevel(src, samp, (clamp(gb - 0.5, vec3<f32>(0.0), n - 1.0) + 0.5) / n, 0.0).x;
+  // A workgroup (4 cells a side, at a multiple of 4) lies in one block: its first cell marks the block once.
+  workgroupBarrier();
+  if (li == 0u && atomicLoad(&wgHolds) != 0u) {
+    let nb = blocksOf(nf);
+    let bk = c / BLOCK;
+    atomicStore(&heldNext[(bk.z * nb.y + bk.y) * nb.x + bk.x], 1u);
   }
-  let top = smoothstep(0.7, 1.0, gF.y / n.y);
-  d = max(d, 0.0) * exp(-(P.decay.y + 2.5 * top) * P.grid.y);
-  d = max(d, P.srcProps.x * sourceMask(w));
-  if (solidAt(P.origin.xyz + gF * 0.5 * P.grid.x)) { d = 0.0; }
-  textureStore(dst, c, vec4<f32>(d, 0.0, 0.0, 0.0));
 }
 `

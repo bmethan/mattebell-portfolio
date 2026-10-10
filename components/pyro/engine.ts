@@ -370,9 +370,12 @@ export class PyroEngine {
         canvas.after(own)
         console.warn('Pyro: the canvas gave no webgpu context; drawing on one of its own')
       }
-      // A device and pipelines made ahead of time, if they are ready and still usable; else new ones.
-      const ahead = warm ? await warm : null
+      // A device and pipelines made ahead of time, if they are ready and still usable; else new ones. Taken at once, so
+      // an engine started meanwhile (React's development double mount starts two) makes its own rather than sharing a
+      // device the other destroys when it is thrown away.
+      const pending = warm
       warm = null
+      const ahead = pending ? await pending : null
       const got = ahead && !ahead.lost ? ahead : await requestDevice()
       if (!got) {
         own?.remove()
@@ -447,6 +450,7 @@ export class PyroEngine {
   private pipes: Pipes | null = null
   private grids: Grids | null = null
   private disposed = false
+  private lost = false
   private visible = false
   private paused = false
   private raf = 0
@@ -487,9 +491,10 @@ export class PyroEngine {
     this.state = { ...PYRO_DEFAULTS, ...initial }
     const d = device
     this.format = navigator.gpu.getPreferredCanvasFormat()
-    ctx.configure({ device: d, format: this.format, alphaMode: 'opaque' })
+    this.configure()
     d.addEventListener('uncapturederror', ev => console.error(`Pyro WebGPU error: ${(ev as GPUUncapturedErrorEvent).error.message}`))
     d.lost.then(info => {
+      this.lost = true
       if (this.disposed) return
       console.warn('Pyro: WebGPU device lost', info.message)
       this.stop()
@@ -1570,7 +1575,34 @@ export class PyroEngine {
     return this.upres
   }
 
+  private configure() {
+    this.ctx.configure({ device: this.device, format: this.format, alphaMode: 'opaque' })
+  }
+
+  // The canvas's texture for this frame, or null when there is none to draw to (disposed, or the device lost). Another
+  // engine on the same canvas can leave the context unconfigured, or configured for its own device: React's development
+  // double mount starts two, and the one it throws away unconfigures the shared context as it goes. Take it back.
+  private canvasTexture(): GPUTexture | null {
+    if (this.disposed || this.lost) return null
+    if (typeof this.ctx.getConfiguration === 'function' && this.ctx.getConfiguration()?.device !== this.device) this.configure()
+    try {
+      return this.ctx.getCurrentTexture()
+    } catch {
+      // Unconfigured, in a browser that cannot say so: configure, and try once more.
+      try {
+        this.configure()
+        return this.ctx.getCurrentTexture()
+      } catch (err) {
+        console.warn('Pyro: no canvas texture to draw to', err)
+        return null
+      }
+    }
+  }
+
   private render() {
+    // Nothing to draw to: skip the frame rather than throw.
+    const screen = this.canvasTexture()
+    if (!screen) return
     const g = this.grids!
     const p = this.pipes!
     this.needsRender = false
@@ -1599,7 +1631,7 @@ export class PyroEngine {
     const next = 1 - this.histIndex
     pass = enc.beginRenderPass({
       colorAttachments: [
-        { view: this.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
+        { view: screen.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
         { view: t.hist[next].createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
       ],
     })
@@ -1774,6 +1806,8 @@ export class PyroEngine {
   // kernel (all SOR sweeps together). Needs the timestamp-query feature.
   async profileStep(): Promise<Record<string, number> | null> {
     if (!this.grids || !this.device.features.has('timestamp-query')) return null
+    const screen = this.canvasTexture()
+    if (!screen) return null
     const d = this.device
     const g = this.grids
     const p = this.pipes!
@@ -1912,7 +1946,7 @@ export class PyroEngine {
     labels.push('accumulate')
     const ap = enc.beginRenderPass({
       colorAttachments: [
-        { view: this.ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
+        { view: screen.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
         { view: t.hist[1 - this.histIndex].createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
       ],
       timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * k + 2, endOfPassWriteIndex: 2 * k + 3 },
@@ -2170,6 +2204,8 @@ export class PyroEngine {
     this.layoutCamera()
     // A still meters at once (no easing) and accumulates as a paused frame does.
     await this.readFire()
+    // Disposed, or the device lost, while metering: no still.
+    if (this.disposed || this.lost) return null
     this.meterEV = this.targetEV()
     const paused = this.paused
     this.paused = true
@@ -2184,8 +2220,10 @@ export class PyroEngine {
     this.disposed = true
     if (this.raf) cancelAnimationFrame(this.raf)
     this.raf = 0
+    // The context, unless another engine on the canvas has since configured it for its own device.
     try {
-      this.ctx.unconfigure()
+      const cfg = typeof this.ctx.getConfiguration === 'function' ? this.ctx.getConfiguration() : undefined
+      if (cfg === undefined || cfg?.device === this.device) this.ctx.unconfigure()
     } catch {}
     this.device.destroy()
     this.ownCanvas?.remove()

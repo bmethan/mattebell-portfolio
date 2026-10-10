@@ -19,7 +19,7 @@ interface Props {
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
-const WARM_S = 2
+const WARM_S = 5 // long enough for the render scale to settle on a GPU that falls behind
 const MEASURE_S = 5
 
 function deviceLine() {

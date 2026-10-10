@@ -28,6 +28,16 @@ const SPEED_LIMIT = 8 // m/s
 const FOV_Y = (32 * Math.PI) / 180
 const RENDER_SCALE_MIN = 0.5
 const RENDER_SCALE_MAX = 0.75
+// The simulation falling behind real time while the page's frames still come (the GPU is the bottleneck, and the
+// two-frames-in-flight gate keeps the page smooth by skipping steps): fewer steps than this a second, for a second of
+// steady running, renders fewer pixels, so more of the GPU goes to the steps. Judged only after SIM_SETTLE_MS of
+// running without a break (start-up, a restart, a change of scale), over the last second's steps, all at the current
+// scale (so SIM_SETTLE_MS is at least a second). On the HP Envy's Radeon (RDNA 2) in a 1600-pixel-wide window, the
+// bonfire's frame costs 21 ms at full scale and 10 at the lowest, its step 16: 24 steps a second at full scale, 29 at
+// the lowest. (A smoke source's step there costs 31 ms by itself, so a softer image gains it little.)
+const SIM_BEHIND_RATE = 27
+const SIM_BEHIND_MS = 750
+const SIM_SETTLE_MS = 1000
 // A default resolution that cannot keep up steps down: judged on the steps taken between 3 and 6 s of running
 // (after start-up compiles settle), against 18 per second.
 const AUTO_RES_FROM_S = 3
@@ -480,6 +490,10 @@ export class PyroEngine {
   private stepTimes: number[] = []
   private frameTimes: number[] = []
   private renderScale = RENDER_SCALE_MAX
+  private scaleCeiling = RENDER_SCALE_MAX // the render scale the simulation keeps real time at (lowered when it falls behind)
+  private steadySince = 0 // when the loop last began running without a break (ms)
+  private behindMs = 0 // how long the simulation has run behind real time, without a break
+  private lastAdapt = 0
   private inFlight = 0 // frames of GPU work submitted and not yet finished
   private runClock = 0 // seconds spent running (on screen, not paused) on the current grids
   private autoSteps = 0 // steps taken in the judging window
@@ -888,6 +902,9 @@ export class PyroEngine {
     this.autoSteps = 0
     this.stepTimes = []
     this.renderScale = RENDER_SCALE_MAX
+    this.scaleCeiling = RENDER_SCALE_MAX
+    this.behindMs = 0
+    this.steadySince = performance.now()
     this.applySize()
   }
 
@@ -1101,6 +1118,8 @@ export class PyroEngine {
   private kick() {
     if (this.raf || this.disposed || !this.visible || !this.pipes) return
     this.lastTick = performance.now()
+    this.steadySince = this.lastTick
+    this.behindMs = 0
     this.raf = requestAnimationFrame(this.tick)
   }
 
@@ -1113,6 +1132,8 @@ export class PyroEngine {
   private tick = (now: number) => {
     this.raf = 0
     if (this.disposed || !this.visible || !this.grids) return
+    // A long gap (the page busy elsewhere) breaks the steady running the simulation's rate is judged on.
+    if (now - this.lastTick > 250) this.steadySince = now
     const elapsed = Math.min(now - this.lastTick, 100)
     this.lastTick = now
     // The GPU still has two frames of work: queue nothing more (the page keeps its frame rate; a GPU that cannot
@@ -1682,10 +1703,30 @@ export class PyroEngine {
   }
 
 
-  // When the display's frames come slower than 40 a second for a second while simulating (the GPU is the
-  // bottleneck), render fewer pixels, down to half.
+  // When the simulation falls behind real time, or the display's frames come slower than 40 a second, for a second
+  // while simulating (the GPU is the bottleneck), render fewer pixels, down to two thirds of the full scale. Frames
+  // back above 55 a second raise it again, but never above the scale the simulation last fell behind at (until a
+  // restart: a new starting point or resolution judges afresh). (Whether a step down helped is not judged from the
+  // rate it gives: a starting fire grows for its first ten seconds or so, costing more to draw as it does, so its rate
+  // falls whatever the scale.)
   private adapt() {
     const now = this.frameTimes[this.frameTimes.length - 1]
+    const since = Math.min(now - this.lastAdapt, 100)
+    this.lastAdapt = now
+    if (!this.paused && now - this.steadySince > SIM_SETTLE_MS) {
+      let rate = 0
+      for (const t of this.stepTimes) if (now - t <= 1000) rate++
+      this.behindMs = rate < SIM_BEHIND_RATE ? this.behindMs + since : 0
+      if (this.behindMs >= SIM_BEHIND_MS && this.renderScale > RENDER_SCALE_MIN) {
+        this.renderScale = Math.max(RENDER_SCALE_MIN, this.renderScale * 0.85)
+        this.scaleCeiling = this.renderScale
+        this.behindMs = 0
+        this.steadySince = now
+        this.frameTimes = []
+        this.applySize()
+        return
+      }
+    }
     while (this.frameTimes.length && now - this.frameTimes[0] > 1000) this.frameTimes.shift()
     if (this.paused || this.frameTimes.length < 10) return
     const spanMs = now - this.frameTimes[0]
@@ -1694,8 +1735,8 @@ export class PyroEngine {
       this.renderScale = Math.max(RENDER_SCALE_MIN, this.renderScale * 0.85)
       this.frameTimes = []
       this.applySize()
-    } else if (fps > 55 && this.renderScale < RENDER_SCALE_MAX) {
-      this.renderScale = Math.min(RENDER_SCALE_MAX, this.renderScale / 0.85)
+    } else if (fps > 55 && this.renderScale < this.scaleCeiling) {
+      this.renderScale = Math.min(this.scaleCeiling, this.renderScale / 0.85)
       this.frameTimes = []
       this.applySize()
     }

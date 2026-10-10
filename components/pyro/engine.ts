@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -19,6 +19,8 @@ const MG_POST = 2
 const MG_COARSE = 16
 // Red-black sweeps per step for each of its potentials (warm started).
 const IVOCK_SWEEPS = 1
+// Leapfrog flow maps' projection at each cycle's end, cold started: V-cycles.
+const LFM_PROJECT_CYCLES = 4
 // BiMocq2's steps between re-initialisations.
 const BIMOCQ_REINIT = 16
 const MG_COARSE_OMEGA = 1.6
@@ -131,6 +133,11 @@ interface Pipes {
   bimocqMaps: GPUComputePipeline
   bimocqRecon: GPUComputePipeline
   bimocqAccum: GPUComputePipeline
+  advectVelDouble: GPUComputePipeline
+  lfmCellVel: GPUComputePipeline
+  lfmMarchFwd: GPUComputePipeline
+  lfmMarchBwd: GPUComputePipeline
+  lfmPull: [GPUComputePipeline, GPUComputePipeline, GPUComputePipeline]
   diffuse: GPUComputePipeline
   light: GPUComputePipeline
   render: GPURenderPipeline
@@ -181,6 +188,25 @@ interface Grids {
     accum: [GPUBindGroup, GPUBindGroup]
   }
   ivockRhs: GPUBuffer // its right-hand side, the vorticity lost, four floats a cell (readable for development checks)
+  // Leapfrog flow maps: the cycle's half-step velocities (on the faces, and cell-centred for marching), its initial
+  // velocity with the forces gathered in (ping-ponged), the step's forces, the pullbacks' scratch, the maps and their
+  // Jacobian columns (four floats per face, three lattices), and the pressure kept aside while the re-initialisation
+  // solves its own.
+  lfm: {
+    ring: GPUTexture[]
+    ringC: GPUTexture[]
+    u0: [GPUTexture, GPUTexture]
+    delta: GPUTexture
+    m: GPUTexture
+    e: GPUTexture
+    pressure: GPUBuffer
+    pressureSave: GPUBuffer
+    advect: GPUBindGroup[] // step k >= 2: the half-step velocity two back, through the last
+    cellVel: GPUBindGroup[]
+    marchFwd: GPUBindGroup[]
+    marchBwd: GPUBindGroup
+    pull: [GPUBindGroup, GPUBindGroup, GPUBindGroup]
+  }
   detA: [GPUTexture, GPUTexture]
   detB: [GPUTexture, GPUTexture]
   lightDims: Vec3
@@ -244,7 +270,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, diffuse, light, upres, render, resolve] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, render, resolve] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -277,6 +303,13 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(BIMOCQ_MAPS),
     compute(BIMOCQ_RECON),
     compute(BIMOCQ_ACCUM),
+    compute(ADVECT_VEL, { DIR: 2 }),
+    compute(LFM_CELLVEL),
+    compute(LFM_MARCH_FWD),
+    compute(LFM_MARCH_BWD),
+    compute(LFM_PULL, { MODE: 1 }),
+    compute(LFM_PULL, { MODE: 2 }),
+    compute(LFM_PULL, { MODE: 3 }),
     compute(DIFFUSE),
     compute(LIGHT),
     compute(UPRES),
@@ -293,7 +326,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, diffuse, light, upres, render, resolve }
+  return { fireSum, fireTotal, noiseGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, render, resolve }
 }
 
 export function prewarmPyro() {
@@ -387,6 +420,9 @@ export class PyroEngine {
   private bimocqHasPrev = false
   private bimocqReset = true
   private bimocqWas = false
+  // Leapfrog flow maps: the step within the cycle, and whether the last step used them.
+  private lfmStep = 0
+  private lfmWas = false
   private readingBall = false
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
@@ -563,7 +599,7 @@ export class PyroEngine {
       d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: resources.map((resource, binding) => ({ binding, resource })) })
     const cells = n[0] * n[1] * n[2]
     const div = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
-    const pressure = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE })
+    const pressure = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
     const buffers: GPUBuffer[] = [div, pressure]
     const storage = (count: number) => {
       const b = d.createBuffer({ size: Math.max(16, count * 4), usage: GPUBufferUsage.STORAGE })
@@ -677,6 +713,46 @@ export class PyroEngine {
       ) as [GPUBindGroup, GPUBindGroup],
       accum: [0, 1].map(k => group(p.bimocqAccum, [{ buffer: this.simBuf }, this.sampler, v(scal[0]), v(phiStar), { buffer: by[1 - k] }, v(dCurr[k]), v(dCurr[1 - k])])) as [GPUBindGroup, GPUBindGroup],
     }
+    // Leapfrog flow maps (see 2c).
+    const ring = Array.from({ length: LFM_N }, () => tex(velSize, true))
+    const ringC = Array.from({ length: LFM_N }, () => tex(n))
+    const u0: [GPUTexture, GPUTexture] = [tex(velSize, true), tex(velSize, true)]
+    const delta = tex(velSize)
+    const lm = tex(velSize)
+    const le = tex(velSize)
+    const faces = 3 * velSize[0] * velSize[1] * velSize[2]
+    const faceBuffer = () => {
+      const b = d.createBuffer({ size: faces * 16, usage: GPUBufferUsage.STORAGE })
+      buffers.push(b)
+      return b
+    }
+    const phi = faceBuffer()
+    const fcol = faceBuffer()
+    const psi = faceBuffer()
+    const tcol = faceBuffer()
+    // The impulse's gauge at each cell at the cycle's end: the pressure and |u|^2 / 2 gathered along its path.
+    const lam = storage(cells * 2)
+    const pressureSave = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+    buffers.push(pressureSave)
+    const lfm: Grids['lfm'] = {
+      ring,
+      ringC,
+      u0,
+      delta,
+      m: lm,
+      e: le,
+      pressure,
+      pressureSave,
+      advect: ring.map(r => group(p.advectVelDouble, [{ buffer: this.simBuf }, this.sampler, v(vel[0]), v(r), v(vel[3])])),
+      cellVel: ringC.map(r => group(p.lfmCellVel, [{ buffer: this.simBuf }, v(vel[1]), v(r), { buffer: pressure }])),
+      marchFwd: ringC.map(r => group(p.lfmMarchFwd, [{ buffer: this.simBuf }, this.sampler, v(r), v(delta), v(u0[0]), v(u0[1]), { buffer: phi }, { buffer: fcol }])),
+      marchBwd: group(p.lfmMarchBwd, [{ buffer: this.simBuf }, this.sampler, ...ringC.map(v), { buffer: psi }, { buffer: tcol }, { buffer: lam }]),
+      pull: [
+        group(p.lfmPull[0], [{ buffer: this.simBuf }, this.sampler, { buffer: psi }, { buffer: tcol }, v(u0[0]), v(u0[0]), v(lm), { buffer: lam }]),
+        group(p.lfmPull[1], [{ buffer: this.simBuf }, this.sampler, { buffer: phi }, { buffer: fcol }, v(lm), v(u0[0]), v(le), { buffer: lam }]),
+        group(p.lfmPull[2], [{ buffer: this.simBuf }, this.sampler, { buffer: psi }, { buffer: tcol }, v(le), v(lm), v(vel[0]), { buffer: lam }]),
+      ],
+    }
     // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
     const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
     const firePartial = storage(groups * 12)
@@ -707,7 +783,7 @@ export class PyroEngine {
     const s = this.sampler
     this.grids = {
       n,
-      textures: [...vel, ...scal, ...detA, ...detB, curl, light, flame, nut, vortA, vortB, vortC, psiCurl],
+      textures: [...vel, ...scal, ...detA, ...detB, curl, light, flame, nut, vortA, vortB, vortC, psiCurl, ...ring, ...ringC, ...u0, delta, lm, le],
       buffers,
       levels,
       vel,
@@ -720,6 +796,7 @@ export class PyroEngine {
       flame,
       bimocq,
       ivockRhs,
+      lfm,
       detA,
       detB,
       lightDims,
@@ -753,7 +830,7 @@ export class PyroEngine {
           ],
         }),
         ivockApply: group(p.ivockApply, [P, v(vel[3]), v(psiCurl), v(vel[2])]),
-        forces: group(p.forces, [P, v(vel[3]), v(scal[0]), v(curl), v(vel[0]), v(nut)]),
+        forces: group(p.forces, [P, v(vel[3]), v(scal[0]), v(curl), v(vel[0]), v(nut), v(delta)]),
         divergence: withSkin(p.divergence, [P, v(vel[0]), { buffer: div }, v(scal[0]), { buffer: fireLight }, { buffer: hrr }]),
         sor: [0, 1].map(k => group(p.sor, [P, { buffer: this.parityBufs[k] }, { buffer: div }, { buffer: pressure }])) as [GPUBindGroup, GPUBindGroup],
         project: group(p.project, [P, v(vel[0]), { buffer: pressure }, v(vel[1])]),
@@ -773,6 +850,7 @@ export class PyroEngine {
     }
     this.resetSkin()
     this.bimocqReset = true
+    this.lfmStep = 0
     this.simTime = 0
     this.frame = 0
     this.lightDirty = true
@@ -1059,10 +1137,20 @@ export class PyroEngine {
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
     }
     // Velocity: advect (into vel[3]), forces (into vel[0]), project (into vel[1]). Advection-reflection advects half a
-    // step, projects, reflects, advects the reflection the second half and projects again.
-    const scheme = this.state.velocity
+    // step, projects, reflects, advects the reflection the second half and projects again. Leapfrog flow maps advect
+    // the half-step velocity two back through the last (2c), the cycle's first two steps over half a step and one.
+    const scheme = this.velScheme()
+    const lfm = scheme === 'lfm'
+    // A cycle starts afresh from the current velocity when LFM has just been switched on.
+    if (lfm && !this.lfmWas) this.lfmStep = 0
+    const k = this.lfmStep
+    if (lfm && k === 0) enc.copyTextureToTexture({ texture: g.vel[0] }, { texture: g.lfm.u0[0] }, [nx + 1, ny + 1, nz + 1])
     let pass = enc.beginComputePass()
-    if (scheme === 'ar') {
+    if (lfm) {
+      if (k === 0) run(pass, p.advectVelHalf, g.bg.arAdvect1, cv)
+      else if (k === 1) run(pass, p.advectVel, g.bg.advectVel, cv)
+      else run(pass, p.advectVelDouble, g.lfm.advect[k - 2], cv)
+    } else if (scheme === 'ar') {
       run(pass, p.advectVelHalf, g.bg.arAdvect1, cv)
     } else if (scheme === 'mac') {
       run(pass, p.advectVel, g.bg.advectVelFwd, cv)
@@ -1091,8 +1179,10 @@ export class PyroEngine {
       this.solvePressure(pass)
     }
     run(pass, p.project, g.bg.project, cv)
+    if (lfm) run(pass, p.lfmCellVel, g.lfm.cellVel[k], cc)
     pass.end()
     enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
+    if (lfm) enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.lfm.ring[k] }, [nx + 1, ny + 1, nz + 1])
     // A fire keeps its mass through the advection (the scalars' ratios, 7b).
     const fire = this.state.sourceType === 'fire'
     if (fire) enc.clearBuffer(g.spread)
@@ -1126,6 +1216,14 @@ export class PyroEngine {
     if (bim) this.bimocqAfter(enc, cc)
     enc.copyTextureToTexture({ texture: g.detA[1] }, { texture: g.detA[0] }, [nx, ny, nz])
     enc.copyTextureToTexture({ texture: g.detB[1] }, { texture: g.detB[0] }, [nx, ny, nz])
+    // Leapfrog flow maps, once the scalars have moved with the step's half-step velocity: the forward map on, and at
+    // the cycle's end the velocity rebuilt from the maps.
+    if (lfm) {
+      this.lfmMarch(enc, run, cv)
+      if (k === LFM_N - 1) this.lfmReinit(enc, run, cv, cc)
+      this.lfmStep = (k + 1) % LFM_N
+    }
+    this.lfmWas = lfm
     // The fire's light from the new scalars (zero without flames).
     pass = enc.beginComputePass()
     run(pass, p.fireSum, g.bg.fireSum, cc)
@@ -1255,7 +1353,52 @@ export class PyroEngine {
 
   // IVOCK runs for a smoke source (see wgsl.ts), with MacCormack or semi-Lagrangian velocity.
   private ivockOn() {
-    return this.state.ivock && this.state.velocity !== 'ar' && this.state.sourceType === 'smoke'
+    const v = this.velScheme()
+    return this.state.ivock && v !== 'ar' && v !== 'lfm' && this.state.sourceType === 'smoke'
+  }
+
+  // The velocity's scheme this step: leapfrog flow maps for a smoke source when chosen (a fire given them uses
+  // MacCormack: the maps assume incompressible flow, and a fire's burning gas expands).
+  private velScheme() {
+    const v = this.state.velocity
+    return v === 'lfm' && this.state.sourceType !== 'smoke' ? 'mac' : v
+  }
+
+  // Leapfrog flow maps after each step's projection: the forward map and its Jacobian columns marched through the
+  // step's half-step velocity, gathering its forces into the cycle's initial velocity (2c).
+  private lfmMarch(enc: GPUCommandEncoder, run: (pass: GPUComputePassEncoder, pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => void, cv: Vec3) {
+    const g = this.grids!
+    const [nx, ny, nz] = g.n
+    const pass = enc.beginComputePass()
+    run(pass, this.pipes!.lfmMarchFwd, g.lfm.marchFwd[this.lfmStep], cv)
+    pass.end()
+    enc.copyTextureToTexture({ texture: g.lfm.u0[1] }, { texture: g.lfm.u0[0] }, [nx + 1, ny + 1, nz + 1])
+  }
+
+  // At the cycle's end: the backward map; the impulse pulled back along it; the round trip's error taken off; projected
+  // (cold started, with LFM_PROJECT_CYCLES V-cycles, the step's pressure kept aside for the next step's warm start);
+  // the result is the velocity, and the next cycle's start.
+  private lfmReinit(enc: GPUCommandEncoder, run: (pass: GPUComputePassEncoder, pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => void, cv: Vec3, cc: Vec3) {
+    const g = this.grids!
+    const p = this.pipes!
+    const L = g.lfm
+    const [nx, ny, nz] = g.n
+    const bytes = nx * ny * nz * 4
+    let pass = enc.beginComputePass()
+    run(pass, p.lfmMarchBwd, L.marchBwd, cv)
+    run(pass, p.lfmPull[0], L.pull[0], cv)
+    run(pass, p.lfmPull[1], L.pull[1], cv)
+    run(pass, p.lfmPull[2], L.pull[2], cv)
+    pass.end()
+    enc.copyBufferToBuffer(L.pressure, 0, L.pressureSave, 0, bytes)
+    enc.clearBuffer(L.pressure)
+    pass = enc.beginComputePass()
+    run(pass, p.divergence, g.bg.divergence, cc)
+    this.mgCycles(pass, LFM_PROJECT_CYCLES)
+    run(pass, p.project, g.bg.project, cv)
+    pass.end()
+    enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
+    enc.copyBufferToBuffer(L.pressureSave, 0, L.pressure, 0, bytes)
   }
 
   // IVOCK, after the velocity is advected (into vel[3]); the corrected velocity goes to vel[2] for the caller to copy
@@ -1266,7 +1409,7 @@ export class PyroEngine {
     const p = this.pipes!
     run(pass, p.vortBefore, g.bg.vortBefore, cc)
     run(pass, p.advFwd, g.bg.vortAdvect, cc)
-    if (this.state.velocity === 'mac') run(pass, p.advBwd, g.bg.vortBack, cc)
+    if (this.velScheme() === 'mac') run(pass, p.advBwd, g.bg.vortBack, cc)
     run(pass, p.ivockTarget, g.bg.ivockTarget, cc)
     const [nx, ny, nz] = g.n
     const sweep: Vec3 = [Math.ceil(nx / 2 / 16), Math.ceil(ny / 4), nz]
@@ -1286,7 +1429,7 @@ export class PyroEngine {
     const u = new Uint32Array(this.simData)
     const f = new Float32Array(this.simData)
     u.set([nx, ny, nz, this.frame], 0)
-    f.set([dx, SIM_DT, this.simTime, s.velocity === 'mac' ? 1 : 0], 4)
+    f.set([dx, SIM_DT, this.simTime, this.velScheme() === 'mac' ? 1 : 0], 4)
     // A smoke source's dome rests on the floor (it is 2.5 times wider than tall); a fire's bed is a disc on the floor.
     f.set([s.srcX, s.srcRadius / 2.5 + dx, 0, s.srcRadius], 8)
     f.set([s.srcDensity, s.srcTemp, s.srcSpeed, s.srcNoise], 12)
@@ -1299,7 +1442,10 @@ export class PyroEngine {
     const st = this.stir
     f.set([...(st ? st.centre : [0, 0, 0]), STIR_RADIUS], 28)
     f.set([...(st ? st.vel : [0, 0, 0]), st ? 1 : 0], 32)
-    f.set([0, 0, this.ivockOn() ? 1 : 0, this.macScalars() ? 1 : 0], 36)
+    // Leapfrog flow maps: the step within the cycle, and how many steps its forces act over (2c).
+    const lfm = this.velScheme() === 'lfm'
+    const k = lfm && this.lfmWas ? this.lfmStep : 0
+    f.set([lfm ? k : 0, lfm ? (k === 0 ? 0.5 : k === 1 ? 1 : 2) : 0, this.ivockOn() || lfm ? 1 : 0, this.macScalars() ? 1 : 0], 36)
     f.set([(-nx * dx) / 2, 0, (-nz * dx) / 2, 0], 40)
     // Each upres layer resets when the simulation clock crosses its period (layer B half a period later).
     const t0 = this.simTime / DETAIL_PERIOD
@@ -1654,13 +1800,15 @@ export class PyroEngine {
       pass.setBindGroup(0, bg)
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2])
     }
-    const scheme = this.state.velocity
+    const scheme = this.velScheme()
     const solveLabel = this.state.pressure === 'sor' ? `sor x${this.state.pressureIters}` : `multigrid x${this.state.vcycles}`
     if (this.ballBurning()) {
       timed('ballHeat', one(p.ballHeat, g.bg.ballHeat, [SKIN_W / 8, SKIN_H / 8, 1]))
       enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_W * SKIN_H * 16)
     }
-    if (scheme === 'ar') {
+    if (scheme === 'lfm') {
+      timed('advectVel', one(p.advectVelDouble, g.lfm.advect[0], cv))
+    } else if (scheme === 'ar') {
       timed('advectVel', one(p.advectVelHalf, g.bg.arAdvect1, cv))
     } else if (scheme === 'mac') {
       timed('advectVel', pass => {
@@ -1678,7 +1826,7 @@ export class PyroEngine {
       timed('ivock: vorticity', one(p.vortBefore, g.bg.vortBefore, cc))
       timed('ivock: advect', pass => {
         one(p.advFwd, g.bg.vortAdvect, cc)(pass)
-        if (this.state.velocity === 'mac') one(p.advBwd, g.bg.vortBack, cc)(pass)
+        if (scheme === 'mac') one(p.advBwd, g.bg.vortBack, cc)(pass)
       })
       timed('ivock: loss', one(p.ivockTarget, g.bg.ivockTarget, cc))
       timed('ivock: potentials', pass => {
@@ -1707,7 +1855,18 @@ export class PyroEngine {
       timed(`${solveLabel} (2)`, pass => this.solvePressure(pass))
     }
     timed('project', one(p.project, g.bg.project, cv))
+    if (scheme === 'lfm') timed('lfm: ring', one(p.lfmCellVel, g.lfm.cellVel[2], cc))
     enc.copyTextureToTexture({ texture: g.vel[1] }, { texture: g.vel[0] }, [nx + 1, ny + 1, nz + 1])
+    if (scheme === 'lfm') {
+      // The march every step; the re-initialisation's map and pullbacks once a cycle (a quarter of them per step).
+      // (Development only: the extra march disturbs the cycle's maps for the rest of it.)
+      timed('lfm: march', one(p.lfmMarchFwd, g.lfm.marchFwd[2], cv))
+      timed('lfm: backward map', one(p.lfmMarchBwd, g.lfm.marchBwd, cv))
+      timed('lfm: pullbacks', pass => {
+        one(p.lfmPull[0], g.lfm.pull[0], cv)(pass)
+        one(p.lfmPull[1], g.lfm.pull[1], cv)(pass)
+      })
+    }
     if (this.state.sourceType === 'fire') {
       enc.clearBuffer(g.spread)
       timed('massKeeping', pass => {

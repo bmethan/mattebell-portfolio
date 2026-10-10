@@ -63,6 +63,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1145/3306346.3322945',
   },
   {
+    id: 'lfm',
+    group: 'Solver',
+    authors: 'Yuchen Sun, Junlin Li, Ruicheng Wang, Sinan Wang, Zhiqi Li, Bart G. van Bloemen Waanders, Bo Zhu',
+    title: 'Leapfrog Flow Maps for Real-Time Fluid Simulation',
+    venue: 'ACM Transactions on Graphics 44(4), SIGGRAPH 2025',
+    year: '2025',
+    url: 'https://doi.org/10.1145/3731180',
+  },
+  {
     id: 'ivock',
     group: 'Solver',
     authors: 'Xinxin Zhang, Robert Bridson, Chen Greif',

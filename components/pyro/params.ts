@@ -4,7 +4,7 @@ import { FUEL } from './physics'
 
 export type PyroResolution = 'low' | 'medium' | 'high'
 export type Advection = 'sl' | 'mac' | 'bimocq' // BiMocq2 for a smoke source; a fire then uses MacCormack
-export type VelocityScheme = 'ar' | 'mac' | 'sl'
+export type VelocityScheme = 'ar' | 'mac' | 'sl' | 'lfm'
 export type PressureSolver = 'mg' | 'sor'
 export type SourceType = 'smoke' | 'fire'
 
@@ -22,7 +22,7 @@ export const DOMAIN_WIDTH = 4.8
 export interface PyroState {
   resolution: PyroResolution
   advection: Advection // the scalars
-  velocity: VelocityScheme // advection-reflection, Modified MacCormack or semi-Lagrangian
+  velocity: VelocityScheme // advection-reflection, Modified MacCormack, semi-Lagrangian, or leapfrog flow maps (a smoke source)
   pressure: PressureSolver
   vcycles: number // multigrid V-cycles per step
   ivock: boolean // restore the vorticity advection loses (IVOCK)

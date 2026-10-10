@@ -14,6 +14,8 @@ import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_
 // outside, smoke leaves, and air flowing in carries none).
 
 // The wooden ball's skin map, texels around and from pole to pole (see SIM_COMMON).
+// Leapfrog flow maps' cycle, in steps (the paper's fire-ball setting).
+export const LFM_N = 4
 export const SKIN_W = 128
 export const SKIN_H = 64
 
@@ -28,7 +30,7 @@ struct Params {
   decay: vec4<f32>,     // cooling (1/s), dissipation (1/s), SOR relaxation, speed limit (m/s)
   stirO: vec4<f32>,     // stir centre (m), radius (m)
   stirD: vec4<f32>,     // stir velocity change (m/s), on (0 or 1)
-  stirR: vec4<f32>,     // unused xy, IVOCK and its eddy viscosity on (0 or 1), the scalars' MacCormack on (0 or 1)
+  stirR: vec4<f32>,     // LFM's step within its cycle, the forces' time step in steps (0 = one; LFM's leapfrog), the eddy viscosity on (IVOCK or LFM; 0 or 1), the scalars' MacCormack on (0 or 1)
   origin: vec4<f32>,    // domain min corner (m)
   detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B
   fire: vec4<f32>,      // source is a fire bed (0 or 1), fuel it gives off (kg/s), soot yield (kg/kg), radiant fraction
@@ -374,10 +376,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 `
 
 // 2. Vorticity at cell centres (from cell-centred velocity, central differences), and its magnitude. And, when IVOCK
-// runs, the momentum's subgrid viscosity: Smagorinsky's eddy viscosity (C_s dx)^2 |S|, as FDS uses for momentum, kept
-// as the explicit diffusion step's weight nu dt / dx^2 (at most 0.15, inside its stability limit). Without IVOCK the
-// solver's own numerical dissipation plays that part; IVOCK takes the numerical dissipation away, and a fire's plume
-// then piled energy into the smallest eddies until it ran away.
+// or leapfrog flow maps run, the momentum's subgrid viscosity: Smagorinsky's eddy viscosity (C_s dx)^2 |S|, as FDS uses
+// for momentum, kept as the explicit diffusion step's weight nu dt / dx^2 (over LFM's leapfrog steps, their length; at
+// most 0.15, inside its stability limit). Otherwise the solver's own numerical dissipation plays that part; both take
+// the numerical dissipation away, and the flow then piled energy into the smallest eddies until it ran away.
 export const CURL = /* wgsl */ `
 ${SIM_COMMON}
 @group(0) @binding(1) var vel: texture_3d<f32>;
@@ -401,7 +403,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   textureStore(curlOut, c, vec4<f32>(w, length(w)));
   var k = 0.0;
   if (P.stirR.z > 0.5) {
-    k = min(C_S * C_S * strainRate(vel, c) * P.grid.y, 0.15);
+    k = min(C_S * C_S * strainRate(vel, c) * P.grid.y * select(1.0, P.stirR.y, P.stirR.y > 0.0), 0.15);
   }
   textureStore(nutOut, c, vec4<f32>(k, 0.0, 0.0, 0.0));
 }
@@ -600,6 +602,262 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
+// 2c. Leapfrog flow maps for a smoke source's velocity (Sun, Li, Wang, Wang, Li, van Bloemen Waanders and Zhu 2025).
+// The velocity is carried as impulse along flow maps over a cycle of LFM_N steps, rather than re-sampled each step.
+// Within a cycle, each step makes a half-step velocity by leapfrog: the one two half-steps back, plus the forces,
+// advected over 2 dt by the one between (the first two steps start it over dt/2 and dt), then projected. These
+// half-step velocities are kept in a ring. The forward map, and the column of its Jacobian each face needs, is marched
+// through them step by step (RK4, with the Jacobian marched alongside), and the step's forces are gathered back along
+// it into the cycle's initial velocity (the paper's path integral). At the cycle's end the backward map is marched
+// back through the ring the same way, and the new velocity is the initial one's impulse pulled back along it, m =
+// T^T u0(Psi), with the error of a round trip through both maps taken off (BFECC), clamped, and projected. It then
+// starts the next cycle.
+// This lab's version differs from the paper in four ways. It marches through a cell-centred copy of each ring velocity,
+// sampled trilinearly, and takes the Jacobian's product with a column as a central difference along it, where the paper
+// samples with a 27-tap quadratic B-spline: the paper's way costs some 80 loads a sample, past this GPU's budget. Its
+// domain has open sides, which hold the pressure at zero, where the paper's examples are closed boxes: the impulse
+// differs from the velocity by the gradient of a gauge, which grows along each path at p - |u|^2 / 2, and an open side
+// does not respect it, so the gauge is marched back along the same maps and its gradient taken off. Near an open side,
+// on a path that came in through one, and where a map has distorted too far within a cycle, the maps carry the velocity
+// itself, less the gradient of the pressure gathered along the path. And, as with IVOCK, once the numerical dissipation
+// is gone the flow needs a real sink for its smallest eddies: Smagorinsky's eddy viscosity (2). Without any one of
+// these, wind, a stir or the finer grid ran away within seconds. Its projections are this solver's multigrid. Map
+// positions are in grid units (cell centres at i + 0.5), velocities in m/s, Jacobian columns dimensionless.
+const LFM_COMMON = /* wgsl */ `
+const LFM_N = ${LFM_N}u;
+// Face texel id's position on lattice a (0: x faces, 1: y, 2: z), in grid units.
+fn facePos(id: vec3<u32>, a: u32) -> vec3<f32> {
+  let f = vec3<f32>(id) + 0.5;
+  if (a == 0u) { return vec3<f32>(f.x - 0.5, f.y, f.z); }
+  if (a == 1u) { return vec3<f32>(f.x, f.y - 0.5, f.z); }
+  return vec3<f32>(f.x, f.y, f.z - 0.5);
+}
+fn faceValid(id: vec3<u32>, a: u32) -> bool {
+  let n = P.dims.xyz;
+  if (a == 0u) { return id.x <= n.x && id.y < n.y && id.z < n.z; }
+  if (a == 1u) { return id.x < n.x && id.y <= n.y && id.z < n.z; }
+  return id.x < n.x && id.y < n.y && id.z <= n.z;
+}
+fn faceIndex(id: vec3<u32>, a: u32) -> u32 {
+  let m = P.dims.xyz + 1u;
+  return a * m.x * m.y * m.z + id.x + m.x * (id.y + m.y * id.z);
+}
+fn unitCol(a: u32) -> vec3<f32> { return select(select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), a == 1u), vec3<f32>(1.0, 0.0, 0.0), a == 0u); }
+// How far a map's Jacobian column counts: from the two ends of its path, fully when both are 6 cells or more inside
+// the open sides and the top, not at all when either is within 2 (or outside); and from the column itself, fully while
+// it has stretched or shrunk by less than 2 times, not at all past 3 (the distortion the paper re-initialises to
+// avoid, which a hard stir on the finer grid reaches within a cycle). Elsewhere the maps carry the velocity itself.
+fn impulseWeight(g: vec3<f32>) -> f32 {
+  let n = nF();
+  let d = min(min(min(g.x, n.x - g.x), min(g.z, n.z - g.z)), n.y - g.y);
+  return smoothstep(2.0, 6.0, d);
+}
+fn colWeight(c: vec3<f32>, g: vec3<f32>, end: vec3<f32>) -> f32 {
+  let l = length(c);
+  return impulseWeight(g) * impulseWeight(end) * (1.0 - smoothstep(2.0, 3.0, max(l, 1.0 / max(l, 1e-3))));
+}
+fn weightedCol(c: vec3<f32>, a: u32, g: vec3<f32>, end: vec3<f32>) -> vec3<f32> { return mix(unitCol(a), c, colWeight(c, g, end)); }
+`
+
+// The ring's cell-centred copies, for marching: each cell the mean of its faces, and the step's pressure (solved for
+// its forces' span of steps, so divided by it), which the impulse's gauge gathers.
+export const LFM_CELLVEL = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var vel: texture_3d<f32>;
+@group(0) @binding(2) var dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(3) var<storage, read> pressure: array<f32>;
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let c = vec3<i32>(id);
+  if (any(c >= nCells())) { return; }
+  let u = cellVel(vel, c);
+  textureStore(dst, c, vec4<f32>(u, pressure[cellIndex(c)] / max(P.stirR.y, 0.5)));
+}
+`
+
+// One RK4 step of a map and its Jacobian column through a cell-centred velocity (h > 0 marches back in time).
+const LFM_RK4 = /* wgsl */ `
+fn velC(t: texture_3d<f32>, s: sampler, g: vec3<f32>) -> vec3<f32> {
+  return textureSampleLevel(t, s, clamp(g, vec3<f32>(0.5), nF() - 0.5) / nF(), 0.0).xyz;
+}
+// (c . grad) u, per second: a central difference half a cell either way along c.
+fn gradDot(t: texture_3d<f32>, s: sampler, g: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
+  return (velC(t, s, g + 0.5 * c) - velC(t, s, g - 0.5 * c)) / P.grid.x;
+}
+struct March { x: vec3<f32>, c: vec3<f32> }
+fn rk4(t: texture_3d<f32>, s: sampler, m0: March, h: f32) -> March {
+  let k = h / P.grid.x;
+  let u1 = velC(t, s, m0.x);
+  let a1 = gradDot(t, s, m0.x, m0.c);
+  let x2 = m0.x - 0.5 * k * u1;
+  let c2 = m0.c - 0.5 * h * a1;
+  let u2 = velC(t, s, x2);
+  let a2 = gradDot(t, s, x2, c2);
+  let x3 = m0.x - 0.5 * k * u2;
+  let c3 = m0.c - 0.5 * h * a2;
+  let u3 = velC(t, s, x3);
+  let a3 = gradDot(t, s, x3, c3);
+  let x4 = m0.x - k * u3;
+  let c4 = m0.c - h * a3;
+  let u4 = velC(t, s, x4);
+  let a4 = gradDot(t, s, x4, c4);
+  return March(m0.x - k / 6.0 * (u1 + 2.0 * u2 + 2.0 * u3 + u4), m0.c - h / 6.0 * (a1 + 2.0 * a2 + 2.0 * a3 + a4));
+}
+`
+
+// Each step: the forward map and its Jacobian columns one step on through the step's half-step velocity, and the
+// step's forces gathered back along it into the cycle's initial velocity, u0 += dt F^T f, at the step's midpoint.
+// The forces acted over k_f steps (the leapfrog's), so dt f = delta / k_f.
+export const LFM_MARCH_FWD = /* wgsl */ `
+${SIM_COMMON}
+${LFM_COMMON}
+${LFM_RK4}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var mid: texture_3d<f32>;
+@group(0) @binding(3) var delta: texture_3d<f32>;
+@group(0) @binding(4) var u0In: texture_3d<f32>;
+@group(0) @binding(5) var u0Out: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(6) var<storage, read_write> phi: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> fcol: array<vec4<f32>>;
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = P.dims.xyz;
+  if (id.x > n.x || id.y > n.y || id.z > n.z) { return; }
+  var u0 = textureLoad(u0In, vec3<i32>(id), 0);
+  let kf = max(P.stirR.y, 0.5);
+  for (var a = 0u; a < 3u; a++) {
+    if (!faceValid(id, a)) { continue; }
+    let i = faceIndex(id, a);
+    var m0 = March(facePos(id, a), unitCol(a));
+    if (P.stirR.x > 0.5) { m0 = March(phi[i].xyz, fcol[i].xyz); }
+    // The force at the step's midpoint, gathered with the midpoint's column.
+    let um = velC(mid, samp, m0.x);
+    let xm = m0.x + 0.5 * P.grid.y / P.grid.x * um;
+    let cm = m0.c + 0.5 * P.grid.y * gradDot(mid, samp, m0.x, m0.c);
+    u0[a] += dot(weightedCol(cm, a, facePos(id, a), xm), velAt(delta, samp, xm)) / kf;
+    let m1 = rk4(mid, samp, m0, -P.grid.y);
+    phi[i] = vec4<f32>(m1.x, 1.0);
+    fcol[i] = vec4<f32>(m1.c, 0.0);
+  }
+  textureStore(u0Out, vec3<i32>(id), u0);
+}
+`
+
+// At the cycle's end: the backward map and its Jacobian columns from each face back through the ring.
+export const LFM_MARCH_BWD = /* wgsl */ `
+${SIM_COMMON}
+${LFM_COMMON}
+${LFM_RK4}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var mid0: texture_3d<f32>;
+@group(0) @binding(3) var mid1: texture_3d<f32>;
+@group(0) @binding(4) var mid2: texture_3d<f32>;
+@group(0) @binding(5) var mid3: texture_3d<f32>;
+@group(0) @binding(6) var<storage, read_write> psi: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> tcol: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> lam: array<vec2<f32>>;
+// The gauge: one RK4 step back of a cell's path, the pressure and |u|^2 / 2 gathered at the same stages.
+struct Gauge { x: vec3<f32>, l: vec2<f32> }
+fn ringAt(t: texture_3d<f32>, s: sampler, g: vec3<f32>) -> vec4<f32> {
+  return textureSampleLevel(t, s, clamp(g, vec3<f32>(0.5), nF() - 0.5) / nF(), 0.0);
+}
+fn gaugeStep(t: texture_3d<f32>, s: sampler, g0: Gauge, h: f32) -> Gauge {
+  let k = h / P.grid.x;
+  let a1 = ringAt(t, s, g0.x);
+  let a2 = ringAt(t, s, g0.x - 0.5 * k * a1.xyz);
+  let a3 = ringAt(t, s, g0.x - 0.5 * k * a2.xyz);
+  let a4 = ringAt(t, s, g0.x - k * a3.xyz);
+  let f = vec4<f32>(dot(a1.xyz, a1.xyz), dot(a2.xyz, a2.xyz), dot(a3.xyz, a3.xyz), dot(a4.xyz, a4.xyz)) * 0.5;
+  let ke = f.x + 2.0 * f.y + 2.0 * f.z + f.w;
+  return Gauge(g0.x - k / 6.0 * (a1.xyz + 2.0 * a2.xyz + 2.0 * a3.xyz + a4.xyz), g0.l + h / 6.0 * vec2<f32>(a1.w + 2.0 * a2.w + 2.0 * a3.w + a4.w, ke));
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = P.dims.xyz;
+  if (id.x > n.x || id.y > n.y || id.z > n.z) { return; }
+  if (all(id < n)) {
+    var q = Gauge(vec3<f32>(id) + 0.5, vec2<f32>(0.0));
+    q = gaugeStep(mid3, samp, q, P.grid.y);
+    q = gaugeStep(mid2, samp, q, P.grid.y);
+    q = gaugeStep(mid1, samp, q, P.grid.y);
+    q = gaugeStep(mid0, samp, q, P.grid.y);
+    lam[cellIndex(vec3<i32>(id))] = q.l;
+  }
+  for (var a = 0u; a < 3u; a++) {
+    if (!faceValid(id, a)) { continue; }
+    var m = March(facePos(id, a), unitCol(a));
+    m = rk4(mid3, samp, m, P.grid.y);
+    m = rk4(mid2, samp, m, P.grid.y);
+    m = rk4(mid1, samp, m, P.grid.y);
+    m = rk4(mid0, samp, m, P.grid.y);
+    let i = faceIndex(id, a);
+    psi[i] = vec4<f32>(m.x, 1.0);
+    tcol[i] = vec4<f32>(m.c, 0.0);
+  }
+}
+`
+
+// The pullbacks at the cycle's end. MODE 1: the impulse, m = T^T u0(Psi). MODE 2: the round trip's error, e = F^T
+// m(Phi) - u0. MODE 3: m - T^T e(Psi) / 2, clamped to the range of m at the face and its six neighbours on its
+// lattice (the paper's optional clamp), and a smoke source's push applied again: it sets the air there to its speed,
+// and the next cycle's first step, half as long, counts what it changes twice (its forces act over half a step), so
+// the cycle should start at that speed already.
+export const LFM_PULL = /* wgsl */ `
+${SIM_COMMON}
+${LFM_COMMON}
+override MODE: u32 = 1u;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<storage, read> mapPos: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> mapCol: array<vec4<f32>>;
+@group(0) @binding(4) var src: texture_3d<f32>;
+@group(0) @binding(5) var aux: texture_3d<f32>;
+@group(0) @binding(6) var dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(7) var<storage, read> lam: array<vec2<f32>>;
+fn lamAt(c: vec3<i32>) -> vec2<f32> { return lam[cellIndex(clamp(c, vec3<i32>(0), nCells() - 1))]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = P.dims.xyz;
+  if (id.x > n.x || id.y > n.y || id.z > n.z) { return; }
+  let c = vec3<i32>(id);
+  let hi = vec3<i32>(n);
+  let here = textureLoad(aux, c, 0);
+  let lamHere = lamAt(c);
+  var out = vec4<f32>(0.0);
+  for (var a = 0u; a < 3u; a++) {
+    if (!faceValid(id, a)) { continue; }
+    let i = faceIndex(id, a);
+    let wgt = colWeight(mapCol[i].xyz, facePos(id, a), mapPos[i].xyz);
+    let col = mix(unitCol(a), mapCol[i].xyz, wgt);
+    let v = dot(col, velAt(src, samp, mapPos[i].xyz));
+    if (MODE == 1u) { out[a] = v; }
+    if (MODE == 2u) { out[a] = v - here[a]; }
+    if (MODE == 3u) {
+      var lo = here[a];
+      var up = here[a];
+      for (var k = 0; k < 6; k++) {
+        var o = vec3<i32>(0);
+        o[k / 2] = select(-1, 1, (k & 1) == 1);
+        let q = textureLoad(aux, clamp(c + o, vec3<i32>(0), hi), 0)[a];
+        lo = min(lo, q);
+        up = max(up, q);
+      }
+      var r = clamp(here[a] - 0.5 * v, lo, up);
+      // The gauge off. The impulse less the gradient of what it gathered, p - |u|^2 / 2, is the velocity; where the
+      // maps carry the velocity itself, it lacks only the pressure's push, the gradient of the pressure gathered.
+      var o = vec3<i32>(0);
+      o[a] = 1;
+      let gl = (lamHere - lamAt(c - o)) / P.grid.x;
+      r -= gl.x - wgt * gl.y;
+      out[a] = r;
+    }
+  }
+  if (MODE == 3u && P.fire.x < 0.5 && faceValid(id, 1u) && id.y > 0u) {
+    out.y = mix(out.y, P.srcProps.z, sourceMask(worldOf(facePos(id, 1u))));
+  }
+  textureStore(dst, c, out);
+}
+`
+
 // 3. Forces on each face: vorticity confinement (Fedkiw, Stam and Jensen 2001), buoyancy from temperature,
 // curl-noise turbulence where there is smoke, wind, the source's upward push, the visitor's
 // stir, and drag. The floor face stays at rest.
@@ -610,6 +868,8 @@ ${SIM_COMMON}
 @group(0) @binding(3) var curlT: texture_3d<f32>;
 @group(0) @binding(4) var velOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(5) var nutT: texture_3d<f32>;
+// What this step changed, for LFM's path integral.
+@group(0) @binding(6) var deltaOut: texture_storage_3d<rgba16float, write>;
 
 const WIND_DRAG = 0.4; // 1/s: how quickly the air takes up the wind
 
@@ -685,12 +945,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (id.x > n.x || id.y > n.y || id.z > n.z) { return; }
   let c = vec3<i32>(id);
   let f = vec3<f32>(id);
-  let dt = P.grid.y;
+  // (LFM's leapfrog applies a step's forces over a half, one or two steps.)
+  let dt = P.grid.y * select(1.0, P.stirR.y, P.stirR.y > 0.0);
   let vmax = P.decay.w;
   let keep = exp(-P.forces2.w * dt);
   let windT = 1.0 - exp(-WIND_DRAG * dt);
-  var v = textureLoad(velIn, c, 0).xyz;
-  // The momentum's eddy viscosity (2), when IVOCK runs: an explicit diffusion of each face's velocity.
+  let vIn = textureLoad(velIn, c, 0).xyz;
+  var v = vIn;
+  // The momentum's eddy viscosity (2), when IVOCK or LFM runs: an explicit diffusion of each face's velocity.
   if (P.stirR.z > 0.5) { v += eddyDiffusion(c); }
 
   if (id.y < n.y && id.z < n.z) {
@@ -699,7 +961,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     a += P.forces.w * turbMask(cellScal(c - X), cellScal(c)) * curlX(noiseSpace(w));
     var u = v.x + a * dt;
     u += (P.forces2.y - u) * windT;
-    u = (u + stir(w).x) * keep;
+    u = (u + stir(w).x * dt / P.grid.y) * keep;
     v.x = clamp(u, -vmax, vmax);
   }
   if (id.x < n.x && id.z < n.z) {
@@ -716,7 +978,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       vy -= vy * windT;
       // A smoke source pushes its smoke out; a fire bed only gives off fuel, and buoyancy does the rest.
       if (P.fire.x < 0.5) { vy = mix(vy, P.srcProps.z, sourceMask(w)); }
-      vy = (vy + stir(w).y) * keep;
+      vy = (vy + stir(w).y * dt / P.grid.y) * keep;
       v.y = clamp(vy, -vmax, vmax);
     }
   }
@@ -726,7 +988,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     a += P.forces.w * turbMask(cellScal(c - Z), cellScal(c)) * curlZ(noiseSpace(w));
     var wz = v.z + a * dt;
     wz += (P.forces2.z - wz) * windT;
-    wz = (wz + stir(w).z) * keep;
+    wz = (wz + stir(w).z * dt / P.grid.y) * keep;
     v.z = clamp(wz, -vmax, vmax);
   }
   // Faces inside the collision ball move with it.
@@ -736,6 +998,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (solidAt(worldOf(vec3<f32>(f.x + 0.5, f.y + 0.5, f.z)))) { v.z = P.ballVel.z; }
   }
   textureStore(velOut, c, vec4<f32>(v, 0.0));
+  textureStore(deltaOut, c, vec4<f32>(v - vIn, 0.0));
 }
 `
 

@@ -40,6 +40,10 @@ const TECH_NOTES: [string, string][] = [
     'Advecting the velocity loses some of the flow’s swirl every step, most of all in its smallest eddies. For a smoke source, IVOCK (Zhang, Bridson and Greif 2015) restores it: the vorticity before the step is stretched by the flow and carried along by the same scheme as the velocity, and what the carried velocity’s own vorticity falls short of it is put back through a vector potential. It keeps 15 to 37% more swirl (enstrophy) in the smoke plume. With the numerical loss gone the flow needs a real sink for its smallest eddies, so Smagorinsky’s eddy viscosity, which FDS uses on the momentum, comes with it. This lab’s version differs from the paper: cell-centred where the paper staggers it on cell edges, its potential solved in a screened form over a few cells, and it restores only lost strength along the vorticity’s own direction (unrestricted, it fed on itself). On a fire it mixed the plume far too fast, its centreline down to a tenth of McCaffrey’s temperatures, most likely the fire’s strong expansion meeting this cell-centred form, so fires keep the validated solver. The pair costs a smoke source about a third of the solver’s speed on an integrated GPU, and the Solver tab turns each off.',
   ],
   [
+    'Flow maps',
+    'The Solver tab also offers leapfrog flow maps for a smoke source’s velocity (Sun, Li, Wang, Wang, Li, van Bloemen Waanders and Zhu 2025). Rather than re-sampling the velocity every step, which blurs it a little each time, the solver follows where the air has travelled over four steps, through half-step velocities that leapfrog over one another, and rebuilds the velocity from where it started, carried along those paths as impulse, with the forces gathered along the way and the error of a round trip through the paths taken off. The paper’s examples are closed boxes. This lab’s box is open on four sides and the top, where the pressure is held at zero, which the rebuilt impulse does not respect, and the first version ran away within seconds. Four additions hold it: the impulse’s gauge (the gradient that separates it from the velocity) followed along the same paths and taken off; the velocity itself carried near the open sides and wherever a path has stretched too far within its four steps; the source’s push applied again at each rebuild; and Smagorinsky’s eddy viscosity, as with IVOCK, as a sink for the smallest eddies. Stable, it matches IVOCK rather than beating it: about the same swirl, edges 5 to 8% softer, and structures that hold together longer as they rise, in larger, smoother folds. It costs about a tenth of the smoke’s speed on an integrated GPU, with a heavier step every fourth, and IVOCK stands aside while it runs.',
+  ],
+  [
     'Forces',
     'Buoyancy at its physical strength: gas hotter than the air around it rises at g (T − T₀) / T₀. Vorticity confinement, which restores the small swirls a coarse grid smooths away. Divergence-free turbulence from the curl of a noise potential, rising with the plume and churning as it rises (held still, the updraft would draw its pushes out into steady vertical streaks): for a smoke source its strength is the Turbulence control, in m/s²; for a fire it is a turbulence model, calibrated against measurements (see Validation). Wind, and a smoke source’s push. Cooling and dissipation default to 0: the plume cools by mixing with the air it draws in.',
   ],
@@ -713,18 +717,22 @@ export default function PyroLab() {
                     <Pill on={pyro.velocity === 'sl'} onClick={() => update({ velocity: 'sl' })}>
                       Semi-Lagrangian
                     </Pill>
+                    <Pill on={pyro.velocity === 'lfm'} onClick={() => update({ velocity: 'lfm' })}>
+                      Leapfrog flow maps, for smoke
+                    </Pill>
                   </Group>
                 </div>
                 <div className="lab-row">
                   <Group label="Lost vorticity">
-                    <Pill on={pyro.ivock} onClick={() => update({ ivock: true })}>
+                    <Pill on={pyro.ivock && pyro.velocity !== 'lfm'} onClick={() => update({ ivock: true })}>
                       IVOCK, for smoke
                     </Pill>
-                    <Pill on={!pyro.ivock} onClick={() => update({ ivock: false })}>
+                    <Pill on={!pyro.ivock && pyro.velocity !== 'lfm'} onClick={() => update({ ivock: false })}>
                       Off
                     </Pill>
                   </Group>
                 </div>
+                {pyro.velocity === 'lfm' && <p className="lab-note">Flow maps keep the swirl themselves, so IVOCK stands aside while they run.</p>}
                 <div className="lab-row">
                   <Group label="Scalars">
                     <Pill on={pyro.advection === 'bimocq'} onClick={() => update({ advection: 'bimocq' })}>

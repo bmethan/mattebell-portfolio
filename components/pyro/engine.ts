@@ -1565,6 +1565,7 @@ export class PyroEngine {
         entries: [
           ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView({ dimension: '2d-array' }), v(tex[0]), v(g.flame)]),
           { binding: 31, resource: { buffer: g.skin } },
+          { binding: 32, resource: { buffer: g.ballSheet } },
         ],
       })
       this.upres = { tex, group, render }

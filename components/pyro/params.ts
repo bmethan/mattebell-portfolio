@@ -64,10 +64,14 @@ export interface PyroState {
   exposureComp: number // EV of compensation on the metered exposure: positive brightens, as on a camera's dial
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
   view: ViewTransform // the view transform the image is shown through, as in the Lookdev lab
-  // One of the Lookdev lab's HDR environments lighting the scene (environment.ts), or none (the sun and a flat sky).
-  // With one, the light azimuth turns it, the Sky EV sets its illuminance on open ground, and the floor runs to the
-  // horizon under it.
-  env: Env
+  // One of the Lookdev lab's HDR environments lighting the scene (environment.ts), its softbox rig ('rig': key, fill
+  // and rim, engine.ts RIG), or none (the sun and a flat sky). With a map, the light azimuth turns it, the Sky EV sets
+  // its illuminance on open ground, and the floor runs to the horizon under it. With the rig, the light azimuth and
+  // elevation place the key and the Sun EV is its illuminance.
+  env: Env | 'rig'
+  rigKey: boolean // the rig's lights, each on or off
+  rigFill: boolean
+  rigRim: boolean
   // Black around the floor's pool of light, the sky (or the environment) and a floor to the horizon, or the Lookdev
   // lab's cyc (the floor sweeping up into a wall behind the fire) in its charcoal or its gray.
   background: 'studio' | 'sky' | 'charcoal' | 'gray'
@@ -123,7 +127,10 @@ export const PYRO_DEFAULTS: PyroState = {
   whiteBalance: 5000,
   view: 'aces',
   env: 'none',
-  background: 'studio',
+  rigKey: true,
+  rigFill: true,
+  rigRim: true,
+  background: 'gray',
   tricubic: true,
   upres: true,
   upresStrength: 1,
@@ -147,7 +154,7 @@ const FIRE_START: Partial<PyroState> = { sourceType: 'fire', ...SOURCE_LOOKS.fir
 const SMOKE_START: Partial<PyroState> = { sourceType: 'smoke', ...SOURCE_LOOKS.smoke, srcNoise: 0.8, srcRadius: 0.3, srcX: 0, wind: 0, exposureMode: 'auto', exposureComp: 0, env: 'none' }
 export const BONFIRE_AT_DUSK: Partial<PyroState> = { ...FIRE_START, heatRelease: 180, srcRadius: 0.4, sootYield: 0.04, albedo: 0.45, sunEV: 8, skyEV: 7, lightAz: -60, lightEl: 12, whiteBalance: 5000 }
 export const PRESETS: { id: string; label: string; state: Partial<PyroState> }[] = [
-  { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'studio' } },
+  { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'gray' } },
   { id: 'campfire', label: 'Campfire at night', state: { ...FIRE_START, background: 'studio', heatRelease: 80, srcRadius: 0.3, sootYield: FUEL.sootYield, albedo: 0.35, sunEV: -1, skyEV: -2, lightAz: -45, lightEl: 35, whiteBalance: 5500 } },
   { id: 'oil', label: 'Oil fire in daylight', state: { ...FIRE_START, background: 'sky', heatRelease: 250, srcRadius: 0.4, sootYield: 0.12, albedo: 0.25, sunEV: 14, skyEV: 11, lightAz: -40, lightEl: 40, whiteBalance: 5500 } },
   { id: 'fire-wind', label: 'Fire in wind', state: { ...FIRE_START, background: 'sky', heatRelease: 120, srcRadius: 0.3, sootYield: 0.05, albedo: 0.4, sunEV: 12, skyEV: 10, lightAz: -45, lightEl: 30, whiteBalance: 6000, srcX: -1, wind: 1.8 } },

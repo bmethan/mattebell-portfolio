@@ -8,7 +8,8 @@ import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER
 import { writeVdb, type VdbGrid } from './vdb'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 import { REC709_TO_AP1, ap1Luminance, loadAcesLutGPU, mat3Apply, viewIndex } from '../lab/viewTransforms'
-import { BACKDROP_H, BACKDROP_W, environmentLight, type EnvLight } from './environment'
+import { BACKDROP_H, BACKDROP_W, environmentLight, shBasis, type EnvLight } from './environment'
+import { kelvinToACEScg } from '../lookdev/color'
 
 export const SIM_DT = 1 / 30
 const MAX_STEPS_PER_FRAME = 2
@@ -64,6 +65,16 @@ const unitLum = (c709: Vec3): Vec3 => {
 }
 const SUN_COLOUR = unitLum([1.0, 0.93, 0.84])
 const SKY_COLOUR = unitLum([0.42, 0.52, 0.72])
+// The Lookdev lab's three-point softbox rig (its scene.ts, lightRigOf), as directional lights: the key where the
+// light azimuth and elevation put it, 4300 K; the fill on the far side from the key (0.95 rad round, 0.18 up), 8000 K;
+// the rim strip behind (2.45 rad round, 0.45 up), 4300 K. Each at the Lookdev lab's ratio of its light to the key's,
+// radiance times solid angle from the centre of that scene: the key 20 x 0.16 sr, the fill 1.8 x 0.28 sr (about 1:6),
+// the rim 36 x 0.085 sr (about as strong as the key). The key's illuminance is the Key EV (the sun's).
+const RIG = {
+  key: { kelvin: 4300 },
+  fill: { az: 0.95, el: 0.18, kelvin: 8000, ratio: (1.8 * 0.28) / (20 * 0.16) },
+  rim: { az: 2.45, el: 0.45, kelvin: 4300, ratio: (36 * 0.085) / (20 * 0.16) },
+}
 
 // The fields at one moment, for export: per cell (x fastest, then y, then z), the extinction at 550 nm (1/m), the
 // temperature (K), and for a fire the unburned fuel (mass fraction) and the heat release rate (W/m3); per cell,
@@ -252,6 +263,7 @@ interface Grids {
   detB: [GPUTexture, GPUTexture]
   lightDims: Vec3
   light: GPUTexture
+  light2: GPUTexture
   bg: {
     advectVel: GPUBindGroup // semi-Lagrangian, straight to the advected texture
     advectVelFwd: GPUBindGroup
@@ -459,7 +471,7 @@ export class PyroEngine {
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
   private simData = new ArrayBuffer(256)
-  private renderData = new Float32Array(100)
+  private renderData = new Float32Array(108)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
@@ -716,6 +728,8 @@ export class PyroEngine {
     const flame = tex(n)
     const lightDims: Vec3 = [Math.ceil(n[0] / 2), Math.ceil(n[1] / 2), Math.ceil(n[2] / 2)]
     const light = tex(lightDims)
+    // The softbox rig's rim: its own optical depth (x), so the smoke shadows it too.
+    const light2 = tex(lightDims)
     const v = (t: GPUTexture) => t.createView()
     const group = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[]) =>
       d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: resources.map((resource, binding) => ({ binding, resource })) })
@@ -926,6 +940,7 @@ export class PyroEngine {
       detB,
       lightDims,
       light,
+      light2,
       bg: {
         advectVel: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[3])]),
         advectVelFwd: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[1])]),
@@ -969,8 +984,8 @@ export class PyroEngine {
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
-        light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }]),
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }]),
+        light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2)]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }]),
       },
     }
     this.resetSkin()
@@ -1645,6 +1660,38 @@ export class PyroEngine {
         sunLux = e.key.irradiance.map(v => v * k)
       } else sunLux = [0, 0, 0]
     }
+    // The floor's albedo: the lab's own, or the Lookdev lab's cyc in charcoal (its studio floor) or gray.
+    const floorAlbedo = s.background === 'charcoal' ? 0.05 : s.background === 'gray' ? 0.18 : 0.14
+    // The Lookdev lab's softbox rig (RIG): the key in the sun's place, where the light azimuth and elevation put it; the
+    // fill through the spherical harmonics (soft and broad), with the floor's bounce of all three below the horizon;
+    // the rim a second light behind, shadowed through its own light volume. No backdrop: the studio's black or a cyc.
+    const rim = new Float32Array(8)
+    if (s.env === 'rig') {
+      const lux = luxOfEV(s.sunEV)
+      const side = s.lightAz >= 0 ? 1 : -1
+      const dirOf = (a: number, b: number): Vec3 => [Math.sin(a) * Math.cos(b), Math.sin(b), Math.cos(a) * Math.cos(b)]
+      const tint = (kelvin: number, scale: number) => kelvinToACEScg(kelvin).map(v => v * scale) as Vec3
+      sunLux = s.rigKey ? tint(RIG.key.kelvin, lux) : [0, 0, 0]
+      const fillDir = dirOf(-side * RIG.fill.az, RIG.fill.el)
+      const fillLux: Vec3 = s.rigFill ? tint(RIG.fill.kelvin, lux * RIG.fill.ratio) : [0, 0, 0]
+      const rimDir = dirOf(-side * RIG.rim.az, RIG.rim.el)
+      const rimLux: Vec3 = s.rigRim ? tint(RIG.rim.kelvin, lux * RIG.rim.ratio) : [0, 0, 0]
+      rim.set([...rimDir, s.rigRim ? 1 : 0, ...rimLux, 0])
+      // The fill as a small source (its irradiance times the basis toward it); the floor's bounce over the lower
+      // hemisphere (where only the constant band and the vertical one survive).
+      const sh = new Float64Array(27)
+      const b = new Float64Array(9)
+      shBasis(fillDir[0], fillDir[1], fillDir[2], b)
+      for (let m = 0; m < 9; m++) for (let ch = 0; ch < 3; ch++) sh[3 * m + ch] += fillLux[ch] * b[m]
+      for (let ch = 0; ch < 3; ch++) {
+        const eh = sunLux[ch] * Math.max(sun[1], 0) + fillLux[ch] * Math.max(fillDir[1], 0) + rimLux[ch] * Math.max(rimDir[1], 0)
+        const ground = (floorAlbedo * eh) / Math.PI
+        sh[ch] += ground * 0.282095 * 2 * Math.PI
+        sh[3 + ch] -= ground * 0.488603 * Math.PI
+      }
+      envData.set([1, 1, 0, 0], 0)
+      for (let m = 0; m < 9; m++) envData.set([sh[3 * m], sh[3 * m + 1], sh[3 * m + 2], 0], 4 + 4 * m)
+    }
     const fire = s.sourceType === 'fire'
     if (this.wb?.kelvin !== s.whiteBalance) this.wb = { kelvin: s.whiteBalance, m: whiteBalance(s.whiteBalance) }
     const wb = this.wb.m
@@ -1656,8 +1703,6 @@ export class PyroEngine {
     r.set([...sun, s.anisotropy], 16)
     r.set([...sunLux, s.densityScale], 20)
     r.set([...SKY_COLOUR.map(v => v * luxOfEV(s.skyEV)), s.albedo], 24)
-    // The floor's albedo: the lab's own, or the Lookdev lab's cyc in charcoal (its studio floor) or gray.
-    const floorAlbedo = s.background === 'charcoal' ? 0.05 : s.background === 'gray' ? 0.18 : 0.14
     r.set([floorAlbedo, floorAlbedo, floorAlbedo, 3.2], 28)
     r.set([this.canvas.width, this.canvas.height, this.simTime, fire ? s.flameDetail : 0], 32)
     // Cross-fade weights: each layer is weighted by a triangle of its age, 0 when it was just reset, 1 half a period on.
@@ -1674,6 +1719,7 @@ export class PyroEngine {
     const stage = cyc ? 2 : s.background === 'sky' || e ? 1 : 0
     r.set([stage, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
     r.set(envData, 60)
+    r.set(rim, 100)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
@@ -1747,6 +1793,7 @@ export class PyroEngine {
           { binding: 31, resource: { buffer: g.skin } },
           { binding: 32, resource: { buffer: g.ballSheet } },
           { binding: 33, resource: this.envTex.createView() },
+          { binding: 34, resource: v(g.light2) },
         ],
       })
       this.upres = { tex, held, group, render }
@@ -1888,8 +1935,10 @@ export class PyroEngine {
   // a second, so the fire's puffing does not pump the exposure.
   private targetEV() {
     const s = this.state
-    // (An HDR environment's illuminance on open ground, key included, is the Sky EV's.)
-    const lux = this.envLight ? luxOfEV(s.skyEV) : luxOfEV(s.sunEV) + luxOfEV(s.skyEV)
+    // (An HDR environment's illuminance on open ground, key included, is the Sky EV's; the softbox rig's, the key's
+    // and the fill's as they face the camera.)
+    const rig = s.env === 'rig' ? luxOfEV(s.sunEV) * Math.max((s.rigKey ? 1 : 0) + (s.rigFill ? RIG.fill.ratio : 0), 0.05) : 0
+    const lux = s.env === 'rig' ? rig : this.envLight ? luxOfEV(s.skyEV) : luxOfEV(s.sunEV) + luxOfEV(s.skyEV)
     const ambient = Math.log2((METER_AMBIENT * lux) / 2.5)
     if (s.sourceType !== 'fire' || this.fireCd <= 0) return ambient
     return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(this.fireCd / METER_FIRE_CD))
@@ -1931,7 +1980,7 @@ export class PyroEngine {
   // uploaded; until then, and without one, the sun and the flat sky light the scene.
   private syncEnv() {
     const env = this.state.env
-    if (env === 'none') {
+    if (env === 'none' || env === 'rig') {
       this.envLight = null
       return
     }

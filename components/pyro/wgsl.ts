@@ -1972,6 +1972,8 @@ struct RParams {
                        // whether the ACES 2.0 LUT has loaded (0 or 1)
   env: vec4<f32>,      // an HDR environment (0 or 1); cos and sin of its turn into the map's frame; its scale to lux
   sh: array<vec4<f32>, 9>, // its light but the key, as spherical harmonics (rgb, cd/m2 x sr), the floor below
+  rimDir: vec4<f32>,   // the softbox rig's rim: toward it, on (0 or 1)
+  rimCol: vec4<f32>,   // its illuminance (lux) by colour
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -2048,6 +2050,7 @@ ${RENDER_COMMON}
 @group(0) @binding(3) var scal: texture_3d<f32>;
 @group(0) @binding(4) var lightOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(5) var<storage, read> fireSums: array<vec4<f32>>;
+@group(0) @binding(6) var light2Out: texture_storage_3d<rgba16float, write>; // x: optical depth toward the rig's rim
 
 fn density(w: vec3<f32>) -> f32 { return sigmaOf(textureSampleLevel(scal, samp, uvwOf(w), 0.0)); }
 
@@ -2120,6 +2123,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x, false);
   let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x, false);
   textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w)));
+  var tauRim = 0.0;
+  if (R.rimDir.w > 0.5) { tauRim = depth(w, R.rimDir.xyz, 1.5 * P.grid.x, false); }
+  textureStore(light2Out, vec3<i32>(id), vec4<f32>(tauRim, 0.0, 0.0, 0.0));
 }
 `
 
@@ -2267,6 +2273,19 @@ ${fireCommon(9)}
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
 @group(0) @binding(32) var<storage, read> ballSheet: array<f32>; // the fuel flowing up the burning ball (BALL_HEAT)
 @group(0) @binding(33) var envTex: texture_2d<f32>; // an HDR environment's backdrop, softened (environment.ts)
+@group(0) @binding(34) var light2: texture_3d<f32>; // x: optical depth toward the softbox rig's rim (LIGHT)
+fn rimOn() -> bool { return R.rimDir.w > 0.5; }
+// The rim's shadow on a surface point outside the gas: the optical depth where the way to the rim enters the domain.
+fn rimShadow(p: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
+  let rimDir = R.rimDir.xyz;
+  let sb = boxHit(p, rimDir, P.origin.xyz, domainHi());
+  var s = vec3<f32>(1.0);
+  if (sb.y > max(sb.x, 0.0)) {
+    let pe = p + rimDir * max(sb.x, 0.0) + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0);
+    s = exp(-textureSampleLevel(light2, samp, uvwOf(pe), 0.0).x * ch);
+  }
+  return s * ballSun(p, rimDir);
+}
 
 // An HDR environment (environment.ts). A direction into the map's frame: turned about the vertical so the map's light
 // faces the light azimuth.
@@ -2645,6 +2664,12 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   // The sky's light scattered toward the camera, before the smoke above dims it: a uniform dome over open ground
   // (radiance E / pi, half of it seen by an isotropic scatterer), or an HDR environment through the phase function.
   let skyScatter = select(R.skyCol.xyz * INV_2PI, envScatter(rd, g), envOn());
+  // The softbox rig's rim, through the same phase octaves as the sun.
+  let rimDir = R.rimDir.xyz;
+  let cosR = dot(rd, rimDir);
+  let pr0 = hg(cosR, g);
+  let pr1 = hg(cosR, 0.5 * g);
+  let pr2 = hg(cosR, 0.25 * g);
 
   // Radiance in cd/m2, per colour channel (soot dims blue more than red, so transmittance is a colour too).
   var col = vec3<f32>(0.0);
@@ -2698,7 +2723,12 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         // The fire's light, shadowed by the soot on the way (from the light volume, in kilolux).
         let fireE = fireColour * 1000.0 * L.w;
         // Light scattered toward the camera per unit of extinction, cd/m2: the phase function is hg / (4 pi).
-        let S = albedo * (R.sunCol.xyz * INV_4PI * lsun + amb + fireE * INV_4PI);
+        var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + amb + fireE * INV_4PI);
+        if (rimOn()) {
+          let tauR = textureSampleLevel(light2, samp, uvw, 0.0).x * ch;
+          let lrim = (exp(-tauR) * pr0 + 0.5 * exp(-0.5 * tauR) * pr1 + 0.25 * exp(-0.25 * tauR) * pr2) * ballSun(w, rimDir);
+          S += albedo * R.rimCol.xyz * INV_4PI * lrim;
+        }
         // Emission (Kirchhoff's law): what the soot absorbs, it emits at the blackbody radiance of its temperature.
         var B = vec3<f32>(0.0);
         let rise = riseOf(s4);
@@ -2724,8 +2754,12 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let nb = normalize(ph - P.ball.xyz);
     let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
     let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nb.y), envIrradiance(nb), envOn());
-    let E = R.sunCol.xyz * max(dot(nb, sun), 0.0) * exp(-lb.x * ch) + skyE * exp(-0.5 * lb.y * ch)
+    var E = R.sunCol.xyz * max(dot(nb, sun), 0.0) * exp(-lb.x * ch) + skyE * exp(-0.5 * lb.y * ch)
       + ballFireLight(ph, nb, lb.w, fireColour, ch);
+    if (rimOn()) {
+      let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0).x;
+      E += R.rimCol.xyz * max(dot(nb, rimDir), 0.0) * exp(-lb2 * ch);
+    }
     var alb = vec3<f32>(BALL_ALBEDO);
     var glow = vec3<f32>(0.0);
     if (ballBurns()) {
@@ -2777,7 +2811,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let fireE = fireColour * fireLux;
     // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
     let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
-    let E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
+    var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
+    if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch); }
     var floorL = R.floorCol.xyz * INV_PI * E * fade;
     // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
     let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());

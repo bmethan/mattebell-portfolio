@@ -16,6 +16,8 @@ import { ENVIRONMENTS, ENV_ORDER, type Env } from './lookdev/environments'
 // Each HDR environment's illuminance on open ground when it is picked (the Environment EV; lux = 2.5 x 2^EV): a clear
 // midday about 100,000 lux, an overcast day about 15,000, the sun just set about 600, a photo studio about 1,200.
 const ENV_EV: Record<Exclude<Env, 'none'>, number> = { midday: 15.5, overcast: 12.5, sunset: 8, studio: 9 }
+// The Environment row: none (the sun and a flat sky), the Lookdev lab's softbox rig, then its four HDR maps.
+const LIGHTINGS: PyroState['env'][] = ['none', 'rig', ...ENV_ORDER.filter((e): e is Exclude<Env, 'none'> => e !== 'none')]
 
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
 const noSubscribe = () => () => {}
@@ -93,7 +95,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Environments',
-    'The Lookdev lab’s four HDR environments from Poly Haven can light the scene. A volume renderer cannot sample a map at every scattering event at this frame rate, so each map’s brightest light, where it has one, is pulled out as a key that casts the smoke’s shadows (the midday sun, 68% of that map’s light within a degree of it; the photo studio’s main softbox, 43% within 15 degrees), and the rest is kept as three bands of spherical harmonics: convolved with the smoke’s phase function for its scattering, and with the cosine for the floor and the ball (Ramamoorthi and Hanrahan). The overcast sky and the sunset’s glow have no key, so they light the smoke softly from all around. Below the horizon the map gives way to the floor, lit by the whole environment. The Turn slider turns the map; the Environment EV is its illuminance on open ground, key included, which auto exposure meters.',
+    'The Lookdev lab’s four HDR environments from Poly Haven can light the scene. A volume renderer cannot sample a map at every scattering event at this frame rate, so each map’s brightest light, where it has one, is pulled out as a key that casts the smoke’s shadows (the midday sun, 68% of that map’s light within a degree of it; the photo studio’s main softbox, 43% within 15 degrees), and the rest is kept as three bands of spherical harmonics: convolved with the smoke’s phase function for its scattering, and with the cosine for the floor and the ball (Ramamoorthi and Hanrahan). The overcast sky and the sunset’s glow have no key, so they light the smoke softly from all around. Below the horizon the map gives way to the floor, lit by the whole environment. The Turn slider turns the map; the Environment EV is its illuminance on open ground, key included, which auto exposure meters. The softbox rig is the Lookdev lab’s three softboxes as lights, at that lab’s ratios: the key where the light sliders put it (4300 K), a fill on the far side (8000 K, about a sixth of the key) through the same spherical harmonics, and a rim strip behind (4300 K, about as strong as the key) with a light volume of its own, so the smoke shadows it and only its edges and wisps catch it.',
   ],
   [
     'Export',
@@ -332,6 +334,13 @@ export default function PyroLab() {
   }
   const pickSource = (t: SourceType) => {
     if (t !== pyro.sourceType) update({ sourceType: t, ...SOURCE_LOOKS[t] })
+  }
+  // A map brings its typical illuminance; the rig is a studio's, so it takes the gray cyc in place of the sky.
+  const pickLighting = (en: PyroState['env']) => {
+    if (en === pyro.env) return
+    if (en === 'none') update({ env: en })
+    else if (en === 'rig') update(pyro.background === 'sky' ? { env: en, background: 'gray' } : { env: en })
+    else update({ env: en, skyEV: ENV_EV[en] })
   }
   const update = (patch: Partial<PyroState>) => {
     setPyro(p => ({ ...p, ...patch }))
@@ -674,14 +683,35 @@ export default function PyroLab() {
                 </div>
                 <div className="lab-row">
                   <Group label="Environment">
-                    {ENV_ORDER.map(en => (
-                      <Pill key={en} on={pyro.env === en} onClick={() => update(en === 'none' || en === pyro.env ? { env: en } : { env: en, skyEV: ENV_EV[en] })}>
-                        {en === 'none' ? 'None' : ENVIRONMENTS[en].label}
+                    {LIGHTINGS.map(en => (
+                      <Pill key={en} on={pyro.env === en} onClick={() => pickLighting(en)}>
+                        {en === 'none' ? 'None' : en === 'rig' ? 'Softbox rig' : ENVIRONMENTS[en].label}
                       </Pill>
                     ))}
                   </Group>
                 </div>
-                {pyro.env === 'none' ? (
+                {pyro.env === 'rig' ? (
+                  <>
+                    <div className="lab-row">
+                      <Group label="Lights">
+                        <Pill on={pyro.rigKey} onClick={() => update({ rigKey: !pyro.rigKey })}>
+                          Key
+                        </Pill>
+                        <Pill on={pyro.rigFill} onClick={() => update({ rigFill: !pyro.rigFill })}>
+                          Fill
+                        </Pill>
+                        <Pill on={pyro.rigRim} onClick={() => update({ rigRim: !pyro.rigRim })}>
+                          Rim
+                        </Pill>
+                      </Group>
+                    </div>
+                    <div className="lab-row">
+                      <Slider label="Light azimuth" min={-180} max={180} step={1} value={pyro.lightAz} digits={0} unit={'°'} onChange={v => update({ lightAz: v })} />
+                      <Slider label="Light elevation" min={5} max={85} step={1} value={pyro.lightEl} digits={0} unit={'°'} onChange={v => update({ lightEl: v })} />
+                      <Slider label="Key" min={-4} max={16} step={0.5} value={pyro.sunEV} digits={1} unit=" EV" onChange={v => update({ sunEV: v })} />
+                    </div>
+                  </>
+                ) : pyro.env === 'none' ? (
                   <>
                     <div className="lab-row">
                       <Slider label="Light azimuth" min={-180} max={180} step={1} value={pyro.lightAz} digits={0} unit={'°'} onChange={v => update({ lightAz: v })} />
@@ -740,14 +770,16 @@ export default function PyroLab() {
                 </div>
                 <div className="lab-row">
                   <Group label="Background">
-                    {pyro.env === 'none' && (
+                    {(pyro.env === 'none' || pyro.env === 'rig') && (
                       <Pill on={pyro.background === 'studio'} onClick={() => update({ background: 'studio' })}>
                         Studio
                       </Pill>
                     )}
-                    <Pill on={pyro.background === 'sky' || (pyro.env !== 'none' && pyro.background === 'studio')} onClick={() => update({ background: 'sky' })}>
-                      Sky
-                    </Pill>
+                    {pyro.env !== 'rig' && (
+                      <Pill on={pyro.background === 'sky' || (pyro.env !== 'none' && pyro.background === 'studio')} onClick={() => update({ background: 'sky' })}>
+                        Sky
+                      </Pill>
+                    )}
                     <Pill on={pyro.background === 'charcoal'} onClick={() => update({ background: 'charcoal' })}>
                       Charcoal cyc
                     </Pill>

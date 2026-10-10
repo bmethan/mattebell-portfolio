@@ -65,5 +65,15 @@ export const METER_FIRE_SLOPE = 0.35
 // The fire's light is gathered from this many slices of the grid's height, each a point light at its own centre.
 export const FIRE_BANDS = 8
 
+// Chemiluminescence: light from the burning itself, apart from the soot's glow. Molecules formed excited in the
+// reactions (CH, C2, CO2) give up their energy as light, in proportion to the heat released, which is the blue of a gas
+// flame. No measurement of how much light that is turned up, so this is an order-of-magnitude estimate: a gas ring's
+// blue flame, about 2.5 kW, gives a fraction of a lumen (a candle gives 12), dim enough to vanish in daylight and
+// beside any soot, bright enough to see by at night, as alcohol fires are seen.
+export const CHEMI_LM_PER_W = 1e-4
+// Soot forms behind the burning, not with it: soot takes some 20 ms in hot, fuel-rich gas to form (22 ms for
+// ethylene at its sooting limit: Kumfer, Skeen and Axelbaum 2008).
+export const SOOT_DELAY = 0.02 // s
+
 // A WGSL float literal.
 export const wf = (x: number) => (Number.isInteger(x) ? `${x}.0` : x.toPrecision(7))

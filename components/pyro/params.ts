@@ -160,6 +160,8 @@ export const BONFIRE_AT_DUSK: Partial<PyroState> = { ...FIRE_START, heatRelease:
 export const PRESETS: { id: string; label: string; state: Partial<PyroState> }[] = [
   { id: 'bonfire', label: 'Bonfire at dusk', state: { ...BONFIRE_AT_DUSK, background: 'gray' } },
   { id: 'campfire', label: 'Campfire at night', state: { ...FIRE_START, background: 'studio', heatRelease: 80, srcRadius: 0.3, sootYield: FUEL.sootYield, albedo: 0.35, sunEV: -1, skyEV: -2, lightAz: -45, lightEl: 35, whiteBalance: 5500 } },
+  // The campfire's fire burning a fuel that makes no soot (methanol's yield is nil): its light is all the flame's own blue.
+  { id: 'alcohol', label: 'Alcohol fire at night', state: { ...FIRE_START, background: 'studio', heatRelease: 80, srcRadius: 0.3, sootYield: 0, albedo: 0.35, sunEV: -1, skyEV: -2, lightAz: -45, lightEl: 35, whiteBalance: 5500 } },
   { id: 'oil', label: 'Oil fire in daylight', state: { ...FIRE_START, background: 'sky', heatRelease: 250, srcRadius: 0.4, sootYield: 0.12, albedo: 0.25, sunEV: 14, skyEV: 11, lightAz: -40, lightEl: 40, whiteBalance: 5500 } },
   { id: 'fire-wind', label: 'Fire in wind', state: { ...FIRE_START, background: 'sky', heatRelease: 120, srcRadius: 0.3, sootYield: 0.05, albedo: 0.4, sunEV: 12, skyEV: 10, lightAz: -45, lightEl: 30, whiteBalance: 6000, srcX: -1, wind: 1.8 } },
   { id: 'plume', label: 'Smoke plume', state: { ...SMOKE_START, background: 'studio' } },

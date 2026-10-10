@@ -1,8 +1,8 @@
-import { BB_MAX_K, BB_MIN_K } from './blackbody'
+import { BB_MAX_K, BB_MIN_K, chemiluminescenceColour } from './blackbody'
 import { AP1_WGSL, VIEW_TRANSFORMS_WGSL } from '../lab/viewTransforms'
 import { FUZZ } from '../lookdev/gpu/wgslBsdf'
 import { FIRE_BANDS } from './physics'
-import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
+import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
 // The cyc's floor ends this far behind the fire (m), past the back of the gas's domain (about 0.48 m), and sweeps up
 // this radius into a wall 2.3 m back.
@@ -1989,6 +1989,20 @@ const FLAME_SHEET_K = 1400.0;
 fn radiatingKelvin(meanK: f32, heatMW: f32) -> f32 {
   return max(meanK, mix(meanK, FLAME_SHEET_K, smoothstep(0.2, 2.0, heatMW)));
 }
+// The flame's own light (chemiluminescence, physics.ts), in proportion to the heat released: cd/m2 per metre of
+// flame at 1 MW/m3, the light per watt over the sphere. Its colour, CH's blue with C2's green, at unit luminance.
+const CHEMI_CD = ${wf((CHEMI_LM_PER_W * 1e6) / (4 * Math.PI))};
+const CHEMI_COLOUR = vec3<f32>(${chemiluminescenceColour().map(wf).join(', ')});
+// The share of a burning cell's soot formed by now. Soot forms SOOT_DELAY after its fuel burns, so the soot of the
+// last SOOT_DELAY of burning is not there yet: of the heat released so far (the fuel burned, the mixture fraction
+// less the fuel left), the part released that recently. Where the fuel has only begun to burn, at the flame's base,
+// that is most of it, so the gas there is clear and the flame's blue shows through. (The grid's soot stays as the
+// yield makes it, for the smoke; this is how much of it is soot yet, for the flame's glow and its light.)
+const SOOT_DELAY = ${wf(SOOT_DELAY)}; // s
+fn sootFormed(g: Gas, heatMW: f32) -> f32 {
+  let released = max(g.z - g.fuel, 0.0) * HEAT * RHO_T / (T_AMB + g.rise); // J/m3
+  return clamp(1.0 - SOOT_DELAY * heatMW * 1e6 / max(released, 1e-3), 0.0, 1.0);
+}
 const INV_PI = 0.31830989;
 const INV_2PI = 0.15915494;
 const INV_4PI = 0.07957747;
@@ -2118,6 +2132,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       for (var x = -1; x <= 2; x++) {
         let q = textureLoad(scal, clamp(b + vec3<i32>(x, y, z), vec3<i32>(0), n - 1), 0);
         occ = max(occ, q.x);
+        // (A fire's fuel too: a flame burns blue where there is no soot yet, or none at all.)
+        if (P.fire.x > 0.5) { occ = max(occ, 0.1 * q.w); }
       }
     }
   }
@@ -2175,7 +2191,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     let s = textureLoad(scal, c, 0);
     // Emission per unit volume (cd/m3): what the soot absorbs times the blackbody radiance at its temperature.
     let g = gasOf(s);
-    e = (1.0 - R.skyCol.w) * sigmaOf(s) * chroma() * planck(radiatingKelvin(T_AMB + g.rise, hrr[cellIndex(c)] * 1e-6));
+    // (Only the soot formed by now glows; and the flame's own light, chemiluminescence.)
+    let heatMW = hrr[cellIndex(c)] * 1e-6;
+    var formed = 1.0;
+    if (heatMW > 0.0) { formed = sootFormed(g, heatMW); }
+    e = (1.0 - R.skyCol.w) * sigmaOf(s) * formed * chroma() * planck(radiatingKelvin(T_AMB + g.rise, heatMW));
+    e += CHEMI_COLOUR * (CHEMI_CD * heatMW);
     let bed = bedMask(worldOf(vec3<f32>(id) + 0.5)) * P.grid.x * P.grid.x;
     b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
   }
@@ -2830,6 +2851,16 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       var sig = sigmaOf(s4) * fade;
       let upres = R.wb2.w > 0.5;
       if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvm, 0.0).x, 0.0) * fade; }
+      // Where a fire burns: the flame's own blue light, and only the soot formed by now (sootFormed). The blue is there
+      // all through the flame, hidden wherever soot glows in front of it, and shows where the gas is clear.
+      var heat = 0.0;
+      if (R.fire.x > 0.5) {
+        heat = textureSampleLevel(flameTex, samp, uvm, 0.0).x * offBallShell(wm);
+        if (heat > 0.0) {
+          sig *= sootFormed(gasOf(s4), heat);
+          col += T * CHEMI_COLOUR * (CHEMI_CD * heat * fade * ds);
+        }
+      }
       if (sig > 1e-3) {
         // Upres detail (unless the wavelet-turbulence grid supplies it): strongest in thin smoke (the edges and wisps),
         // a third as strong in the dense core, and fading out in the faintest haze, where fine noise reads as grain.
@@ -2854,7 +2885,6 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         // Emission (Kirchhoff's law): what the soot absorbs, it emits at the blackbody radiance of its temperature.
         var B = vec3<f32>(0.0);
         let rise = riseOf(s4);
-        let heat = textureSampleLevel(flameTex, samp, uvm, 0.0).x * offBallShell(wm);
         if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
           var kelvin = radiatingKelvin(T_AMB + rise, heat);
           if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, rot)); }

@@ -77,6 +77,37 @@ export function planckTable(): Float32Array<ArrayBuffer> {
   return out
 }
 
+// The colour of a flame's chemiluminescence, the blue of a gas flame and of a fire's base: excited CH and C2,
+// formed in the burning itself, and CO2 formed excited, each giving up its energy as light. CH's bands at 431 and
+// 390 nm, C2's Swan bands at 474, 516 and 563 nm and the CO2 continuum under them (OH's, at 309 nm, is ultraviolet),
+// in photons, roughly as a hydrocarbon flame near stoichiometric gives them (C2 grows on the fuel-rich side). Linear
+// ACEScg at unit luminance: a deep blue.
+const CHEMI_BANDS: [number, number, number][] = [
+  // [nm, FWHM nm, relative photons]
+  [431.4, 6, 1.0],
+  [389.0, 4, 0.25],
+  [473.7, 6, 0.15],
+  [516.5, 8, 0.35],
+  [563.5, 8, 0.08],
+  [420, 140, 1.2],
+]
+export function chemiluminescenceColour(): [number, number, number] {
+  const xyz = [0, 0, 0]
+  for (let nm = 380; nm <= 780; nm += 1) {
+    let e = 0
+    for (const [mu, fwhm, photons] of CHEMI_BANDS) {
+      const s = fwhm / 2.3548
+      e += (photons / (s * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * ((nm - mu) / s) ** 2) / nm // energy per photon ~ 1 / nm
+    }
+    const c = cieXYZ(nm)
+    xyz[0] += e * c[0]
+    xyz[1] += e * c[1]
+    xyz[2] += e * c[2]
+  }
+  const rgb = apply(REC709_TO_AP1, apply(XYZ_TO_REC709, xyz)).map(v => Math.max(0, v / xyz[1]))
+  return [rgb[0], rgb[1], rgb[2]]
+}
+
 // Bradford cone-response matrix (Lam 1985) and its inverse.
 const BRADFORD = [
   [0.8951, 0.2664, -0.1614],

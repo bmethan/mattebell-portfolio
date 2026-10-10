@@ -198,6 +198,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.3801/IAFSS.FSS.5-177',
   },
   {
+    id: 'kumfer',
+    group: 'Combustion',
+    authors: 'Kumfer, Skeen, Axelbaum',
+    title: 'Soot Inception Limits in Laminar Diffusion Flames with Application to Oxy-Fuel Combustion',
+    venue: 'Combustion and Flame 154(3), soot forming in about 20 ms',
+    year: '2008',
+    url: 'https://doi.org/10.1016/j.combustflame.2008.03.008',
+  },
+  {
     id: 'bamford',
     group: 'Burning ball',
     authors: 'C. H. Bamford, J. Crank, D. H. Malan',

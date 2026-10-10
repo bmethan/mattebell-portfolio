@@ -6,12 +6,12 @@ import { parseArgs } from 'node:util'
 
 export const LAB_URL = process.env.PYRO_URL ?? 'http://localhost:4622/?lab=pyro'
 const BROWSER = process.env.PYRO_BROWSER ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
-// Playwright is not a dependency of the site. The probes use this repo's copy if one is installed, else the one in
-// the node_modules beside the package.json that PLAYWRIGHT_FROM names (on Matthew's machine, magpie's).
-const PLAYWRIGHT_FROM = [process.env.PLAYWRIGHT_FROM, 'C:/Users/leahp/Claude_Local/magpie/package.json'].filter(Boolean)
+// Playwright: the repo's playwright-core (a development dependency only; it drives the installed browser and
+// downloads none), or the copy beside the package.json that PLAYWRIGHT_FROM names.
+const PLAYWRIGHT_FROM = [process.env.PLAYWRIGHT_FROM].filter(Boolean)
 
 async function playwright() {
-  for (const name of ['playwright', 'playwright-core']) {
+  for (const name of ['playwright-core', 'playwright']) {
     try {
       return await import(name)
     } catch {}
@@ -22,7 +22,7 @@ async function playwright() {
       return createRequire(from)('playwright')
     } catch {}
   }
-  throw new Error('No Playwright found: install playwright-core here (npm i -D playwright-core) or set PLAYWRIGHT_FROM to a package.json whose node_modules has playwright.')
+  throw new Error('No Playwright found: run npm install (playwright-core is a development dependency), or set PLAYWRIGHT_FROM to a package.json whose node_modules has playwright.')
 }
 
 // The options every probe takes, plus its own; `help` is printed for --help.

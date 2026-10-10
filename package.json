@@ -26,6 +26,7 @@
     "@webgpu/types": "^0.1.74",
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
+    "playwright-core": "1.61.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

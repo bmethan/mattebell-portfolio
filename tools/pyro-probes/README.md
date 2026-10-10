@@ -8,9 +8,9 @@ paused and stepped exactly, so a given scenario gives the same run every time.
 ## Setup
 
 - Start the dev server (port 4622 by default; set `PYRO_URL` otherwise).
-- Playwright is not a dependency of the site. The probes use this repo's copy if one is installed
-  (`npm i -D playwright-core`), else the one beside the package.json that `PLAYWRIGHT_FROM` names; on Matthew's
-  machine they default to magpie's.
+- `npm install` brings Playwright: `playwright-core`, a development dependency only (nothing of it ships with the
+  site), which drives the installed browser and downloads none. `PLAYWRIGHT_FROM` can point at another copy (a
+  package.json whose node_modules has `playwright`).
 - They drive the installed Edge (`PYRO_BROWSER` to change it), with its GPU.
 - Run one probe at a time: two sharing the GPU can lose the device.
 

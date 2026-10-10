@@ -1,5 +1,6 @@
 import { BB_MAX_K, BB_MIN_K } from './blackbody'
 import { AP1_WGSL, VIEW_TRANSFORMS_WGSL } from '../lab/viewTransforms'
+import { FUZZ } from '../lookdev/gpu/wgslBsdf'
 import { FIRE_BANDS } from './physics'
 import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
@@ -2358,8 +2359,53 @@ fn envBackdrop(d: vec3<f32>) -> vec3<f32> {
 // surface over the same bands' unshadowed light gives the mean transmittance). Close to the fire a band is no point
 // but a slice of flame as wide as the bed, which lights a surface turned partly away from its centre too: its cosine
 // wraps round by how large the slice looms, r_bed^2 / (r^2 + r_bed^2).
-fn ballFireLight(ph: vec3<f32>, nb: vec3<f32>, shadowed: f32, fireColour: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
-  if (R.fire.x < 0.5) { return vec3<f32>(0.0); }
+// With the ball's surface (ballMat): the fire's light on it as irradiance for the base (e, lux), its reflection in the
+// specular layer (spec, cd/m2), and what the fuzz takes of it (fuzz: the lobe-weighted illuminance, or the radiance of
+// flames all around). The flames touching it act as surroundings; each band of the fire as a light of its own.
+struct BallFire {
+  e: vec3<f32>,
+  spec: vec3<f32>,
+  fuzz: vec3<f32>,
+}
+fn ballFire(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat, shadowed: f32, fireColour: vec3<f32>, ch: vec3<f32>) -> BallFire {
+  var out = BallFire(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+  if (R.fire.x < 0.5) { return out; }
+  let F = tangentFrame(n);
+  let nv = max(dot(n, v), 1e-4);
+  let near = ballFireNear(ph, nb, ch);
+  out.spec = near * envBRDF(m.f0, m.rough, nv);
+  out.fuzz = near;
+  let cellVol = P.grid.x * P.grid.x * P.grid.x;
+  let bed2 = max(P.src.w * P.src.w, 0.04);
+  var far = 0.0;
+  var seen = 0.0;
+  var spec = 0.0;
+  var fuzz = 0.0;
+  for (var b = 0u; b < FIRE_BANDS; b++) {
+    let lum = fireLight[3u + 2u * b].w * cellVol;
+    if (lum <= 0.0) { continue; }
+    let d = fireLight[4u + 2u * b].xyz - ph;
+    let dist = length(d);
+    let r2 = dist * dist + BAND_R2;
+    let l = d / max(dist, 1e-4);
+    let wrap = bed2 / (dist * dist + bed2);
+    let c = (dot(n, l) + wrap) / (1.0 + wrap);
+    if (c > 0.0) {
+      seen += lum / r2;
+      let e = lum / r2 * smoothstep(0.05, 0.15, dist);
+      far += e * c;
+      if (m.specW > 0.0) { spec += e * ggxSpec(n, v, l, m.rough, m.f0); }
+      if (m.fuzzW > 0.0) { fuzz += e * fuzzLobe(F, v, l, m.fuzzRough); }
+    }
+  }
+  let trans = clamp(1000.0 * shadowed / max(seen, 1e-6), 0.0, 1.0);
+  out.e = fireColour * far * trans + 3.1415927 * near;
+  out.spec += fireColour * spec * trans;
+  out.fuzz += fireColour * fuzz * trans;
+  return out;
+}
+// The flames touching the ball: the radiance of the gas just outside its surface, along the normal.
+fn ballFireNear(ph: vec3<f32>, nb: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
   let albedo = R.skyCol.w;
   let step = 2.0 * P.grid.x;
   var near = vec3<f32>(0.0);
@@ -2374,25 +2420,7 @@ fn ballFireLight(ph: vec3<f32>, nb: vec3<f32>, shadowed: f32, fireColour: vec3<f
     if (rise > 400.0 || heat > 0.2) { near += tn * (1.0 - ts) * (1.0 - albedo) * planck(radiatingKelvin(T_AMB + rise, heat)); }
     tn *= ts;
   }
-  let cellVol = P.grid.x * P.grid.x * P.grid.x;
-  let bed2 = max(P.src.w * P.src.w, 0.04);
-  var far = 0.0;
-  var seen = 0.0;
-  for (var b = 0u; b < FIRE_BANDS; b++) {
-    let lum = fireLight[3u + 2u * b].w * cellVol;
-    if (lum <= 0.0) { continue; }
-    let d = fireLight[4u + 2u * b].xyz - ph;
-    let dist = length(d);
-    let r2 = dist * dist + BAND_R2;
-    let wrap = bed2 / (dist * dist + bed2);
-    let c = (dot(nb, d) / max(dist, 1e-4) + wrap) / (1.0 + wrap);
-    if (c > 0.0) {
-      seen += lum / r2;
-      far += lum * c / r2 * smoothstep(0.05, 0.15, dist);
-    }
-  }
-  let trans = clamp(1000.0 * shadowed / max(seen, 1e-6), 0.0, 1.0);
-  return fireColour * far * trans + 3.1415927 * near;
+  return near;
 }
 
 // The burning ball's own flames. Its volatiles burn in a layer along its surface far thinner than a cell, which the
@@ -2521,6 +2549,87 @@ fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> vec3<f32> {
   a *= 1.0 - 0.6 * crack;
   let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
   return REC709_TO_AP1 * mix(a, vec3<f32>(0.42, 0.41, 0.39), sk.w * mix(0.55, 1.0, plates) * (1.0 - crack));
+}
+// The burning ball as an OpenPBR surface (the subset it needs, as the Lookdev lab's materials are): a dielectric
+// specular layer (GGX) over the diffuse base, the ash as OpenPBR's fuzz on top (the Lookdev lab's own code, Zeltner,
+// Burley and Chiang's sheen), and the glow as emission. Turned pine, unfinished: a broad sheen (roughness 0.6, IOR
+// 1.5). Char: a faint silvery sheen on its blocks, tighter and a little stronger (roughness 0.4, IOR 1.9, as graphite-
+// like carbon reflects more than wood), none down in the cracks. Ash: a pale fuzz, roughness 0.7.
+const PI: f32 = 3.14159265358979;
+const TWO_PI: f32 = 6.28318530717959;
+fn sq(x: f32) -> f32 { return x * x; }
+${FUZZ}
+struct BallMat {
+  base: vec3<f32>, // base colour (ACEScg)
+  specW: f32, // specular weight
+  rough: f32, // specular roughness (GGX alpha = rough^2)
+  f0: f32, // reflectance at normal incidence, from the specular IOR
+  fuzzW: f32,
+  fuzzColor: vec3<f32>,
+  fuzzRough: f32,
+}
+fn ballMat(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> BallMat {
+  let charred = smoothstep(0.1, 0.7, sk.z);
+  let ior = mix(1.5, 1.9, charred);
+  let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
+  let ash = sk.w * mix(0.55, 1.0, plates) * (1.0 - crack);
+  return BallMat(woodAlbedo(lp, sk, crack), (1.0 - crack) * (1.0 - 0.7 * ash), mix(0.6, 0.4, charred), sq((ior - 1.0) / (ior + 1.0)),
+    0.8 * ash, REC709_TO_AP1 * vec3<f32>(0.42, 0.41, 0.39), 0.7);
+}
+// Columns: two tangents and the normal.
+fn tangentFrame(n: vec3<f32>) -> mat3x3<f32> {
+  let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.x) > 0.9);
+  let t = normalize(cross(a, n));
+  return mat3x3<f32>(t, cross(n, t), n);
+}
+// The cracks have depth: the char dips about 2 mm into each, so at a crack's edges the surface tilts into it (a bump
+// from the crack pattern's slope, by finite differences along the surface).
+fn crackNormal(lp: vec3<f32>, nb: vec3<f32>, sk: vec4<f32>, crack: f32) -> vec3<f32> {
+  if (sk.z < 0.8) { return nb; }
+  let F = tangentFrame(nb);
+  let e = 0.004;
+  let gx = (charCracks(lp + F[0] * e, sk) - crack) / e;
+  let gy = (charCracks(lp + F[1] * e, sk) - crack) / e;
+  let depth = 0.002 / max(P.ball.w, 0.01);
+  return normalize(nb + depth * (gx * F[0] + gy * F[1]));
+}
+// GGX (Trowbridge-Reitz; Walter and colleagues) with the height-correlated Smith visibility and Schlick's Fresnel: the
+// specular lobe times the cosine, for light arriving from l.
+fn ggxSpec(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, f0: f32) -> f32 {
+  let nl = dot(n, l);
+  if (nl <= 0.0) { return 0.0; }
+  let nv = max(dot(n, v), 1e-4);
+  let h = normalize(v + l);
+  let nh = max(dot(n, h), 0.0);
+  let vh = max(dot(v, h), 0.0);
+  let a2 = sq(rough * rough);
+  let d = a2 / (PI * sq(nh * nh * (a2 - 1.0) + 1.0));
+  let vis = 0.5 / (nl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(nl * nl * (1.0 - a2) + a2));
+  return d * vis * (f0 + (1.0 - f0) * pow(1.0 - vh, 5.0)) * nl;
+}
+// The specular lobe's reflectance against light from all around (Karis's analytic fit of the split sum).
+fn envBRDF(f0: f32, rough: f32, nv: f32) -> f32 {
+  let r = rough * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+  let a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
+  let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+  return f0 * ab.x + ab.y;
+}
+// The surroundings' radiance about a reflected direction, blurred by the lobe: the environment's harmonics with each
+// band weighted as for a Gaussian of the lobe's width (alpha); or the flat sky above, the lit floor below.
+fn glossyEnv(r: vec3<f32>, rough: f32) -> vec3<f32> {
+  if (envOn()) {
+    let s2 = sq(rough * rough);
+    return shAt(toEnv(r), 1.0, exp(-s2), exp(-3.0 * s2));
+  }
+  let sky = R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(r.y, 0.0)));
+  return select(R.floorCol.xyz * R.skyCol.xyz * INV_PI, sky, r.y > 0.0);
+}
+// The fuzz's lobe toward light from l (normalized: it integrates to 1), in the surface's frame F.
+fn fuzzLobe(F: mat3x3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32) -> f32 {
+  let vl = transpose(F) * v;
+  let ll = transpose(F) * l;
+  if (ll.z <= 0.0) { return 0.0; }
+  return fuzzD(vl, ll, rough);
 }
 // Kirchhoff again: the surface glows at the blackbody radiance of its temperature (emissivity 0.9). In the cracks the
 // char is hotter, out of the cooling air; ash over it glows less.
@@ -2749,27 +2858,54 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 
   if (tBall < tFloor && tBall < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     // The collision ball, lit by the sun and the sky through the smoke (the light volume just outside its surface)
-    // and by the fire: matte grey, or wood that scorches, chars, glows and turns to ash as its skin heats.
+    // and by the fire: matte grey, or wood that scorches, chars, glows and turns to ash as its skin heats, shaded as
+    // an OpenPBR surface (ballMat).
     let ph = ro + rd * tBall;
     let nb = normalize(ph - P.ball.xyz);
+    let v = -rd;
     let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
-    let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nb.y), envIrradiance(nb), envOn());
-    var E = R.sunCol.xyz * max(dot(nb, sun), 0.0) * exp(-lb.x * ch) + skyE * exp(-0.5 * lb.y * ch)
-      + ballFireLight(ph, nb, lb.w, fireColour, ch);
-    if (rimOn()) {
-      let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0).x;
-      E += R.rimCol.xyz * max(dot(nb, rimDir), 0.0) * exp(-lb2 * ch);
-    }
-    var alb = vec3<f32>(BALL_ALBEDO);
+    var m = BallMat(vec3<f32>(BALL_ALBEDO), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5);
+    var n = nb;
     var glow = vec3<f32>(0.0);
     if (ballBurns()) {
       let lp = (ph - P.ball.xyz) / P.ball.w;
       let sk = skinAt(nb);
       let crack = charCracks(lp, sk);
-      alb = woodAlbedo(lp, sk, crack);
+      m = ballMat(lp, sk, crack);
+      n = crackNormal(lp, nb, sk, crack);
       glow = charGlow(sk, crack);
     }
-    col += T * (alb * INV_PI * E + glow);
+    let F = tangentFrame(n);
+    let nv = max(dot(n, v), 1e-4);
+    // Each light's illuminance at normal incidence (shadowed): the base takes its cosine share, the specular layer
+    // and the fuzz their lobes'.
+    let sunE = R.sunCol.xyz * exp(-lb.x * ch);
+    var E = sunE * max(dot(n, sun), 0.0);
+    var spec = sunE * ggxSpec(n, v, sun, m.rough, m.f0);
+    var fuzz = sunE * fuzzLobe(F, v, sun, m.fuzzRough);
+    if (rimOn()) {
+      let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0).x;
+      let rimE = R.rimCol.xyz * exp(-lb2 * ch);
+      E += rimE * max(dot(n, rimDir), 0.0);
+      spec += rimE * ggxSpec(n, v, rimDir, m.rough, m.f0);
+      fuzz += rimE * fuzzLobe(F, v, rimDir, m.fuzzRough);
+    }
+    // The sky or the environment, through the smoke above.
+    let occ = exp(-0.5 * lb.y * ch);
+    let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * n.y), envIrradiance(n), envOn()) * occ;
+    E += skyE;
+    spec += glossyEnv(reflect(rd, n), m.rough) * envBRDF(m.f0, m.rough, nv) * occ;
+    fuzz += skyE * INV_PI;
+    let bf = ballFire(ph, nb, n, v, m, lb.w, fireColour, ch);
+    E += bf.e;
+    spec += bf.spec;
+    fuzz += bf.fuzz;
+    // OpenPBR's layering: the fuzz on top passes 1 - its albedo; the specular layer reflects its share and passes
+    // the rest to the base.
+    let eFuzz = select(0.0, fuzzDirAlbedo(nv, m.fuzzRough), m.fuzzW > 0.0);
+    let tFuzz = 1.0 - m.fuzzW * eFuzz;
+    let base = m.base * INV_PI * E * (1.0 - m.specW * envBRDF(m.f0, m.rough, nv));
+    col += T * (tFuzz * (base + m.specW * spec) + m.fuzzW * eFuzz * m.fuzzColor * fuzz + glow);
   } else if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     let pf = ro + rd * tFloor;
     let nf = nFloor;

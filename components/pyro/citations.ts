@@ -251,6 +251,25 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     year: '2008',
     url: 'https://doi.org/10.1139/X07-204',
   },
+  // The ball's surface, shaded as the Lookdev lab's materials are (its citations, as verified there).
+  {
+    id: 'openpbr',
+    group: 'Burning ball',
+    authors: 'Academy Software Foundation',
+    title: 'OpenPBR Surface Specification v1.1.1',
+    venue: 'ASWF',
+    year: '2026',
+    url: 'https://academysoftwarefoundation.github.io/OpenPBR/',
+  },
+  {
+    id: 'sheen',
+    group: 'Burning ball',
+    authors: 'Tizian Zeltner, Brent Burley, Matt Jen-Yuan Chiang',
+    title: 'Practical Multiple-Scattering Sheen Using Linearly Transformed Cosines',
+    venue: 'ACM SIGGRAPH Talks',
+    year: '2022',
+    url: 'https://doi.org/10.1145/3532836.3536240',
+  },
   {
     id: 'fernandes',
     group: 'Burning ball',

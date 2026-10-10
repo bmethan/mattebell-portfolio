@@ -461,6 +461,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
   },
   // The view transforms, shared with the Lookdev lab (its citations, as verified there).
   {
+    id: 'jimenez-post',
+    group: 'Camera',
+    authors: 'Jorge Jimenez',
+    title: 'Next Generation Post Processing in Call of Duty: Advanced Warfare',
+    venue: 'SIGGRAPH Advances in Real-Time Rendering in Games course',
+    year: '2014',
+    url: 'https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare/',
+  },
+  {
     id: 'aces2',
     group: 'Camera',
     authors: 'Academy of Motion Picture Arts and Sciences; Academy Software Foundation',

@@ -1975,6 +1975,7 @@ struct RParams {
   sh: array<vec4<f32>, 9>, // its light but the key, as spherical harmonics (rgb, cd/m2 x sr), the floor below
   rimDir: vec4<f32>,   // the softbox rig's rim: toward it, on (0 or 1)
   rimCol: vec4<f32>,   // its illuminance (lux) by colour
+  camera: vec4<f32>,   // the shutter's open time (s, 0 for none); the glare's share of the light
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -2275,6 +2276,7 @@ ${fireCommon(9)}
 @group(0) @binding(32) var<storage, read> ballSheet: array<f32>; // the fuel flowing up the burning ball (BALL_HEAT)
 @group(0) @binding(33) var envTex: texture_2d<f32>; // an HDR environment's backdrop, softened (environment.ts)
 @group(0) @binding(34) var light2: texture_3d<f32>; // x: optical depth toward the softbox rig's rim (LIGHT)
+@group(0) @binding(35) var velTex: texture_3d<f32>; // the velocity, for the motion blur
 fn rimOn() -> bool { return R.rimDir.w > 0.5; }
 // The rim's shadow on a surface point outside the gas: the optical depth where the way to the rim enters the domain.
 fn rimShadow(p: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
@@ -2810,41 +2812,52 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           T *= tf;
         }
       }
-      let s4 = scalSmooth(uvw);
+      // Motion blur: this sample's moment within the shutter (stratified along the ray, a different set each frame,
+      // which the accumulation averages), and the gas that was here then, carried back along the flow. (The velocity
+      // in one lookup: each component lives on its own faces, a quarter cell either way of where this reads it, near
+      // enough for a blur.)
+      var wm = w;
+      if (R.camera.x > 0.0) {
+        let tau = (fract(jitter + f32(i) * 0.618034) - 0.5) * R.camera.x;
+        let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
+        wm = w - u * tau;
+      }
+      let uvm = uvwOf(wm);
+      let s4 = scalSmooth(uvm);
       // (Against the collision ball the grid holds it as a staircase of solid cells, which the gas within a cell or
       // two of its true surface takes the shape of; there the gas fades out and the sphere itself takes over.)
-      let fade = edgeFade(uvw) * offBallStairs(w);
+      let fade = edgeFade(uvm) * offBallStairs(wm);
       var sig = sigmaOf(s4) * fade;
       let upres = R.wb2.w > 0.5;
-      if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvw, 0.0).x, 0.0) * fade; }
+      if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvm, 0.0).x, 0.0) * fade; }
       if (sig > 1e-3) {
         // Upres detail (unless the wavelet-turbulence grid supplies it): strongest in thin smoke (the edges and wisps),
         // a third as strong in the dense core, and fading out in the faintest haze, where fine noise reads as grain.
         if (R.detail.z > 0.0 && !upres) {
           let thin = 1.0 - smoothstep(0.2, 4.0, sig);
           let faint = smoothstep(0.0, 1.0, sig);
-          sig *= clamp(1.0 + 2.0 * R.detail.z * detail(w, uvw) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
+          sig *= clamp(1.0 + 2.0 * R.detail.z * detail(wm, uvm) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
         }
-        let L = textureSampleLevel(light, samp, uvw, 0.0);
+        let L = textureSampleLevel(light, samp, uvm, 0.0);
         let tauS = L.x * ch;
-        let lsun = (exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2) * ballSun(w, sun);
+        let lsun = (exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2) * ballSun(wm, sun);
         let amb = skyScatter * exp(-0.5 * L.y * ch);
         // The fire's light, shadowed by the soot on the way (from the light volume, in kilolux).
         let fireE = fireColour * 1000.0 * L.w;
         // Light scattered toward the camera per unit of extinction, cd/m2: the phase function is hg / (4 pi).
         var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + amb + fireE * INV_4PI);
         if (rimOn()) {
-          let tauR = textureSampleLevel(light2, samp, uvw, 0.0).x * ch;
-          let lrim = (exp(-tauR) * pr0 + 0.5 * exp(-0.5 * tauR) * pr1 + 0.25 * exp(-0.25 * tauR) * pr2) * ballSun(w, rimDir);
+          let tauR = textureSampleLevel(light2, samp, uvm, 0.0).x * ch;
+          let lrim = (exp(-tauR) * pr0 + 0.5 * exp(-0.5 * tauR) * pr1 + 0.25 * exp(-0.25 * tauR) * pr2) * ballSun(wm, rimDir);
           S += albedo * R.rimCol.xyz * INV_4PI * lrim;
         }
         // Emission (Kirchhoff's law): what the soot absorbs, it emits at the blackbody radiance of its temperature.
         var B = vec3<f32>(0.0);
         let rise = riseOf(s4);
-        let heat = textureSampleLevel(flameTex, samp, uvw, 0.0).x * offBallShell(w);
+        let heat = textureSampleLevel(flameTex, samp, uvm, 0.0).x * offBallShell(wm);
         if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
           var kelvin = radiatingKelvin(T_AMB + rise, heat);
-          if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(w, uvw, rot)); }
+          if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, rot)); }
           B = (1.0 - albedo) * planck(kelvin);
         }
         // Integrated exactly over the step for constant properties (Hillaire 2015).
@@ -2966,24 +2979,16 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 `
 
 // 11. Temporal accumulation, then the camera. Each frame's march is blended into a running history, which averages
-// away the sampling noise; the history is first clamped to the range of the current frame's 3 x 3 neighbourhood (in a
-// luminance-compressed space, so a bright flame does not dominate), so what moves or flickers is not smeared behind
-// it. Then the white balance, the view transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and
-// a dither against banding.
+// away the sampling noise (and, with the motion blur, the shutter's moments); the history is first clamped to the range
+// of the current frame's 3 x 3 neighbourhood (in a luminance-compressed space, so a bright flame does not dominate), so
+// what moves or flickers is not smeared behind it. Then the lens's glare (GLARE), and DISPLAY: the white balance, the
+// view transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and a dither against banding.
 export const RESOLVE = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
-${VIEW_TRANSFORMS_WGSL}
 @group(0) @binding(2) var current: texture_2d<f32>;
 @group(0) @binding(3) var history: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> T: vec4<f32>; // history valid (0 or 1), weight of the current frame
-@group(0) @binding(5) var lut: texture_2d<f32>; // the ACES 2.0 LUT: 65 slices of 65 x 65 stacked (blue by slice)
-@group(0) @binding(6) var lutSampler: sampler;
-
-struct Out {
-  @location(0) color: vec4<f32>,
-  @location(1) history: vec4<f32>,
-}
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -2991,22 +2996,11 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
   return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
 }
 
-fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
 fn squash(c: vec3<f32>) -> vec3<f32> { return c / (1.0 + ap1Lum(c)); }
 fn unsquash(c: vec3<f32>) -> vec3<f32> { return c / max(1.0 - ap1Lum(c), 1e-4); }
-// As the Lookdev lab shows its image: ACES 2.0 from the LUT (AgX until it has loaded), or AgX, PBR Neutral or the
-// plain sRGB curve on the image carried into Rec.709.
-fn view(c: vec3<f32>) -> vec3<f32> {
-  let v = u32(R.scene.z + 0.5);
-  if (v == 0u && R.scene.w > 0.5) { return aces2(c); }
-  var r = max(AP1_TO_REC709 * c, vec3<f32>(0.0));
-  if (v == 2u) { r = PBRNeutralToneMapping(r); }
-  else if (v != 3u) { r = AgXToneMapping(r); }
-  return srgbOETF(r);
-}
 
 @fragment
-fn fs(@builtin(position) fc: vec4<f32>) -> Out {
+fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let p = vec2<i32>(fc.xy);
   let last = vec2<i32>(textureDimensions(current)) - 1;
   let cur = squash(max(textureLoad(current, p, 0).xyz, vec3<f32>(0.0)));
@@ -3024,10 +3018,112 @@ fn fs(@builtin(position) fc: vec4<f32>) -> Out {
     let h = clamp(squash(textureLoad(history, p, 0).xyz), lo, hi);
     blended = mix(h, cur, T.y);
   }
-  let c = unsquash(blended);
+  return vec4<f32>(unsquash(blended), 1.0);
+}
+`
+
+// The lens's glare: a real lens scatters a few percent of the light it passes into a wide, soft halo (veiling glare),
+// unseen around most of a scene but plain around anything far brighter than what surrounds it, as flames are at
+// dusk. Without a threshold, so it keeps the light's energy: the image is blurred into a chain of GLARE_LEVELS mips,
+// each half the size of the last, by the 13-tap downsampling and 3 x 3 tent upsampling of Jimenez (2014), the levels
+// summed, and the display mixes that sum (over the levels' count) in at the Glare control's share. The first
+// downsample weights its five groups by 1 / (1 + luminance) (Karis's average), so a single blazing pixel cannot flare
+// into a blotch.
+export const GLARE_LEVELS = 6
+export const GLARE = /* wgsl */ `
+${AP1_WGSL}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn tap(uv: vec2<f32>) -> vec3<f32> { return textureSampleLevel(src, smp, uv, 0.0).xyz; }
+fn karis(c: vec3<f32>) -> f32 { return 1.0 / (1.0 + ap1Lum(c)); }
+fn down(fc: vec4<f32>, firstPass: bool) -> vec4<f32> {
+  let ts = 1.0 / vec2<f32>(textureDimensions(src));
+  let uv = fc.xy * 2.0 * ts;
+  let a = tap(uv + ts * vec2<f32>(-2.0, -2.0));
+  let b = tap(uv + ts * vec2<f32>(0.0, -2.0));
+  let c = tap(uv + ts * vec2<f32>(2.0, -2.0));
+  let d = tap(uv + ts * vec2<f32>(-2.0, 0.0));
+  let e = tap(uv);
+  let f = tap(uv + ts * vec2<f32>(2.0, 0.0));
+  let g = tap(uv + ts * vec2<f32>(-2.0, 2.0));
+  let h = tap(uv + ts * vec2<f32>(0.0, 2.0));
+  let i = tap(uv + ts * vec2<f32>(2.0, 2.0));
+  let j = tap(uv + ts * vec2<f32>(-1.0, -1.0));
+  let k = tap(uv + ts * vec2<f32>(1.0, -1.0));
+  let l = tap(uv + ts * vec2<f32>(-1.0, 1.0));
+  let m = tap(uv + ts * vec2<f32>(1.0, 1.0));
+  let g0 = (j + k + l + m) * 0.25;
+  let g1 = (a + b + d + e) * 0.25;
+  let g2 = (b + c + e + f) * 0.25;
+  let g3 = (d + e + g + h) * 0.25;
+  let g4 = (e + f + h + i) * 0.25;
+  if (!firstPass) { return vec4<f32>(g0 * 0.5 + (g1 + g2 + g3 + g4) * 0.125, 1.0); }
+  let w0 = 0.5 * karis(g0);
+  let w1 = 0.125 * karis(g1);
+  let w2 = 0.125 * karis(g2);
+  let w3 = 0.125 * karis(g3);
+  let w4 = 0.125 * karis(g4);
+  return vec4<f32>((g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4), 1.0);
+}
+@fragment fn fsDownFirst(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> { return down(fc, true); }
+@fragment fn fsDown(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> { return down(fc, false); }
+// Into a level twice this one's size, added to what is there (the pipeline blends by adding).
+@fragment fn fsUp(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  let ts = 1.0 / vec2<f32>(textureDimensions(src));
+  let uv = fc.xy * 0.5 * ts;
+  var c = tap(uv) * 4.0;
+  c += (tap(uv + ts * vec2<f32>(1.0, 0.0)) + tap(uv - ts * vec2<f32>(1.0, 0.0)) + tap(uv + ts * vec2<f32>(0.0, 1.0)) + tap(uv - ts * vec2<f32>(0.0, 1.0))) * 2.0;
+  c += tap(uv + ts) + tap(uv - ts) + tap(uv + ts * vec2<f32>(1.0, -1.0)) + tap(uv + ts * vec2<f32>(-1.0, 1.0));
+  return vec4<f32>(c / 16.0, 1.0);
+}
+`
+
+// The camera's last step: the glare mixed in, the white balance, the view transform, a dither against banding.
+export const DISPLAY = /* wgsl */ `
+${SIM_COMMON}
+${RENDER_COMMON}
+${VIEW_TRANSFORMS_WGSL}
+@group(0) @binding(2) var image: texture_2d<f32>; // the accumulated history
+@group(0) @binding(3) var glareTex: texture_2d<f32>; // the glare's levels summed (GLARE), at half size
+@group(0) @binding(4) var smp: sampler;
+@group(0) @binding(5) var lut: texture_2d<f32>; // the ACES 2.0 LUT: 65 slices of 65 x 65 stacked (blue by slice)
+@group(0) @binding(6) var lutSampler: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
+// As the Lookdev lab shows its image: ACES 2.0 from the LUT (AgX until it has loaded), or AgX, PBR Neutral or the
+// plain sRGB curve on the image carried into Rec.709.
+fn view(c: vec3<f32>) -> vec3<f32> {
+  let v = u32(R.scene.z + 0.5);
+  if (v == 0u && R.scene.w > 0.5) { return aces2(c); }
+  var r = max(AP1_TO_REC709 * c, vec3<f32>(0.0));
+  if (v == 2u) { r = PBRNeutralToneMapping(r); }
+  else if (v != 3u) { r = AgXToneMapping(r); }
+  return srgbOETF(r);
+}
+
+@fragment
+fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  var c = textureLoad(image, vec2<i32>(fc.xy), 0).xyz;
+  let k = R.camera.y;
+  if (k > 0.0) {
+    let glare = textureSampleLevel(glareTex, smp, fc.xy / vec2<f32>(textureDimensions(image)), 0.0).xyz / max(R.camera.z, 1.0);
+    c = c * (1.0 - k) + glare * k;
+  }
   let balanced = vec3<f32>(dot(R.wb0.xyz, c), dot(R.wb1.xyz, c), dot(R.wb2.xyz, c));
-  let mapped = view(max(balanced, vec3<f32>(0.0)));
-  return Out(vec4<f32>(mapped + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0), vec4<f32>(c, 1.0));
+  return vec4<f32>(view(max(balanced, vec3<f32>(0.0))) + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0);
 }
 `
 

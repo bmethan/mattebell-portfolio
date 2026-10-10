@@ -91,7 +91,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Camera',
-    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze, or the Lookdev lab’s cyc in its charcoal or gray, the floor sweeping up into a wall behind the fire, lit by the fire too.',
+    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. The shutter is a film camera’s at 24 frames a second, 180 degrees by default (open 1/48 s): each sample along a ray takes its own moment within it and reads the gas where the flow had it then, so fast flames streak as they do on film. The lens scatters a few percent of the light it passes (4% by default) into a wide, soft glare, by a chain of blurs that keeps the light’s energy (Jimenez’s, from Call of Duty), which shows only around what is far brighter than its surroundings, as the flames’ cores are. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze, or the Lookdev lab’s cyc in its charcoal or gray, the floor sweeping up into a wall behind the fire, lit by the fire too.',
   ],
   [
     'Environments',
@@ -758,6 +758,10 @@ export default function PyroLab() {
                     <Slider label="Exposure" min={-2} max={16} step={0.25} value={pyro.exposure} digits={2} unit=" EV" onChange={v => update({ exposure: v })} />
                   )}
                   <Slider label="White balance" min={2000} max={10000} step={100} value={pyro.whiteBalance} digits={0} unit=" K" onChange={v => update({ whiteBalance: v })} />
+                </div>
+                <div className="lab-row">
+                  <Slider label="Shutter" min={0} max={360} step={15} value={pyro.shutter} digits={0} unit={'°'} onChange={v => update({ shutter: v })} />
+                  <Slider label="Glare" min={0} max={10} step={0.5} value={pyro.glare * 100} digits={1} unit="%" onChange={v => update({ glare: v / 100 })} />
                 </div>
                 <div className="lab-row">
                   <Group label="View">

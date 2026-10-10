@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PROJECT, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -149,6 +149,21 @@ const norm = (a: Vec3): Vec3 => {
   return [a[0] / l, a[1] / l, a[2] / l]
 }
 
+// The frame's targets and the bind groups of the passes over them (see ensureTargets, postGroups).
+interface Targets {
+  w: number
+  h: number
+  hdr: GPUTexture
+  hist: [GPUTexture, GPUTexture]
+  glare: GPUTexture
+  glareViews: GPUTextureView[]
+  resolve: [GPUBindGroup, GPUBindGroup]
+  glareFirst: [GPUBindGroup, GPUBindGroup]
+  glareDown: (GPUBindGroup | null)[]
+  glareUp: (GPUBindGroup | null)[]
+  display: [GPUBindGroup, GPUBindGroup]
+}
+
 interface Pipes {
   fireSum: GPUComputePipeline
   fireTotal: GPUComputePipeline
@@ -192,6 +207,10 @@ interface Pipes {
   light: GPUComputePipeline
   render: GPURenderPipeline
   resolve: GPURenderPipeline
+  display: GPURenderPipeline
+  glareFirst: GPURenderPipeline
+  glareDown: GPURenderPipeline
+  glareUp: GPURenderPipeline
   upres: GPUComputePipeline
 }
 
@@ -323,7 +342,20 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, render, resolve] = await Promise.all([
+  const displayModule = d.createShaderModule({ code: DISPLAY })
+  const glareModule = d.createShaderModule({ code: GLARE })
+  const glarePipe = (entryPoint: string, add: boolean) =>
+    d.createRenderPipelineAsync({
+      layout: 'auto',
+      vertex: { module: glareModule, entryPoint: 'vs' },
+      fragment: {
+        module: glareModule,
+        entryPoint,
+        targets: [{ format: 'rgba16float', blend: add ? { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } : undefined }],
+      },
+      primitive: { topology: 'triangle-list' },
+    })
+  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -376,11 +408,20 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: resolveModule, entryPoint: 'vs' },
-      fragment: { module: resolveModule, entryPoint: 'fs', targets: [{ format }, { format: 'rgba16float' }] },
+      fragment: { module: resolveModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
     }),
+    d.createRenderPipelineAsync({
+      layout: 'auto',
+      vertex: { module: displayModule, entryPoint: 'vs' },
+      fragment: { module: displayModule, entryPoint: 'fs', targets: [{ format }] },
+      primitive: { topology: 'triangle-list' },
+    }),
+    glarePipe('fsDownFirst', false),
+    glarePipe('fsDown', false),
+    glarePipe('fsUp', true),
   ])
-  return { fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, render, resolve }
+  return { fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp }
 }
 
 export function prewarmPyro() {
@@ -471,7 +512,7 @@ export class PyroEngine {
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
   private simData = new ArrayBuffer(256)
-  private renderData = new Float32Array(108)
+  private renderData = new Float32Array(112)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
@@ -481,7 +522,7 @@ export class PyroEngine {
   private blueTex: GPUTexture
   // Temporal accumulation: this frame's march (high dynamic range), the history it blends into (two, swapped each
   // frame), the blend's uniform, and how many frames have accumulated since anything changed.
-  private targets: { w: number; h: number; hdr: GPUTexture; hist: [GPUTexture, GPUTexture]; groups: [GPUBindGroup, GPUBindGroup] } | null = null
+  private targets: Targets | null = null
   private taaBuf: GPUBuffer
   private histIndex = 0
   private taaCount = 0
@@ -525,6 +566,7 @@ export class PyroEngine {
   private lut: GPUTexture
   private lutSampler: GPUSampler
   private lutReady = false
+  private glareSampler: GPUSampler
   private noiseSampler: GPUSampler
   private pipes: Pipes | null = null
   private grids: Grids | null = null
@@ -632,6 +674,7 @@ export class PyroEngine {
     this.syncEnv()
     this.lut = d.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.lutSampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' })
+    this.glareSampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' })
     void loadAcesLutGPU(d).then(lut => {
       if (!lut) return
       if (this.disposed) {
@@ -641,7 +684,7 @@ export class PyroEngine {
       this.lut.destroy()
       this.lut = lut
       this.lutReady = true
-      if (this.targets && this.pipes) this.targets.groups = this.resolveGroups(this.targets.hdr, this.targets.hist)
+      if (this.targets && this.pipes) Object.assign(this.targets, this.postGroups(this.targets.hdr, this.targets.hist, this.targets.glareViews))
       this.needsRender = true
       this.taaCount = 0
       this.kick()
@@ -985,7 +1028,7 @@ export class PyroEngine {
         fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2)]),
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }]),
       },
     }
     this.resetSkin()
@@ -1720,10 +1763,14 @@ export class PyroEngine {
     r.set([stage, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
     r.set(envData, 60)
     r.set(rim, 100)
+    // The camera: a film camera's shutter at 24 frames a second (180 degrees is open 1/48 s), and the glare's share and
+    // levels.
+    r.set([(s.shutter / 360) / 24, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, 0], 108)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
-  // The accumulation targets at the canvas's size (made again, and the history dropped, when it changes).
+  // The frame's targets at the canvas's size (made again, and the history dropped, when it changes): the march's
+  // image, the accumulated history (two, swapped each frame), and the glare's chain of mips at half size.
   private ensureTargets() {
     const w = this.canvas.width
     const h = this.canvas.height
@@ -1731,31 +1778,79 @@ export class PyroEngine {
     if (this.targets) {
       this.targets.hdr.destroy()
       this.targets.hist.forEach(t => t.destroy())
+      this.targets.glare.destroy()
     }
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
     const tex = () => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage })
     const hdr = tex()
     const hist: [GPUTexture, GPUTexture] = [tex(), tex()]
-    this.targets = { w, h, hdr, hist, groups: this.resolveGroups(hdr, hist) }
+    const gw = Math.max(1, w >> 1)
+    const gh = Math.max(1, h >> 1)
+    const levels = Math.max(1, Math.min(GLARE_LEVELS, Math.floor(Math.log2(Math.min(gw, gh))) + 1))
+    const glare = this.device.createTexture({ size: [gw, gh], format: 'rgba16float', usage, mipLevelCount: levels })
+    const glareViews = Array.from({ length: levels }, (_, i) => glare.createView({ baseMipLevel: i, mipLevelCount: 1 }))
+    this.targets = { w, h, hdr, hist, glare, glareViews, ...this.postGroups(hdr, hist, glareViews) }
     this.taaCount = 0
     return this.targets
   }
-  // The resolve pass's bind groups, one for each history it reads (made again when the ACES 2.0 LUT arrives).
-  private resolveGroups(hdr: GPUTexture, hist: [GPUTexture, GPUTexture]): [GPUBindGroup, GPUBindGroup] {
+  // The bind groups of the passes after the march, for each history they read (made again when the ACES 2.0 LUT
+  // arrives): the accumulation, the glare's first downsample (from the history just written), its levels each from the
+  // one before (down) or after (up), and the display.
+  private postGroups(hdr: GPUTexture, hist: [GPUTexture, GPUTexture], glareViews: GPUTextureView[]) {
     const p = this.pipes!
-    const group = (k: number) =>
-      this.device.createBindGroup({
-        layout: p.resolve.getBindGroupLayout(0),
-        entries: [
-          { binding: 1, resource: { buffer: this.renderBuf } },
-          { binding: 2, resource: hdr.createView() },
-          { binding: 3, resource: hist[k].createView() },
-          { binding: 4, resource: { buffer: this.taaBuf } },
+    const d = this.device
+    const group = (pipe: GPURenderPipeline, entries: GPUBindGroupEntry[]) => d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries })
+    const R = { binding: 1, resource: { buffer: this.renderBuf } }
+    const src = (pipe: GPURenderPipeline, view: GPUTextureView) => group(pipe, [{ binding: 0, resource: view }, { binding: 1, resource: this.glareSampler }])
+    const both = <T>(f: (k: number) => T): [T, T] => [f(0), f(1)]
+    return {
+      resolve: both(k => group(p.resolve, [{ binding: 2, resource: hdr.createView() }, { binding: 3, resource: hist[k].createView() }, { binding: 4, resource: { buffer: this.taaBuf } }])),
+      glareFirst: both(k => src(p.glareFirst, hist[k].createView())),
+      glareDown: glareViews.map((_, i) => (i > 0 ? src(p.glareDown, glareViews[i - 1]) : null)),
+      glareUp: glareViews.map((_, i) => (i < glareViews.length - 1 ? src(p.glareUp, glareViews[i + 1]) : null)),
+      display: both(k =>
+        group(p.display, [
+          R,
+          { binding: 2, resource: hist[k].createView() },
+          { binding: 3, resource: glareViews[0] },
+          { binding: 4, resource: this.glareSampler },
           { binding: 5, resource: this.lut.createView() },
           { binding: 6, resource: this.lutSampler },
-        ],
-      })
-    return [group(0), group(1)]
+        ]),
+      ),
+    }
+  }
+  // After the march: the accumulation into the next history, the glare's chain (if any), and the display to the
+  // screen. stamps: for the profiler, GPU timestamps around each of them in turn from query base on.
+  private post(enc: GPUCommandEncoder, screen: GPUTexture, t: Targets, stamps?: { qs: GPUQuerySet; base: number }) {
+    const p = this.pipes!
+    const next = 1 - this.histIndex
+    const black = { r: 0, g: 0, b: 0, a: 1 }
+    const draw = (view: GPUTextureView, pipe: GPURenderPipeline, group: GPUBindGroup, load: boolean, timestampWrites?: GPURenderPassTimestampWrites) => {
+      const rp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: load ? 'load' : 'clear', storeOp: 'store', clearValue: black }], timestampWrites })
+      rp.setPipeline(pipe)
+      rp.setBindGroup(0, group)
+      rp.draw(3)
+      rp.end()
+    }
+    let q = stamps?.base ?? 0
+    const stamp = (begin: boolean, end: boolean): GPURenderPassTimestampWrites | undefined => {
+      if (!stamps || (!begin && !end)) return undefined
+      const w: GPURenderPassTimestampWrites = { querySet: stamps.qs }
+      if (begin) w.beginningOfPassWriteIndex = q
+      if (end) w.endOfPassWriteIndex = q + 1
+      if (end) q += 2
+      return w
+    }
+    draw(t.hist[next].createView(), p.resolve, t.resolve[this.histIndex], false, stamp(true, true))
+    if (this.state.glare > 0) {
+      const L = t.glareViews.length
+      draw(t.glareViews[0], p.glareFirst, t.glareFirst[next], false, stamp(true, L === 1))
+      for (let i = 1; i < L; i++) draw(t.glareViews[i], p.glareDown, t.glareDown[i]!, false)
+      for (let i = L - 2; i >= 0; i--) draw(t.glareViews[i], p.glareUp, t.glareUp[i]!, true, stamp(false, i === 0))
+    }
+    draw(screen.createView(), p.display, t.display[next], false, stamp(true, true))
+    this.histIndex = next
   }
 
   private upresActive() {
@@ -1794,6 +1889,7 @@ export class PyroEngine {
           { binding: 32, resource: { buffer: g.ballSheet } },
           { binding: 33, resource: this.envTex.createView() },
           { binding: 34, resource: v(g.light2) },
+          { binding: 35, resource: v(g.vel[0]) },
         ],
       })
       this.upres = { tex, held, group, render }
@@ -1854,27 +1950,15 @@ export class PyroEngine {
       pass.end()
       this.lightDirty = false
     }
-    let pass = enc.beginRenderPass({
+    const pass = enc.beginRenderPass({
       colorAttachments: [{ view: t.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
     })
     pass.setPipeline(p.render)
     pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.render : g.bg.render)
     pass.draw(3)
     pass.end()
-    // Read the last history, write the next.
-    const next = 1 - this.histIndex
-    pass = enc.beginRenderPass({
-      colorAttachments: [
-        { view: screen.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
-        { view: t.hist[next].createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
-      ],
-    })
-    pass.setPipeline(p.resolve)
-    pass.setBindGroup(0, t.groups[this.histIndex])
-    pass.draw(3)
-    pass.end()
+    this.post(enc, screen, t)
     this.device.queue.submit([enc.finish()])
-    this.histIndex = next
     this.taaCount++
     this.renderFrame++
     // Paused, keep drawing until the history has settled.
@@ -2223,18 +2307,9 @@ export class PyroEngine {
     rp.draw(3)
     rp.end()
     labels.push('accumulate')
-    const ap = enc.beginRenderPass({
-      colorAttachments: [
-        { view: screen.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
-        { view: t.hist[1 - this.histIndex].createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
-      ],
-      timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * k + 2, endOfPassWriteIndex: 2 * k + 3 },
-    })
-    ap.setPipeline(p.resolve)
-    ap.setBindGroup(0, t.groups[this.histIndex])
-    ap.draw(3)
-    ap.end()
-    this.histIndex = 1 - this.histIndex
+    if (this.state.glare > 0) labels.push('glare')
+    labels.push('display')
+    this.post(enc, screen, t, { qs, base: 2 * k + 2 })
     enc.resolveQuerySet(qs, 0, labels.length * 2, resolve, 0)
     enc.copyBufferToBuffer(resolve, 0, read, 0, labels.length * 16)
     d.queue.submit([enc.finish()])

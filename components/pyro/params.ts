@@ -64,6 +64,8 @@ export interface PyroState {
   exposureComp: number // EV of compensation on the metered exposure: positive brightens, as on a camera's dial
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
   view: ViewTransform // the view transform the image is shown through, as in the Lookdev lab
+  shutter: number // degrees: a film camera's shutter angle at 24 frames a second (180 is open 1/48 s; 0, no motion blur)
+  glare: number // the share of the light the lens scatters into its glare (0 to 0.1)
   // One of the Lookdev lab's HDR environments lighting the scene (environment.ts), its softbox rig ('rig': key, fill
   // and rim, engine.ts RIG), or none (the sun and a flat sky). With a map, the light azimuth turns it, the Sky EV sets
   // its illuminance on open ground, and the floor runs to the horizon under it. With the rig, the light azimuth and
@@ -126,6 +128,8 @@ export const PYRO_DEFAULTS: PyroState = {
   exposureComp: 0,
   whiteBalance: 5000,
   view: 'aces',
+  shutter: 180,
+  glare: 0.04,
   env: 'none',
   rigKey: true,
   rigFill: true,

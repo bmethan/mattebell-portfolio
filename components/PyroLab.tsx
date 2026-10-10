@@ -89,7 +89,11 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Camera',
-    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze.',
+    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze, or the Lookdev lab’s cyc in its charcoal or gray, the floor sweeping up into a wall behind the fire, lit by the fire too.',
+  ],
+  [
+    'Environments',
+    'The Lookdev lab’s four HDR environments from Poly Haven can light the scene. A volume renderer cannot sample a map at every scattering event at this frame rate, so each map’s brightest light, where it has one, is pulled out as a key that casts the smoke’s shadows (the midday sun, 68% of that map’s light within a degree of it; the photo studio’s main softbox, 43% within 15 degrees), and the rest is kept as three bands of spherical harmonics: convolved with the smoke’s phase function for its scattering, and with the cosine for the floor and the ball (Ramamoorthi and Hanrahan). The overcast sky and the sunset’s glow have no key, so they light the smoke softly from all around. Below the horizon the map gives way to the floor, lit by the whole environment. The Turn slider turns the map; the Environment EV is its illuminance on open ground, key included, which auto exposure meters.',
   ],
   [
     'Export',
@@ -735,16 +739,22 @@ export default function PyroLab() {
                   </Group>
                 </div>
                 <div className="lab-row">
-                  {pyro.env === 'none' && (
-                    <Group label="Background">
+                  <Group label="Background">
+                    {pyro.env === 'none' && (
                       <Pill on={pyro.background === 'studio'} onClick={() => update({ background: 'studio' })}>
                         Studio
                       </Pill>
-                      <Pill on={pyro.background === 'sky'} onClick={() => update({ background: 'sky' })}>
-                        Sky
-                      </Pill>
-                    </Group>
-                  )}
+                    )}
+                    <Pill on={pyro.background === 'sky' || (pyro.env !== 'none' && pyro.background === 'studio')} onClick={() => update({ background: 'sky' })}>
+                      Sky
+                    </Pill>
+                    <Pill on={pyro.background === 'charcoal'} onClick={() => update({ background: 'charcoal' })}>
+                      Charcoal cyc
+                    </Pill>
+                    <Pill on={pyro.background === 'gray'} onClick={() => update({ background: 'gray' })}>
+                      Gray cyc
+                    </Pill>
+                  </Group>
                   <Group label="Sampling">
                     <Pill on={!pyro.tricubic} onClick={() => update({ tricubic: false })}>
                       Trilinear

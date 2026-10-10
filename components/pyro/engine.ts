@@ -1656,7 +1656,9 @@ export class PyroEngine {
     r.set([...sun, s.anisotropy], 16)
     r.set([...sunLux, s.densityScale], 20)
     r.set([...SKY_COLOUR.map(v => v * luxOfEV(s.skyEV)), s.albedo], 24)
-    r.set([0.14, 0.14, 0.14, 3.2], 28)
+    // The floor's albedo: the lab's own, or the Lookdev lab's cyc in charcoal (its studio floor) or gray.
+    const floorAlbedo = s.background === 'charcoal' ? 0.05 : s.background === 'gray' ? 0.18 : 0.14
+    r.set([floorAlbedo, floorAlbedo, floorAlbedo, 3.2], 28)
     r.set([this.canvas.width, this.canvas.height, this.simTime, fire ? s.flameDetail : 0], 32)
     // Cross-fade weights: each layer is weighted by a triangle of its age, 0 when it was just reset, 1 half a period on.
     const ageA = (this.simTime / DETAIL_PERIOD) % 1
@@ -1668,7 +1670,9 @@ export class PyroEngine {
     r.set([...wb[0], s.wind], 44)
     r.set([...wb[1], s.tricubic ? 1 : 0], 48)
     r.set([...wb[2], this.upresActive() && this.upres ? 1 : 0], 52)
-    r.set([s.background === 'sky' || e ? 1 : 0, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
+    const cyc = s.background === 'charcoal' || s.background === 'gray'
+    const stage = cyc ? 2 : s.background === 'sky' || e ? 1 : 0
+    r.set([stage, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
     r.set(envData, 60)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }

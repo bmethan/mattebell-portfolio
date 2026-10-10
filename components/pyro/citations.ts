@@ -261,6 +261,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.3832/ifor2254-010',
   },
   {
+    id: 'ramamoorthi-hanrahan',
+    group: 'Rendering',
+    authors: 'Ravi Ramamoorthi, Pat Hanrahan',
+    title: 'An Efficient Representation for Irradiance Environment Maps',
+    venue: 'SIGGRAPH 2001',
+    year: '2001',
+    url: 'https://doi.org/10.1145/383259.383317',
+  },
+  {
     id: 'stbn',
     group: 'Rendering',
     authors: 'Alan Wolfe, Nathan Morrical, Tomas Akenine-Möller, Ravi Ramamoorthi',

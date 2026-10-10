@@ -3,6 +3,11 @@ import { AP1_WGSL, VIEW_TRANSFORMS_WGSL } from '../lab/viewTransforms'
 import { FIRE_BANDS } from './physics'
 import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
+// The cyc's floor ends this far behind the fire (m), past the back of the gas's domain (about 0.48 m), and sweeps up
+// this radius into a wall 2.3 m back.
+export const CYC_Z = -1.1
+export const CYC_R = 1.2
+
 // WGSL for the pyro lab: a gas solver on a staggered (MAC) grid, as production FX solvers lay it out, and a
 // volume renderer for it.
 //
@@ -1962,7 +1967,7 @@ struct RParams {
   wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear ACEScg; wind (m/s) in the first row's w
   wb1: vec4<f32>,      // (w: sample the scalars tricubically, 0 or 1)
   wb2: vec4<f32>,      // (w: render the smoke from the upres grid, 0 or 1)
-  scene: vec4<f32>,    // background: the sky and a floor to the horizon (1) or a studio's black (0); extinction in
+  scene: vec4<f32>,    // the stage: a studio's black (0), the sky and a floor to the horizon (1), the cyc (2); extinction in
                        // green relative to 550 nm; the view transform (0 ACES 2.0, 1 AgX, 2 PBR Neutral, 3 Standard);
                        // whether the ACES 2.0 LUT has loaded (0 or 1)
   env: vec4<f32>,      // an HDR environment (0 or 1); cos and sin of its turn into the map's frame; its scale to lux
@@ -2286,6 +2291,41 @@ fn envScatter(rd: vec3<f32>, g: f32) -> vec3<f32> { return shAt(toEnv(rd), 1.0, 
 // Irradiance on a surface facing n, lux: the map convolved with the clamped cosine (bands pi, 2 pi / 3, pi / 4;
 // Ramamoorthi and Hanrahan 2001).
 fn envIrradiance(n: vec3<f32>) -> vec3<f32> { return shAt(toEnv(n), 3.14159265, 2.0943951, 0.78539816); }
+// The cyc (the Lookdev lab's stage, sized for the fire): the floor runs to CYC_Z behind it, sweeps up a quarter circle
+// of radius CYC_R into a wall, as wide as the view. The nearest hit along a ray and the surface's normal there (t is
+// 1e9 for none).
+const CYC_Z = ${wf(CYC_Z)};
+const CYC_R = ${wf(CYC_R)};
+fn cycHit(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+  var best = vec4<f32>(1e9, 0.0, 1.0, 0.0);
+  if (rd.y < -1e-5) {
+    let t = -ro.y / rd.y;
+    if (ro.z + rd.z * t >= CYC_Z) { best = vec4<f32>(t, 0.0, 1.0, 0.0); }
+  }
+  // The sweep: a circle in (y, z) about (CYC_R, CYC_Z); its lower back quarter, facing the camera and up.
+  let oy = ro.y - CYC_R;
+  let oz = ro.z - CYC_Z;
+  let a = rd.y * rd.y + rd.z * rd.z;
+  let b = oy * rd.y + oz * rd.z;
+  let disc = b * b - a * (oy * oy + oz * oz - CYC_R * CYC_R);
+  if (disc > 0.0 && a > 1e-8) {
+    let s = sqrt(disc);
+    for (var k = 0; k < 2; k++) {
+      let t = (-b + select(-s, s, k == 1)) / a;
+      let py = ro.y + rd.y * t;
+      let pz = ro.z + rd.z * t;
+      if (t > 0.0 && t < best.x && pz <= CYC_Z && py <= CYC_R) {
+        best = vec4<f32>(t, 0.0, (CYC_R - py) / CYC_R, (CYC_Z - pz) / CYC_R);
+      }
+    }
+  }
+  if (rd.z < -1e-5) {
+    let t = (CYC_Z - CYC_R - ro.z) / rd.z;
+    if (t > 0.0 && t < best.x && ro.y + rd.y * t >= CYC_R) { best = vec4<f32>(t, 0.0, 0.0, 1.0); }
+  }
+  return best;
+}
+
 // The map itself, softened, as the backdrop (the Lookdev lab's direction mapping).
 fn envBackdrop(d: vec3<f32>) -> vec3<f32> {
   let e = toEnv(d);
@@ -2579,7 +2619,15 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let frame = R.camRight.w;
   let jitter = jitterAt(fc.xy, frame);
 
-  let tFloor = select(1e9, -ro.y / rd.y, rd.y < -1e-5);
+  // The stage under and behind the fire: the floor's plane, or the cyc (and the normal where the ray meets it).
+  var tFloor = select(1e9, -ro.y / rd.y, rd.y < -1e-5);
+  var nFloor = vec3<f32>(0.0, 1.0, 0.0);
+  if (R.scene.x > 1.5) {
+    let cy = cycHit(ro, rd);
+    tFloor = cy.x;
+    nFloor = cy.yzw;
+  }
+  let skyStage = R.scene.x > 0.5 && R.scene.x < 1.5;
   let box = boxHit(ro, rd, P.origin.xyz, domainHi());
   let tBall = ballHit(ro, rd);
   let tEnd = min(min(box.y, tFloor), tBall);
@@ -2690,7 +2738,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     col += T * (alb * INV_PI * E + glow);
   } else if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     let pf = ro + rd * tFloor;
-    // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon.
+    let nf = nFloor;
+    // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon; the cyc is lit
+    // as it stands.
     let fade = select(exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
     // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
     let sb = boxHit(pf, sun, P.origin.xyz, domainHi());
@@ -2705,7 +2755,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     if (P.ball.w > 0.0) {
       let tb = P.ball.xyz - pf;
       let d2 = dot(tb, tb);
-      ballSky = 1.0 - P.ball.w * P.ball.w / d2 * max(tb.y, 0.0) / sqrt(d2);
+      ballSky = 1.0 - P.ball.w * P.ball.w / d2 * max(dot(tb, nf), 0.0) / sqrt(d2);
     }
     var skyVis = vec3<f32>(1.0);
     let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
@@ -2722,17 +2772,18 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       if (lum <= 0.0) { continue; }
       let d = fireLight[4u + 2u * b].xyz - pf;
       let r2 = dot(d, d) + BAND_R2;
-      fireLux += lum * max(d.y, 0.0) / (sqrt(r2) * r2);
+      fireLux += lum * max(dot(d, nf), 0.0) / (sqrt(r2) * r2);
     }
     let fireE = fireColour * fireLux;
-    let skyE = select(R.skyCol.xyz, envIrradiance(vec3<f32>(0.0, 1.0, 0.0)), envOn());
-    let E = R.sunCol.xyz * max(sun.y, 0.0) * shadow + skyE * skyVis * ballSky + fireE;
+    // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
+    let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
+    let E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
     var floorL = R.floorCol.xyz * INV_PI * E * fade;
     // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
     let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
-    if (R.scene.x > 0.5) { floorL = mix(floorL, haze, 1.0 - exp(-tFloor / 40.0)); }
+    if (skyStage) { floorL = mix(floorL, haze, 1.0 - exp(-tFloor / 40.0)); }
     col += T * floorL;
-  } else if (R.scene.x > 0.5 && tBall >= 1e8) {
+  } else if (skyStage && tBall >= 1e8) {
     // The sky: a dome of the sky's radiance (its illuminance on the ground over pi), a little brighter toward the
     // horizon (at night too dim to see); or the HDR environment.
     col += T * select(R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0))), envBackdrop(rd), envOn());

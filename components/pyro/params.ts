@@ -68,7 +68,9 @@ export interface PyroState {
   // With one, the light azimuth turns it, the Sky EV sets its illuminance on open ground, and the floor runs to the
   // horizon under it.
   env: Env
-  background: 'studio' | 'sky' // black around the floor's pool of light, or the sky and a floor to the horizon
+  // Black around the floor's pool of light, the sky (or the environment) and a floor to the horizon, or the Lookdev
+  // lab's cyc (the floor sweeping up into a wall behind the fire) in its charcoal or its gray.
+  background: 'studio' | 'sky' | 'charcoal' | 'gray'
   tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
   upres: boolean // a smoke source's density also on a grid twice as fine (wavelet turbulence)
   upresStrength: number // its turbulence, 1 = Kolmogorov's next band

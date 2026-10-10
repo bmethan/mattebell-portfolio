@@ -7,6 +7,7 @@ import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
 import { writeVdb, type VdbGrid } from './vdb'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
+import { REC709_TO_AP1, ap1Luminance, loadAcesLutGPU, mat3Apply, viewIndex } from '../lab/viewTransforms'
 
 export const SIM_DT = 1 / 30
 const MAX_STEPS_PER_FRAME = 2
@@ -54,8 +55,12 @@ const TAA_WEIGHT = 0.2 // the current frame's share of the accumulated image whi
 const STBN_SLICES = 16
 const STBN_URL = '/pyro/stbn-64x64x16.bin'
 const TAA_SETTLE = 24 // frames a paused image accumulates (a running average) before it stops redrawing
-// The sun's and the sky's colours, each scaled to unit luminance (the EV controls set the illuminance).
-const unitLum = (c: Vec3): Vec3 => c.map(v => v / (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])) as Vec3
+// The sun's and the sky's colours (authored in Rec.709, carried into ACEScg, the working space), each scaled to unit
+// luminance (the EV controls set the illuminance).
+const unitLum = (c709: Vec3): Vec3 => {
+  const c = mat3Apply(REC709_TO_AP1, c709)
+  return c.map(v => v / ap1Luminance(c)) as Vec3
+}
 const SUN_COLOUR = unitLum([1.0, 0.93, 0.84])
 const SKY_COLOUR = unitLum([0.42, 0.52, 0.72])
 
@@ -478,6 +483,10 @@ export class PyroEngine {
   private upresInit = true
   private upresWasActive = false
   private dummy3d: GPUTexture
+  // The ACES 2.0 view's LUT (a 1 x 1 stand-in until it has loaded; AgX shows meanwhile), shared with the Lookdev lab.
+  private lut: GPUTexture
+  private lutSampler: GPUSampler
+  private lutReady = false
   private noiseSampler: GPUSampler
   private pipes: Pipes | null = null
   private grids: Grids | null = null
@@ -581,6 +590,22 @@ export class PyroEngine {
     this.ballBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
+    this.lut = d.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING })
+    this.lutSampler = d.createSampler({ magFilter: 'linear', minFilter: 'linear' })
+    void loadAcesLutGPU(d).then(lut => {
+      if (!lut) return
+      if (this.disposed) {
+        lut.destroy()
+        return
+      }
+      this.lut.destroy()
+      this.lut = lut
+      this.lutReady = true
+      if (this.targets && this.pipes) this.targets.groups = this.resolveGroups(this.targets.hdr, this.targets.hist)
+      this.needsRender = true
+      this.taaCount = 0
+      this.kick()
+    })
     this.curlTex = d.createTexture({
       size: [NOISE_SIZE, NOISE_SIZE, NOISE_SIZE],
       dimension: '3d',
@@ -1591,11 +1616,11 @@ export class PyroEngine {
     r.set([1 - Math.abs(2 * ageA - 1), 1 - Math.abs(2 * ageB - 1), s.detail, 1 / (8 * s.detailScale)], 36)
     // A flame's eddies rise at about half the speed of the gas in the flame, 1.9 Q^(1/5) m/s with Q in kW
     // (McCaffrey 1979).
-    r.set([fire ? 1 : 0, fire ? SOOT_CHROMA[0] : 1, fire ? SOOT_CHROMA[1] : 1, 0.5 * 1.9 * s.heatRelease ** 0.2], 40)
+    r.set([fire ? 1 : 0, fire ? SOOT_CHROMA[0] : 1, fire ? SOOT_CHROMA[2] : 1, 0.5 * 1.9 * s.heatRelease ** 0.2], 40)
     r.set([...wb[0], s.wind], 44)
     r.set([...wb[1], s.tricubic ? 1 : 0], 48)
     r.set([...wb[2], this.upresActive() && this.upres ? 1 : 0], 52)
-    r.set([s.background === 'sky' ? 1 : 0, 0, 0, 0], 56)
+    r.set([s.background === 'sky' ? 1 : 0, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
   }
 
@@ -1612,6 +1637,12 @@ export class PyroEngine {
     const tex = () => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage })
     const hdr = tex()
     const hist: [GPUTexture, GPUTexture] = [tex(), tex()]
+    this.targets = { w, h, hdr, hist, groups: this.resolveGroups(hdr, hist) }
+    this.taaCount = 0
+    return this.targets
+  }
+  // The resolve pass's bind groups, one for each history it reads (made again when the ACES 2.0 LUT arrives).
+  private resolveGroups(hdr: GPUTexture, hist: [GPUTexture, GPUTexture]): [GPUBindGroup, GPUBindGroup] {
     const p = this.pipes!
     const group = (k: number) =>
       this.device.createBindGroup({
@@ -1621,11 +1652,11 @@ export class PyroEngine {
           { binding: 2, resource: hdr.createView() },
           { binding: 3, resource: hist[k].createView() },
           { binding: 4, resource: { buffer: this.taaBuf } },
+          { binding: 5, resource: this.lut.createView() },
+          { binding: 6, resource: this.lutSampler },
         ],
       })
-    this.targets = { w, h, hdr, hist, groups: [group(0), group(1)] }
-    this.taaCount = 0
-    return this.targets
+    return [group(0), group(1)]
   }
 
   private upresActive() {

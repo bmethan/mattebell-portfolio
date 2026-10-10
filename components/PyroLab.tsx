@@ -10,6 +10,7 @@ import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
 import { citeAuthors } from './lookdev/citations'
 import { Group, Pill, Range, Tabs } from './lab/ui'
 import DeviceCheck from './pyro/DeviceCheck'
+import { VIEW_TRANSFORMS } from './lab/viewTransforms'
 
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
 const noSubscribe = () => () => {}
@@ -58,7 +59,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Flames',
-    'Nothing glows but soot. Hot soot emits what it absorbs times the blackbody radiance of its temperature (Kirchhoff’s law), so a flame’s colour and brightness follow from the simulated temperature and soot alone: Planck’s law through the CIE colour matching functions, in absolute units (a blackbody at 2042 K comes out at 600,000 cd/m², the old definition of the candle). The soot’s extinction is the measured 8.7 m²/g of flame smoke and its albedo 0.25, and it absorbs blue more than red (as 1/λ), so it reddens what shines through it. Below about 1000 K its glow is too faint to see, which is where the visible flame ends. A cell’s temperature is an average, and a blackbody’s glow climbs so steeply with temperature that the average glow is far from the glow at the average temperature (the turbulence-radiation interaction), so the renderer adds the temperature fluctuation finer than the grid: its size from the resolved temperature gradient, as large-eddy simulations model a subgrid variance (Pierce and Moin), only its shape from a noise that rises with the flames and churns (Flame detail scales it; 0 renders the cell averages). For the same reason, where fuel is burning the soot radiates at the temperature of the flame sheet it forms in, about 1400 K, rather than its cell’s mean: the burning happens in sheets far thinner than a cell, and the cell spreads their heat over all of it (a thin flame along a burning surface would otherwise never glow). The fire lights its own smoke and the floor: its emitted light is summed on the GPU every step in eight slices of its height, each a point light at its brightness-weighted centre, and each point of the smoke gathers them through the soot in the way, so dense smoke shadows the fire’s light as it does the sun’s. (The floor takes the same eight lights unshadowed: the smoke rises away from the light between them.)',
+    'Nothing glows but soot. Hot soot emits what it absorbs times the blackbody radiance of its temperature (Kirchhoff’s law), so a flame’s colour and brightness follow from the simulated temperature and soot alone: Planck’s law through the CIE colour matching functions, in absolute units (a blackbody at 2042 K comes out at 600,000 cd/m², the old definition of the candle). The colours are worked in ACEScg, whose primaries hold a blackbody’s colour at every temperature a flame reaches, where Rec.709’s lose its blue below about 1900 K. The soot’s extinction is the measured 8.7 m²/g of flame smoke and its albedo 0.25, and it absorbs blue more than red (as 1/λ), so it reddens what shines through it. Below about 1000 K its glow is too faint to see, which is where the visible flame ends. A cell’s temperature is an average, and a blackbody’s glow climbs so steeply with temperature that the average glow is far from the glow at the average temperature (the turbulence-radiation interaction), so the renderer adds the temperature fluctuation finer than the grid: its size from the resolved temperature gradient, as large-eddy simulations model a subgrid variance (Pierce and Moin), only its shape from a noise that rises with the flames and churns (Flame detail scales it; 0 renders the cell averages). For the same reason, where fuel is burning the soot radiates at the temperature of the flame sheet it forms in, about 1400 K, rather than its cell’s mean: the burning happens in sheets far thinner than a cell, and the cell spreads their heat over all of it (a thin flame along a burning surface would otherwise never glow). The fire lights its own smoke and the floor: its emitted light is summed on the GPU every step in eight slices of its height, each a point light at its brightness-weighted centre, and each point of the smoke gathers them through the soot in the way, so dense smoke shadows the fire’s light as it does the sun’s. (The floor takes the same eight lights unshadowed: the smoke rises away from the light between them.)',
   ],
   [
     'Detail',
@@ -83,7 +84,7 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Camera',
-    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then ACES filmic tone mapping through a fitted curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze.',
+    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (EV 7 for an 80 kW campfire, half a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze.',
   ],
   [
     'Export',
@@ -685,6 +686,15 @@ export default function PyroLab() {
                     <Slider label="Exposure" min={-2} max={16} step={0.25} value={pyro.exposure} digits={2} unit=" EV" onChange={v => update({ exposure: v })} />
                   )}
                   <Slider label="White balance" min={2000} max={10000} step={100} value={pyro.whiteBalance} digits={0} unit=" K" onChange={v => update({ whiteBalance: v })} />
+                </div>
+                <div className="lab-row">
+                  <Group label="View">
+                    {VIEW_TRANSFORMS.map(v => (
+                      <Pill key={v.id} on={pyro.view === v.id} onClick={() => update({ view: v.id })}>
+                        {v.label}
+                      </Pill>
+                    ))}
+                  </Group>
                 </div>
                 <div className="lab-row">
                   <Group label="Background">

@@ -1,9 +1,13 @@
 // Blackbody light for the pyro lab, in absolute photometric units: Planck's spectral radiance integrated against the
 // CIE 1931 colour matching functions (the multi-lobe Gaussian fit of Wyman, Sloan and Shirley 2013, as the lookdev
-// lab uses) from 380 to 780 nm, times 683 lm/W, as linear Rec.709 in cd/m2 (so green carries most of the luminance).
-// Hot soot emits its absorption coefficient times this (Kirchhoff's law), so a flame's brightness follows from its
-// temperature and soot alone. Also the camera's white balance: a Bradford chromatic adaptation from a blackbody white
-// to the display's D65.
+// lab uses) from 380 to 780 nm, times 683 lm/W, in cd/m2, as linear ACEScg, the labs' working space (XYZ to Rec.709,
+// then OpenColorIO's Rec.709 to ACEScg; green carries most of the luminance). ACEScg's primaries hold a blackbody's
+// colour over the whole table, 500 to 3000 K, where Rec.709's lose its blue below about 1900 K and its green below
+// about 850 K: a flame's orange and red, 1000 to 1500 K at its tips, stay as they are rather than clipping. Hot soot emits its absorption coefficient times this (Kirchhoff's
+// law), so a flame's brightness follows from its temperature and soot alone. Also the camera's white balance: a
+// Bradford chromatic adaptation from a blackbody white to the display's D65.
+
+import { AP1_TO_REC709, REC709_TO_AP1, mat3Mul } from '../lab/viewTransforms'
 
 export const BB_MIN_K = 500
 export const BB_MAX_K = 3000
@@ -60,14 +64,14 @@ export function blackbodyXYZ(kelvin: number): [number, number, number] {
   return s
 }
 
-// BB_SIZE entries from BB_MIN_K to BB_MAX_K, as rgba: linear Rec.709 radiance in cd/m2 (a = luminance). Below about
-// 1900 K a blackbody's colour lies outside Rec.709; negative components clip to 0.
+// BB_SIZE entries from BB_MIN_K to BB_MAX_K, as rgba: linear ACEScg radiance in cd/m2 (a = luminance). (Rec.709 is
+// only the way there, unclipped; nothing in the range falls outside ACEScg, and the clip is a guard.)
 export function planckTable(): Float32Array<ArrayBuffer> {
   const out = new Float32Array(BB_SIZE * 4)
   for (let i = 0; i < BB_SIZE; i++) {
     const k = BB_MIN_K + ((BB_MAX_K - BB_MIN_K) * i) / (BB_SIZE - 1)
     const xyz = blackbodyXYZ(k)
-    const rgb = apply(XYZ_TO_REC709, xyz).map(v => Math.max(0, v))
+    const rgb = apply(REC709_TO_AP1, apply(XYZ_TO_REC709, xyz)).map(v => Math.max(0, v))
     out.set([rgb[0], rgb[1], rgb[2], xyz[1]], i * 4)
   }
   return out
@@ -85,9 +89,12 @@ const BRADFORD_INV = [
   [-0.0085287, 0.0400428, 0.9684867],
 ]
 
-// The camera's white balance as a 3x3 on linear Rec.709 (rows): light from a blackbody at `kelvin` comes out
-// neutral, as a camera set to that white balance renders it.
+// The camera's white balance as a 3x3 on linear ACEScg (rows): light from a blackbody at `kelvin` comes out
+// neutral, as a camera set to that white balance renders it. (Worked out on Rec.709, then carried over.)
 export function whiteBalance(kelvin: number): number[][] {
+  return mat3Mul(REC709_TO_AP1, mat3Mul(whiteBalance709(kelvin), AP1_TO_REC709))
+}
+function whiteBalance709(kelvin: number): number[][] {
   const w = blackbodyXYZ(kelvin)
   const src = apply(BRADFORD, w.map(v => v / w[1]))
   const dst = apply(BRADFORD, D65)

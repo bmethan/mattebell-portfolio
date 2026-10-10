@@ -1,6 +1,7 @@
 // The pyro lab's controls: names follow the ones FX artists know from production pyro solvers, in physical units
 // where there are some (physics.ts holds the constants).
 import { FUEL } from './physics'
+import type { ViewTransform } from '../lab/viewTransforms'
 
 export type PyroResolution = 'low' | 'medium' | 'high'
 export type Advection = 'sl' | 'mac' | 'bimocq' // BiMocq2 for a smoke source; a fire then uses MacCormack
@@ -61,6 +62,7 @@ export interface PyroState {
   exposureMode: 'auto' | 'manual'
   exposureComp: number // EV of compensation on the metered exposure: positive brightens, as on a camera's dial
   whiteBalance: number // K: light from a blackbody at this temperature comes out neutral
+  view: ViewTransform // the view transform the image is shown through, as in the Lookdev lab
   background: 'studio' | 'sky' // black around the floor's pool of light, or the sky and a floor to the horizon
   tricubic: boolean // sample the scalars with a cubic B-spline rather than trilinearly
   upres: boolean // a smoke source's density also on a grid twice as fine (wavelet turbulence)
@@ -112,6 +114,7 @@ export const PYRO_DEFAULTS: PyroState = {
   exposureMode: 'auto',
   exposureComp: 0,
   whiteBalance: 5000,
+  view: 'aces',
   background: 'studio',
   tricubic: true,
   upres: true,

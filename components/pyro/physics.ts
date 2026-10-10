@@ -44,9 +44,10 @@ export const SOOT_ALPHA = 1
 export const SOOT_EXTINCTION_633 = 8700 // m2/kg
 export const REF_NM = 550
 export const SOOT_EXTINCTION = SOOT_EXTINCTION_633 * (633 / REF_NM) ** SOOT_ALPHA // m2/kg at 550 nm
-// Extinction relative to green at the effective wavelengths of the display's red and blue primaries: soot dims blue
-// light more than red (which is why the sun turns orange through smoke).
-export const SOOT_CHROMA: [number, number] = [(REF_NM / 612) ** SOOT_ALPHA, (REF_NM / 465) ** SOOT_ALPHA]
+// Extinction in each of the working space's channels relative to 550 nm, at the dominant wavelengths of ACEScg's
+// primaries (625, 534 and 467 nm against its white; Rec.709's are 611, 549 and 464): soot dims blue light more than
+// red (which is why the sun turns orange through smoke). Weighted by luminance they average to about 1.
+export const SOOT_CHROMA: [number, number, number] = [(REF_NM / 625) ** SOOT_ALPHA, (REF_NM / 534) ** SOOT_ALPHA, (REF_NM / 467) ** SOOT_ALPHA]
 
 // Light levels as photographers meter them: an incident meter reading of EV (ISO 100) is 2.5 x 2^EV lux; a camera at
 // EV100 saturates at 1.2 x 2^EV100 cd/m2 (Lagarde and de Rousiers 2014).

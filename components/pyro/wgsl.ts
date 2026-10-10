@@ -1,4 +1,5 @@
 import { BB_MAX_K, BB_MIN_K } from './blackbody'
+import { AP1_WGSL, VIEW_TRANSFORMS_WGSL } from '../lab/viewTransforms'
 import { FIRE_BANDS } from './physics'
 import { CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
@@ -1942,7 +1943,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
+// Colours are linear ACEScg throughout (the labs' working space, viewTransforms.ts): the blackbody table, the sun and
+// the sky, the soot's extinction by channel, the albedos, the white balance.
 export const RENDER_COMMON = /* wgsl */ `
+${AP1_WGSL}
 struct RParams {
   camPos: vec4<f32>,   // position (m), tan of half the vertical field of view
   camFwd: vec4<f32>,   // forward, aspect (width / height)
@@ -1954,11 +1958,13 @@ struct RParams {
   floorCol: vec4<f32>, // floor albedo, radius (m) over which the floor fades to black
   size: vec4<f32>,     // render target width, height, simulation time (s), subgrid flame temperature (1 = the model)
   detail: vec4<f32>,   // weight of detail layer A, of layer B, amount, 1 / (8 x detail scale in m)
-  fire: vec4<f32>,     // source is a fire (0 or 1), extinction in red and in blue relative to green, flame eddies' rise (m/s)
-  wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear Rec.709; wind (m/s) in the first row's w
+  fire: vec4<f32>,     // source is a fire (0 or 1), extinction in red and in blue relative to 550 nm, flame eddies' rise (m/s)
+  wb0: vec4<f32>,      // the camera's white balance, rows of a 3x3 on linear ACEScg; wind (m/s) in the first row's w
   wb1: vec4<f32>,      // (w: sample the scalars tricubically, 0 or 1)
   wb2: vec4<f32>,      // (w: render the smoke from the upres grid, 0 or 1)
-  scene: vec4<f32>,    // background: the sky and a floor to the horizon (1) or a studio's black (0); unused
+  scene: vec4<f32>,    // background: the sky and a floor to the horizon (1) or a studio's black (0); extinction in
+                       // green relative to 550 nm; the view transform (0 ACES 2.0, 1 AgX, 2 PBR Neutral, 3 Standard);
+                       // whether the ACES 2.0 LUT has loaded (0 or 1)
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -1977,13 +1983,13 @@ const INV_2PI = 0.15915494;
 const INV_4PI = 0.07957747;
 const SOOT_KE = ${wf(SOOT_EXTINCTION)}; // m2 per kg of soot, at 550 nm
 
-// Extinction at the reference (green) wavelength, 1/m: a fire's soot by its mass per volume (its partial density), a
-// smoke source's smoke by its density. Red and blue scale by chroma().
+// Extinction at the reference wavelength (550 nm), 1/m: a fire's soot by its mass per volume (its partial density), a
+// smoke source's smoke by its density. Each channel scales by chroma().
 fn sigmaOf(s: vec4<f32>) -> f32 {
   if (R.fire.x > 0.5) { return SOOT_KE * (RHO_T / T_AMB) * max(s.x, 0.0) / SOOT_G; }
   return R.sunCol.w * max(s.x, 0.0);
 }
-fn chroma() -> vec3<f32> { return vec3<f32>(R.fire.y, 1.0, R.fire.z); }
+fn chroma() -> vec3<f32> { return vec3<f32>(R.fire.y, R.scene.y, R.fire.z); }
 
 // Entry and exit distances of a ray through an axis-aligned box.
 fn boxHit(o: vec3<f32>, d: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> vec2<f32> {
@@ -2158,7 +2164,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     let bed = bedMask(worldOf(vec3<f32>(id) + 0.5)) * P.grid.x * P.grid.x;
     b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
   }
-  let lum = dot(e, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let lum = ap1Lum(e);
   sumE[li] = vec4<f32>(e, lum);
   sumP[li] = vec4<f32>(worldOf(vec3<f32>(id) + 0.5) * lum, 0.0);
   sumB[li] = b;
@@ -2386,7 +2392,7 @@ fn offBallShell(w: vec3<f32>) -> f32 {
 
 // The wooden ball's surface. Its grain: a turned pine ball, growth rings around a tilted axis, wavy, the early wood
 // pale and the late wood darker. Then, by the char's depth: scorched brown, black char, the char's cracks (cells of
-// about 2.5 cm, as wood's char crazes), and grey ash in plates.
+// about 2.5 cm, as wood's char crazes), and grey ash in plates. (Colours authored in Rec.709, carried into ACEScg.)
 fn hash33(p: vec3<f32>) -> vec3<f32> {
   let q = vec3<f32>(dot(p, vec3<f32>(127.1, 311.7, 74.7)), dot(p, vec3<f32>(269.5, 183.3, 246.1)), dot(p, vec3<f32>(113.5, 271.9, 124.6)));
   return fract(sin(q) * 43758.5453);
@@ -2422,7 +2428,7 @@ fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> vec3<f32> {
   a = mix(a, vec3<f32>(0.035, 0.03, 0.028), smoothstep(0.1, 0.7, sk.z));
   a *= 1.0 - 0.6 * crack;
   let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
-  return mix(a, vec3<f32>(0.42, 0.41, 0.39), sk.w * mix(0.55, 1.0, plates) * (1.0 - crack));
+  return REC709_TO_AP1 * mix(a, vec3<f32>(0.42, 0.41, 0.39), sk.w * mix(0.55, 1.0, plates) * (1.0 - crack));
 }
 // Kirchhoff again: the surface glows at the blackbody radiance of its temperature (emissivity 0.9). In the cracks the
 // char is hotter, out of the cooling air; ash over it glows less.
@@ -2702,13 +2708,17 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 // 11. Temporal accumulation, then the camera. Each frame's march is blended into a running history, which averages
 // away the sampling noise; the history is first clamped to the range of the current frame's 3 x 3 neighbourhood (in a
 // luminance-compressed space, so a bright flame does not dominate), so what moves or flickers is not smeared behind
-// it. Then the white balance and ACES tone mapping, and a dither against banding.
+// it. Then the white balance, the view transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and
+// a dither against banding.
 export const RESOLVE = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
+${VIEW_TRANSFORMS_WGSL}
 @group(0) @binding(2) var current: texture_2d<f32>;
 @group(0) @binding(3) var history: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> T: vec4<f32>; // history valid (0 or 1), weight of the current frame
+@group(0) @binding(5) var lut: texture_2d<f32>; // the ACES 2.0 LUT: 65 slices of 65 x 65 stacked (blue by slice)
+@group(0) @binding(6) var lutSampler: sampler;
 
 struct Out {
   @location(0) color: vec4<f32>,
@@ -2722,18 +2732,17 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 }
 
 fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
-fn lum(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }
-fn squash(c: vec3<f32>) -> vec3<f32> { return c / (1.0 + lum(c)); }
-fn unsquash(c: vec3<f32>) -> vec3<f32> { return c / max(1.0 - lum(c), 1e-4); }
-// Stephen Hill's fit of the ACES RRT and sRGB ODT (rows of the input and output matrices).
-fn aces(c: vec3<f32>) -> vec3<f32> {
-  let a = vec3<f32>(dot(vec3<f32>(0.59719, 0.35458, 0.04823), c), dot(vec3<f32>(0.07600, 0.90834, 0.01566), c), dot(vec3<f32>(0.02840, 0.13383, 0.83777), c));
-  let b = (a * (a + 0.0245786) - 0.000090537) / (a * (0.983729 * a + 0.4329510) + 0.238081);
-  let o = vec3<f32>(dot(vec3<f32>(1.60475, -0.53108, -0.07367), b), dot(vec3<f32>(-0.10208, 1.10813, -0.00605), b), dot(vec3<f32>(-0.00327, -0.07276, 1.07602), b));
-  return clamp(o, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-fn srgb(c: vec3<f32>) -> vec3<f32> {
-  return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * c, c <= vec3<f32>(0.0031308));
+fn squash(c: vec3<f32>) -> vec3<f32> { return c / (1.0 + ap1Lum(c)); }
+fn unsquash(c: vec3<f32>) -> vec3<f32> { return c / max(1.0 - ap1Lum(c), 1e-4); }
+// As the Lookdev lab shows its image: ACES 2.0 from the LUT (AgX until it has loaded), or AgX, PBR Neutral or the
+// plain sRGB curve on the image carried into Rec.709.
+fn view(c: vec3<f32>) -> vec3<f32> {
+  let v = u32(R.scene.z + 0.5);
+  if (v == 0u && R.scene.w > 0.5) { return aces2(c); }
+  var r = max(AP1_TO_REC709 * c, vec3<f32>(0.0));
+  if (v == 2u) { r = PBRNeutralToneMapping(r); }
+  else if (v != 3u) { r = AgXToneMapping(r); }
+  return srgbOETF(r);
 }
 
 @fragment
@@ -2757,7 +2766,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> Out {
   }
   let c = unsquash(blended);
   let balanced = vec3<f32>(dot(R.wb0.xyz, c), dot(R.wb1.xyz, c), dot(R.wb2.xyz, c));
-  let mapped = srgb(aces(max(balanced, vec3<f32>(0.0))));
+  let mapped = view(max(balanced, vec3<f32>(0.0)));
   return Out(vec4<f32>(mapped + (ign(fc.xy + 7.13) - 0.5) / 255.0, 1.0), vec4<f32>(c, 1.0));
 }
 `

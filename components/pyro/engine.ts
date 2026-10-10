@@ -164,6 +164,7 @@ interface Grids {
   scal: [GPUTexture, GPUTexture, GPUTexture, GPUTexture]
   fireLight: GPUBuffer // the grid sums: fire light, its centre, the bed's area and the heat release rate
   hrr: GPUBuffer // heat release rate per cell, W/m3
+  ratio: GPUBuffer // a fire's mass-keeping ratios (readable for development checks)
   spread: GPUBuffer // a fire's mass keeping: the volume over which each cell's gas was spread (fixed point)
   skin: GPUBuffer // the wooden ball's skin (SKIN_W x SKIN_H texels, four floats each), and its next step
   skinNext: GPUBuffer
@@ -767,7 +768,7 @@ export class PyroEngine {
     const hrr = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     // A fire's mass keeping: the volume each cell's gas was spread over, and the ratio its advection is scaled by.
     const spread = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
-    const ratio = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE })
+    const ratio = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     buffers.push(fireLight, hrr, spread, ratio)
     // The wooden ball's skin, fresh wood at the air's temperature, and the buffer its heating step writes.
     const skinBytes = SKIN_W * SKIN_H * 16
@@ -797,6 +798,7 @@ export class PyroEngine {
       scal,
       fireLight,
       hrr,
+      ratio,
       spread,
       skin,
       skinNext,
@@ -2063,6 +2065,23 @@ export class PyroEngine {
   }
 
   // Development check of IVOCK: the vorticity lost in the last step, four floats a cell (x, y, z, unused).
+  // Development check of the mass keeping: the ratio each cell's gas was scaled by in the last step (negative where it
+  // expands).
+  async readRatio(): Promise<Float32Array | null> {
+    if (!this.grids) return null
+    const d = this.device
+    const bytes = this.grids.n[0] * this.grids.n[1] * this.grids.n[2] * 4
+    const read = d.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    enc.copyBufferToBuffer(this.grids.ratio, 0, read, 0, bytes)
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const out = new Float32Array(read.getMappedRange().slice(0))
+    read.unmap()
+    read.destroy()
+    return out
+  }
+
   async readIvock(): Promise<Float32Array | null> {
     if (!this.grids) return null
     const d = this.device

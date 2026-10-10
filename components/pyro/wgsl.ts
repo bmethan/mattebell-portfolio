@@ -1870,6 +1870,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       if (mac && !expanding) { phi = clamp(phi + 0.5 * (textureLoad(s0, c, 0) - textureLoad(s2, c, 0)), lo, hi); }
       // What the expanding cells' ratios add back (7b).
       phi += kept;
+      // Where the gas is not expanding it only moves, so nothing here can exceed the most the gas it came from held.
+      // MacCormack's correction already restores a peak that the trilinear sample smeared, and the mass keeping, added
+      // on top where a cell was under-sampled, then counted that again: beside the collision ball, where the flow round
+      // the solid leaves cells a little under-sampled, a speck of soot in still air grew by some 6% a step until it
+      // filled the air with soot at a fifth of its mass.
+      if (!expanding) { phi = min(phi, hi); }
     }
   }
   let dt = P.grid.y;

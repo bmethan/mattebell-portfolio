@@ -262,6 +262,16 @@ export const PYRO_CITATIONS: PyroCitation[] = [
   },
   // The ball's surface, shaded as the Lookdev lab's materials are (its citations, as verified there).
   {
+    id: 'colorchecker',
+    group: 'Rendering',
+    authors: 'X-Rite; Colour Developers',
+    by: 'X-Rite',
+    title: 'ColorChecker Classic, charts made after November 2014: CIE L*a*b* values (D50)',
+    venue: 'Colour, characterisation datasets; the on-set reference’s chart',
+    year: '2014',
+    url: 'https://github.com/colour-science/colour/blob/develop/colour/characterisation/datasets/colour_checkers/chromaticity_coordinates.py',
+  },
+  {
     id: 'openpbr',
     group: 'Burning ball',
     authors: 'Academy Software Foundation',

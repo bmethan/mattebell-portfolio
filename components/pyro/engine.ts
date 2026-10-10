@@ -75,6 +75,25 @@ const RIG = {
   fill: { az: 0.95, el: 0.18, kelvin: 8000, ratio: (1.8 * 0.28) / (20 * 0.16) },
   rim: { az: 2.45, el: 0.45, kelvin: 4300, ratio: (36 * 0.085) / (20 * 0.16) },
 }
+// The on-set reference (referenceSet), in metres: positions along the floor are out from the bed's edge (never
+// nearer the middle than `clear`), and the set takes `span` of room. Balls 16 cm across on stands 1.6 cm thick; the
+// Lookdev lab's chart (its patches and gaps, CHART_GAP 0.18) 26 cm wide, leaning back 15 degrees.
+const REF = {
+  clear: 0.3,
+  span: 0.75,
+  ballR: 0.08,
+  ballY: 0.45,
+  ballZ: -0.12,
+  greyAt: 0.38,
+  chromeAt: 0.62,
+  standR: 0.008,
+  chartAt: 0.42,
+  chartZ: 0.18,
+  chartW: 0.26,
+  chartAspect: (4 + 5 * 0.18) / (6 + 7 * 0.18),
+  chartTilt: (15 * Math.PI) / 180,
+  chartTurn: (25 * Math.PI) / 180,
+}
 
 // The fields at one moment, for export: per cell (x fastest, then y, then z), the extinction at 550 nm (1/m), the
 // temperature (K), and for a fire the unburned fuel (mass fraction) and the heat release rate (W/m3); per cell,
@@ -512,7 +531,7 @@ export class PyroEngine {
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
   private simData = new ArrayBuffer(256)
-  private renderData = new Float32Array(112)
+  private renderData = new Float32Array(132)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
   private noiseTex: GPUTexture
@@ -1766,7 +1785,35 @@ export class PyroEngine {
     // The camera: a film camera's shutter at 24 frames a second (180 degrees is open 1/48 s), and the glare's share and
     // levels.
     r.set([(s.shutter / 360) / 24, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, 0], 108)
+    r.set(this.referenceSet(s), 112)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
+  }
+
+  // The on-set reference's layout (wgsl.ts refHit), or zeros when it is off: the colour chart standing on the floor,
+  // leaning back, turned to the camera and a little toward the fire; behind it the grey and chrome balls on stands, at
+  // about the middle of the flames' height. Beside the source on its upwind side (the right, in still air), clear of
+  // its bed, or on the other side when that side has no room for it.
+  private referenceSet(s: PyroState): number[] {
+    if (!s.reference) return new Array(20).fill(0)
+    const right = Math.max(s.srcX + s.srcRadius, REF.clear)
+    const left = Math.min(s.srcX - s.srcRadius, -REF.clear)
+    let side = s.wind > 0.05 ? -1 : 1
+    const room = (sd: number) => (sd > 0 ? DOMAIN_WIDTH / 2 - right : DOMAIN_WIDTH / 2 + left)
+    if (room(side) < REF.span) side = -side
+    const at = (u: number) => (side > 0 ? right : left) + side * u
+    const cx = at(REF.chartAt)
+    const yaw = Math.atan2(this.cam.pos[0] - cx, this.cam.pos[2] - REF.chartZ) - side * REF.chartTurn
+    const w = REF.chartW
+    const h = w * REF.chartAspect
+    const U = [Math.cos(yaw) * w, 0, -Math.sin(yaw) * w]
+    const V = [-Math.sin(REF.chartTilt) * Math.sin(yaw) * h, Math.cos(REF.chartTilt) * h, -Math.sin(REF.chartTilt) * Math.cos(yaw) * h]
+    return [
+      ...[at(REF.greyAt), REF.ballY, REF.ballZ, REF.ballR],
+      ...[at(REF.chromeAt), REF.ballY, REF.ballZ, REF.ballR],
+      ...[cx - U[0] / 2, 0.002, REF.chartZ - U[2] / 2, REF.standR],
+      ...U, 0,
+      ...V, 0,
+    ]
   }
 
   // The frame's targets at the canvas's size (made again, and the history dropped, when it changes): the march's

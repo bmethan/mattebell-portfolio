@@ -1,6 +1,7 @@
 import { BB_MAX_K, BB_MIN_K, chemiluminescenceColour } from './blackbody'
 import { AP1_WGSL, VIEW_TRANSFORMS_WGSL } from '../lab/viewTransforms'
 import { FUZZ } from '../lookdev/gpu/wgslBsdf'
+import { COLOR_CHECKER, SCENE_MATERIALS } from '../lookdev/materials'
 import { FIRE_BANDS } from './physics'
 import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
@@ -1976,6 +1977,11 @@ struct RParams {
   rimDir: vec4<f32>,   // the softbox rig's rim: toward it, on (0 or 1)
   rimCol: vec4<f32>,   // its illuminance (lux) by colour
   camera: vec4<f32>,   // the shutter's open time (s, 0 for none); the glare's share of the light
+  refGrey: vec4<f32>,  // the on-set reference (engine.ts): the grey ball's centre and radius (0: no reference)
+  refChrome: vec4<f32>, // the chrome ball's
+  refChartO: vec4<f32>, // the colour chart's lower corner; the stands' radius
+  refChartU: vec4<f32>, // the chart's width, along its lower edge
+  refChartV: vec4<f32>, // its height, up its face
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -2413,8 +2419,10 @@ fn ballFire(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat
     let l = d / max(dist, 1e-4);
     let wrap = bed2 / (dist * dist + bed2);
     let c = (dot(n, l) + wrap) / (1.0 + wrap);
+    // (Every band counts toward the unshadowed light, as the light volume sums them all; counting only those the
+    // surface faces made the transmittance jump where a band's light leaves it, a seam across the surface.)
+    seen += lum / r2;
     if (c > 0.0) {
-      seen += lum / r2;
       let e = lum / r2 * smoothstep(0.05, 0.15, dist);
       far += e * c;
       if (m.specW > 0.0) { spec += e * ggxSpec(n, v, l, m.rough, m.f0); }
@@ -2758,6 +2766,308 @@ fn subgridKelvin(w: vec3<f32>, uvw: vec3<f32>, rot: mat3x3<f32>) -> f32 {
   return sd * clamp((n - 0.5) * 5.0, -2.5, 2.5);
 }
 
+// The on-set reference (the Shading tab): a colour chart, an 18% grey ball and a chrome ball beside the fire, each ball
+// on a thin stand, as a lighting team shoots them on set to record the light where the effect will go: the Lookdev
+// lab's own (its ColorChecker, its OpenPBR grey card and chromium). The engine places them on the fire's upwind side,
+// clear of its flames. They stand outside the simulation: the gas does not flow around them.
+const CHART_GAP = 0.18; // between the patches and around them, in patch widths (the Lookdev lab's)
+const CHART_COLOURS = array<vec3<f32>, 25>(${COLOR_CHECKER.map(c => `vec3<f32>(${c.map(wf).join(', ')})`).join(', ')});
+fn chartColour(i: i32) -> vec3<f32> {
+  let c = CHART_COLOURS;
+  return c[i];
+}
+const CHROME_F0 = vec3<f32>(${SCENE_MATERIALS.chrome.base_color.map(wf).join(', ')});
+fn refOn() -> bool { return R.refGrey.w > 0.0; }
+// What a ray meets of the set first: the grey ball (what 0), the chrome ball (1), a stand (2), or the chart, a patch
+// (3 + its index, row by row from dark skin) or its black frame (3 + 24). t is 1e9 for nothing.
+struct RefHit { t: f32, n: vec3<f32>, what: i32 }
+fn sphereT(ro: vec3<f32>, rd: vec3<f32>, s: vec4<f32>) -> f32 {
+  let oc = ro - s.xyz;
+  let b = dot(oc, rd);
+  let h = b * b - (dot(oc, oc) - s.w * s.w);
+  if (h < 0.0) { return 1e9; }
+  let t = -b - sqrt(h);
+  return select(1e9, t, t > 1e-4);
+}
+// A ball's stand: an upright rod from the floor to the ball's underside.
+fn standT(ro: vec3<f32>, rd: vec3<f32>, s: vec4<f32>) -> f32 {
+  let d = rd.xz;
+  let o = ro.xz - s.xz;
+  let a = dot(d, d);
+  if (a < 1e-10) { return 1e9; }
+  let b = dot(o, d);
+  let h = b * b - a * (dot(o, o) - R.refChartO.w * R.refChartO.w);
+  if (h < 0.0) { return 1e9; }
+  let t = (-b - sqrt(h)) / a;
+  let y = ro.y + rd.y * t;
+  return select(1e9, t, t > 1e-4 && y > 0.0 && y < s.y - s.w);
+}
+fn refHit(ro: vec3<f32>, rd: vec3<f32>) -> RefHit {
+  var h = RefHit(1e9, vec3<f32>(0.0, 1.0, 0.0), -1);
+  if (!refOn()) { return h; }
+  for (var k = 0; k < 2; k++) {
+    let s = select(R.refGrey, R.refChrome, k == 1);
+    let tb = sphereT(ro, rd, s);
+    if (tb < h.t) { h = RefHit(tb, normalize(ro + rd * tb - s.xyz), k); }
+    let ts = standT(ro, rd, s);
+    if (ts < h.t) {
+      let q = ro + rd * ts - s.xyz;
+      h = RefHit(ts, normalize(vec3<f32>(q.x, 0.0, q.z)), 2);
+    }
+  }
+  // The chart (the Lookdev lab's layout): six patches across, four down, on a black card; its back is the card.
+  let U = R.refChartU.xyz;
+  let V = R.refChartV.xyz;
+  let N = normalize(cross(U, V));
+  let dn = dot(rd, N);
+  if (abs(dn) > 1e-8) {
+    let t = dot(R.refChartO.xyz - ro, N) / dn;
+    if (t > 1e-4 && t < h.t) {
+      let q = ro + rd * t - R.refChartO.xyz;
+      let ab = vec2<f32>(dot(q, U) / dot(U, U), dot(q, V) / dot(V, V));
+      if (all(ab >= vec2<f32>(0.0)) && all(ab <= vec2<f32>(1.0))) {
+        var cell = 24;
+        if (dn < 0.0) {
+          let gr = ab * vec2<f32>(6.0 + 7.0 * CHART_GAP, 4.0 + 5.0 * CHART_GAP) - CHART_GAP;
+          let c = floor(gr / (1.0 + CHART_GAP));
+          let f = gr - c * (1.0 + CHART_GAP);
+          if (c.x >= 0.0 && c.y >= 0.0 && c.x < 6.0 && c.y < 4.0 && f.x < 1.0 && f.y < 1.0) { cell = i32(c.x) + 6 * (3 - i32(c.y)); }
+        }
+        h = RefHit(t, select(-N, N, dn < 0.0), 3 + cell);
+      }
+    }
+  }
+  return h;
+}
+// Their surfaces as OpenPBR shades them (BallMat): the grey card's (18%, matte, specular roughness 0.9), each patch
+// in its colour as the grey card, the card black, the stands dark and satin.
+fn refMat(what: i32) -> BallMat {
+  var base = vec3<f32>(0.18);
+  var rough = 0.9;
+  if (what == 2) {
+    base = vec3<f32>(0.03);
+    rough = 0.45;
+  } else if (what >= 3) {
+    base = chartColour(min(what - 3, 24));
+  }
+  return BallMat(base, 1.0, rough, 0.04, 0.0, vec3<f32>(0.0), 0.5);
+}
+// How much of a light at distance dist along l reaches p past the set (its balls, their stands and the chart), soft
+// over a penumbra that widens with the distance behind each, pen0 + penK x (as for the collision ball).
+fn sphereVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK: f32) -> f32 {
+  let tb = s.xyz - p;
+  let along = dot(tb, l);
+  if (along <= 0.0 || along >= dist) { return 1.0; }
+  let pen = pen0 + penK * along;
+  return smoothstep(s.w - pen, s.w + pen, length(tb - l * along));
+}
+// A stand: where the way to the light passes its upright line (seen from above), how far from it, if at a height the
+// stand reaches.
+fn standVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK: f32) -> f32 {
+  let a = dot(l.xz, l.xz);
+  if (a < 1e-6) { return 1.0; }
+  let t = dot(s.xz - p.xz, l.xz) / a;
+  let y = p.y + l.y * t;
+  if (t <= 0.0 || t >= dist || y < 0.0 || y > s.y - s.w) { return 1.0; }
+  let pen = pen0 + penK * t;
+  let r = R.refChartO.w;
+  return smoothstep(r - pen, r + pen, length(p.xz + l.xz * t - s.xz));
+}
+fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32) -> f32 {
+  if (!refOn()) { return 1.0; }
+  var vis = sphereVis(p, l, dist, R.refGrey, pen0, penK) * sphereVis(p, l, dist, R.refChrome, pen0, penK);
+  vis *= standVis(p, l, dist, R.refGrey, pen0, penK) * standVis(p, l, dist, R.refChrome, pen0, penK);
+  // The chart: where the way to the light crosses it, how far inside its edges, against the penumbra there.
+  let U = R.refChartU.xyz;
+  let V = R.refChartV.xyz;
+  let N = normalize(cross(U, V));
+  let dn = dot(l, N);
+  if (abs(dn) > 1e-6) {
+    let t = dot(R.refChartO.xyz - p, N) / dn;
+    if (t > 0.0 && t < dist) {
+      let q = p + l * t - R.refChartO.xyz;
+      let lu = length(U);
+      let lv = length(V);
+      let a = dot(q, U) / lu;
+      let b = dot(q, V) / lv;
+      let inside = min(min(a, lu - a), min(b, lv - b));
+      let pen = pen0 + penK * t;
+      vis *= smoothstep(-pen, pen, -inside);
+    }
+  }
+  return vis;
+}
+
+// A surface's light toward v (cd/m2), with OpenPBR's layering (BallMat): lit by the sun and the rig's rim through the
+// smoke (the light volume just outside it, along its geometric normal nb) and past the collision ball (unless it is
+// the ball), by the sky or the environment through the smoke above, and by the fire (ballFire). n is the shading
+// normal. The reference set's surfaces (the collision ball's, in the image pass, are shaded the same way inline).
+fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat, ch: vec3<f32>, fireColour: vec3<f32>, isBall: bool) -> vec3<f32> {
+  let sun = R.sunDir.xyz;
+  let rimDir = R.rimDir.xyz;
+  let lb = textureSampleLevel(light, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0);
+  let F = tangentFrame(n);
+  let nv = max(dot(n, v), 1e-4);
+  // Each light's illuminance at normal incidence (shadowed): the base takes its cosine share, the specular layer
+  // and the fuzz their lobes'.
+  let sunE = R.sunCol.xyz * exp(-lb.x * ch) * select(ballSun(ph, sun), 1.0, isBall);
+  var E = sunE * max(dot(n, sun), 0.0);
+  var spec = sunE * ggxSpec(n, v, sun, m.rough, m.f0);
+  var fuzz = sunE * fuzzLobe(F, v, sun, m.fuzzRough);
+  if (rimOn()) {
+    let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + nb * 1.5 * P.grid.x), 0.0).x;
+    let rimE = R.rimCol.xyz * exp(-lb2 * ch) * select(ballSun(ph, rimDir), 1.0, isBall);
+    E += rimE * max(dot(n, rimDir), 0.0);
+    spec += rimE * ggxSpec(n, v, rimDir, m.rough, m.f0);
+    fuzz += rimE * fuzzLobe(F, v, rimDir, m.fuzzRough);
+  }
+  // The sky or the environment, through the smoke above.
+  let occ = exp(-0.5 * lb.y * ch);
+  let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * n.y), envIrradiance(n), envOn()) * occ;
+  E += skyE;
+  spec += glossyEnv(reflect(-v, n), m.rough) * envBRDF(m.f0, m.rough, nv) * occ;
+  fuzz += skyE * INV_PI;
+  let bf = ballFire(ph, nb, n, v, m, lb.w, fireColour, ch);
+  E += bf.e;
+  spec += bf.spec;
+  fuzz += bf.fuzz;
+  // OpenPBR's layering: the fuzz on top passes 1 - its albedo; the specular layer reflects its share and passes
+  // the rest to the base.
+  let eFuzz = select(0.0, fuzzDirAlbedo(nv, m.fuzzRough), m.fuzzW > 0.0);
+  let tFuzz = 1.0 - m.fuzzW * eFuzz;
+  let base = m.base * INV_PI * E * (1.0 - m.specW * envBRDF(m.f0, m.rough, nv));
+  return tFuzz * (base + m.specW * spec) + m.fuzzW * eFuzz * m.fuzzColor * fuzz;
+}
+
+// The floor's (or the cyc's) light toward the camera, cd/m2: at pf, facing nf, met tFloor along rd.
+fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
+  let sun = R.sunDir.xyz;
+  let rimDir = R.rimDir.xyz;
+  let skyStage = R.scene.x > 0.5 && R.scene.x < 1.5;
+  // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon; the cyc is lit
+  // as it stands.
+  let fade = select(exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
+  // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
+  let sb = boxHit(pf, sun, P.origin.xyz, domainHi());
+  var shadow = vec3<f32>(1.0);
+  if (sb.y > max(sb.x, 0.0)) {
+    let pe = pf + sun * max(sb.x, 0.0) + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0);
+    shadow = exp(-textureSampleLevel(light, samp, uvwOf(pe), 0.0).x * ch);
+  }
+  // And the collision ball's and the reference set's; the ball also hides its share of the sky, its view factor from
+  // the floor, (r / d)^2 cos.
+  shadow *= ballSun(pf, sun) * refShadow(pf, sun, 1e9, 0.004, 0.0046);
+  var ballSky = 1.0;
+  if (P.ball.w > 0.0) {
+    let tb = P.ball.xyz - pf;
+    let d2 = dot(tb, tb);
+    ballSky = 1.0 - P.ball.w * P.ball.w / d2 * max(dot(tb, nf), 0.0) / sqrt(d2);
+  }
+  var skyVis = vec3<f32>(1.0);
+  let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
+  if (all(uv.xz >= vec2<f32>(0.0)) && all(uv.xz <= vec2<f32>(1.0))) {
+    skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y * ch);
+  }
+  // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
+  // light from each band of its height, I cos / r^2 (the floor reaches beyond the light volume, and smoke rises away
+  // from the light between the flames and the floor, so the smoke does not shadow it here; the reference set does).
+  var fireLux = 0.0;
+  let cellVol = P.grid.x * P.grid.x * P.grid.x;
+  for (var b = 0u; b < FIRE_BANDS; b++) {
+    let lum = fireLight[3u + 2u * b].w * cellVol;
+    if (lum <= 0.0) { continue; }
+    let d = fireLight[4u + 2u * b].xyz - pf;
+    let r2 = dot(d, d) + BAND_R2;
+    let dl = length(d);
+    fireLux += lum * max(dot(d, nf), 0.0) / (sqrt(r2) * r2) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4));
+  }
+  let fireE = fireColour * fireLux;
+  // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
+  let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
+  var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
+  if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch) * refShadow(pf, rimDir, 1e9, 0.01, 0.15); }
+  var floorL = R.floorCol.xyz * INV_PI * E * fade;
+  // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
+  let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
+  if (skyStage) { floorL = mix(floorL, haze, 1.0 - exp(-tFloor / 40.0)); }
+  return floorL;
+}
+
+// What the chrome ball reflects along rd from ro, cd/m2: the gas, then the floor or the cyc, or the sky. Marched as the
+// camera's rays are but more lightly (twice the step, trilinear, without the motion blur, the detail and the subgrid
+// flame temperature: the ball is small in the frame), and without the collision ball or the set itself.
+fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
+  var tFloor = select(1e9, -ro.y / rd.y, rd.y < -1e-5);
+  var nFloor = vec3<f32>(0.0, 1.0, 0.0);
+  if (R.scene.x > 1.5) {
+    let cy = cycHit(ro, rd);
+    tFloor = cy.x;
+    nFloor = cy.yzw;
+  }
+  let box = boxHit(ro, rd, P.origin.xyz, domainHi());
+  let tEnd = min(box.y, tFloor);
+  let sun = R.sunDir.xyz;
+  let g = R.sunDir.w;
+  let cosT = dot(rd, sun);
+  let ph0 = hg(cosT, g);
+  let ph1 = hg(cosT, 0.5 * g);
+  let ph2 = hg(cosT, 0.25 * g);
+  let albedo = R.skyCol.w;
+  let skyScatter = select(R.skyCol.xyz * INV_2PI, envScatter(rd, g), envOn());
+  let rimDir = R.rimDir.xyz;
+  let pr0 = hg(dot(rd, rimDir), g);
+  var col = vec3<f32>(0.0);
+  var T = vec3<f32>(1.0);
+  if (box.y > max(box.x, 0.0) && box.x < tFloor) {
+    let ds = 1.3 * P.grid.x;
+    var t = max(box.x, 0.0) + jitter * ds;
+    for (var i = 0; i < 1024; i++) {
+      if (t > tEnd) { break; }
+      let w = ro + rd * t;
+      let uvw = uvwOf(w);
+      if (textureSampleLevel(light, samp, uvw, 0.0).z < 1e-4) {
+        t += 2.0 * ds;
+        continue;
+      }
+      t += ds;
+      let s4 = textureSampleLevel(scal, samp, uvw, 0.0);
+      let fade = edgeFade(uvw) * offBallStairs(w);
+      var sig = sigmaOf(s4) * fade;
+      var heat = 0.0;
+      if (R.fire.x > 0.5) {
+        heat = textureSampleLevel(flameTex, samp, uvw, 0.0).x * offBallShell(w);
+        if (heat > 0.0) {
+          sig *= sootFormed(gasOf(s4), heat);
+          col += T * CHEMI_COLOUR * (CHEMI_CD * heat * fade * ds);
+        }
+      }
+      if (sig > 1e-3) {
+        let L = textureSampleLevel(light, samp, uvw, 0.0);
+        let tauS = L.x * ch;
+        let lsun = (exp(-tauS) * ph0 + 0.5 * exp(-0.5 * tauS) * ph1 + 0.25 * exp(-0.25 * tauS) * ph2) * ballSun(w, sun);
+        var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + skyScatter * exp(-0.5 * L.y * ch) + fireColour * 1000.0 * L.w * INV_4PI);
+        if (rimOn()) {
+          let tauR = textureSampleLevel(light2, samp, uvw, 0.0).x * ch;
+          S += albedo * R.rimCol.xyz * INV_4PI * exp(-tauR) * pr0;
+        }
+        var B = vec3<f32>(0.0);
+        let rise = riseOf(s4);
+        if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) { B = (1.0 - albedo) * planck(radiatingKelvin(T_AMB + rise, heat)); }
+        let Ts = exp(-sig * ch * ds);
+        col += T * (1.0 - Ts) * (S + B);
+        T *= Ts;
+        if (max(T.x, max(T.y, T.z)) < 0.004) { break; }
+      }
+    }
+  }
+  if (tFloor < 1e8) {
+    col += T * floorLight(ro + rd * tFloor, nFloor, rd, tFloor, ch, fireColour);
+  } else if (R.scene.x > 0.5 && R.scene.x < 1.5) {
+    col += T * select(R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0))), envBackdrop(rd), envOn());
+  }
+  return col;
+}
+
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   // Each frame's rays pass through a different point of their pixel (the R2 sequence), which the accumulation turns
@@ -2781,7 +3091,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let skyStage = R.scene.x > 0.5 && R.scene.x < 1.5;
   let box = boxHit(ro, rd, P.origin.xyz, domainHi());
   let tBall = ballHit(ro, rd);
-  let tEnd = min(min(box.y, tFloor), tBall);
+  let rh = refHit(ro, rd);
+  let tEnd = min(min(min(box.y, tFloor), tBall), rh.t);
   let sun = R.sunDir.xyz;
   let g = R.sunDir.w;
   let cosT = dot(rd, sun);
@@ -2899,7 +3210,30 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     }
   }
 
-  if (tBall < tFloor && tBall < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
+  if (rh.t < min(tFloor, tBall) && rh.t < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
+    // The reference set.
+    let ph = ro + rd * rh.t;
+    let v = -rd;
+    if (rh.what == 1) {
+      // The chrome ball: a mirror, the Lookdev lab's chromium (its reflectance by Schlick's Fresnel). The lights a
+      // mirror shows as points it shows as highlights (the sun, unless an HDR map's backdrop shows it already; the
+      // rig's softboxes, broader); everything else as its reflected ray finds it (mirrorView), the fire included.
+      let F = CHROME_F0 + (1.0 - CHROME_F0) * pow(1.0 - max(dot(rh.n, v), 0.0), 5.0);
+      let lb = textureSampleLevel(light, samp, uvwOf(ph + rh.n * 1.5 * P.grid.x), 0.0);
+      let rig = envOn() && R.env.w <= 0.0;
+      var hl = vec3<f32>(0.0);
+      if (!envOn() || rig) {
+        hl += R.sunCol.xyz * exp(-lb.x * ch) * ballSun(ph, sun) * ggxSpec(rh.n, v, sun, select(0.07, 0.3, rig), 1.0);
+      }
+      if (rimOn()) {
+        let lb2 = textureSampleLevel(light2, samp, uvwOf(ph + rh.n * 1.5 * P.grid.x), 0.0).x;
+        hl += R.rimCol.xyz * exp(-lb2 * ch) * ballSun(ph, rimDir) * ggxSpec(rh.n, v, rimDir, 0.3, 1.0);
+      }
+      col += T * F * (hl + mirrorView(ph + rh.n * 1e-3, reflect(rd, rh.n), jitter, ch, fireColour));
+    } else {
+      col += T * shadeSurface(ph, rh.n, rh.n, v, refMat(rh.what), ch, fireColour, false);
+    }
+  } else if (tBall < tFloor && tBall < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
     // The collision ball, lit by the sun and the sky through the smoke (the light volume just outside its surface)
     // and by the fire: matte grey, or wood that scorches, chars, glows and turns to ash as its skin heats, shaded as
     // an OpenPBR surface (ballMat).
@@ -2950,54 +3284,8 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let base = m.base * INV_PI * E * (1.0 - m.specW * envBRDF(m.f0, m.rough, nv));
     col += T * (tFuzz * (base + m.specW * spec) + m.fuzzW * eFuzz * m.fuzzColor * fuzz + glow);
   } else if (tFloor < 1e8 && max(T.x, max(T.y, T.z)) > 0.004) {
-    let pf = ro + rd * tFloor;
-    let nf = nFloor;
-    // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon; the cyc is lit
-    // as it stands.
-    let fade = select(exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
-    // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
-    let sb = boxHit(pf, sun, P.origin.xyz, domainHi());
-    var shadow = vec3<f32>(1.0);
-    if (sb.y > max(sb.x, 0.0)) {
-      let pe = pf + sun * max(sb.x, 0.0) + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0);
-      shadow = exp(-textureSampleLevel(light, samp, uvwOf(pe), 0.0).x * ch);
-    }
-    // And the collision ball's; it also hides its share of the sky, its view factor from the floor, (r / d)^2 cos.
-    shadow *= ballSun(pf, sun);
-    var ballSky = 1.0;
-    if (P.ball.w > 0.0) {
-      let tb = P.ball.xyz - pf;
-      let d2 = dot(tb, tb);
-      ballSky = 1.0 - P.ball.w * P.ball.w / d2 * max(dot(tb, nf), 0.0) / sqrt(d2);
-    }
-    var skyVis = vec3<f32>(1.0);
-    let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
-    if (all(uv.xz >= vec2<f32>(0.0)) && all(uv.xz <= vec2<f32>(1.0))) {
-      skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y * ch);
-    }
-    // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
-    // light from each band of its height, I cos / r^2 (the floor reaches beyond the light volume, and smoke rises away
-    // from the light between the flames and the floor, so it goes unshadowed here).
-    var fireLux = 0.0;
-    let cellVol = P.grid.x * P.grid.x * P.grid.x;
-    for (var b = 0u; b < FIRE_BANDS; b++) {
-      let lum = fireLight[3u + 2u * b].w * cellVol;
-      if (lum <= 0.0) { continue; }
-      let d = fireLight[4u + 2u * b].xyz - pf;
-      let r2 = dot(d, d) + BAND_R2;
-      fireLux += lum * max(dot(d, nf), 0.0) / (sqrt(r2) * r2);
-    }
-    let fireE = fireColour * fireLux;
-    // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
-    let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
-    var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
-    if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch); }
-    var floorL = R.floorCol.xyz * INV_PI * E * fade;
-    // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
-    let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
-    if (skyStage) { floorL = mix(floorL, haze, 1.0 - exp(-tFloor / 40.0)); }
-    col += T * floorL;
-  } else if (skyStage && tBall >= 1e8) {
+    col += T * floorLight(ro + rd * tFloor, nFloor, rd, tFloor, ch, fireColour);
+  } else if (skyStage && tBall >= 1e8 && rh.t >= 1e8) {
     // The sky: a dome of the sky's radiance (its illuminance on the ground over pi), a little brighter toward the
     // horizon (at night too dim to see); or the HDR environment.
     col += T * select(R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0))), envBackdrop(rd), envOn());

@@ -98,6 +98,10 @@ const TECH_NOTES: [string, string][] = [
     'The Lookdev lab’s four HDR environments from Poly Haven can light the scene. A volume renderer cannot sample a map at every scattering event at this frame rate, so each map’s brightest light, where it has one, is pulled out as a key that casts the smoke’s shadows (the midday sun, 68% of that map’s light within a degree of it; the photo studio’s main softbox, 43% within 15 degrees), and the rest is kept as three bands of spherical harmonics: convolved with the smoke’s phase function for its scattering, and with the cosine for the floor and the ball (Ramamoorthi and Hanrahan). The overcast sky and the sunset’s glow have no key, so they light the smoke softly from all around. Below the horizon the map gives way to the floor, lit by the whole environment. The Turn slider turns the map; the Environment EV is its illuminance on open ground, key included, which auto exposure meters. The softbox rig is the Lookdev lab’s three softboxes as lights, at that lab’s ratios: the key where the light sliders put it (4300 K), a fill on the far side (8000 K, about a sixth of the key) through the same spherical harmonics, and a rim strip behind (4300 K, about as strong as the key) with a light volume of its own, so the smoke shadows it and only its edges and wisps catch it.',
   ],
   [
+    'On-set reference',
+    'The Shading tab can stand the Lookdev lab’s reference set beside the fire, as a lighting team shoots one on set to record the light where an effect will go: its ColorChecker (X-Rite’s published values), an 18% grey ball and a chrome ball, the balls 16 cm across on thin stands at about the middle of the flames’ height, the chart on the floor in front of them, turned to the camera and a little toward the fire. The set stands on the fire’s upwind side, clear of its bed (on the right in still air), and outside the simulation: the gas does not flow around it. The grey ball and the chart are lit as the burning ball is, by the sun, the sky and the fire through the smoke, so the chart shows the firelight’s colour against the camera’s white balance. The chrome ball is a mirror: each ray that meets it is reflected and marched again through the gas, more lightly than the camera’s rays (twice the step, without the motion blur or the subgrid detail), so it shows the fire, its smoke and the stage as they stand, and the sun and the rig’s softboxes as highlights. The balls, their stands and the chart cast shadows on the floor from the sun and from each slice of the fire.',
+  ],
+  [
     'Export',
     'The Solver tab writes the simulation as OpenVDB, the volume format of film effects work, so a frame or a two-second sequence can be rendered in Houdini, Blender or any other program that reads it. The writer is the lab’s own, a few hundred lines: each grid a standard OpenVDB tree (a root, internal nodes of 32³ and 16³ children, leaves of 8³ voxels), with only the leaves that hold smoke, heat or fuel written, and values as 32-bit floats with OpenVDB’s active-mask compression. Every grid reads back bit for bit in OpenVDB 13, the version Blender 5.2 bundles, and the frames render in Blender’s Cycles.',
   ],
@@ -770,6 +774,14 @@ export default function PyroLab() {
                         {v.label}
                       </Pill>
                     ))}
+                  </Group>
+                  <Group label="On-set reference">
+                    <Pill on={!pyro.reference} onClick={() => update({ reference: false })}>
+                      Off
+                    </Pill>
+                    <Pill on={pyro.reference} onClick={() => update({ reference: true })}>
+                      On
+                    </Pill>
                   </Group>
                 </div>
                 <div className="lab-row">

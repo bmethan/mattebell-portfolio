@@ -9,6 +9,7 @@ import { PRESETS, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, SOURCE_LOOKS, ty
 import { PYRO_CITATIONS, PYRO_CITATION_GROUPS } from './pyro/citations'
 import { citeAuthors } from './lookdev/citations'
 import { Group, Pill, Range, Tabs } from './lab/ui'
+import DeviceCheck from './pyro/DeviceCheck'
 
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
 const noSubscribe = () => () => {}
@@ -186,6 +187,9 @@ export default function PyroLab() {
   const [renderer, setRenderer] = useState('')
   const tabsId = useId()
   const debugOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('debug'), () => false)
+  // The device check (components/pyro/DeviceCheck.tsx), for testing the lab on other devices: only with ?check.
+  const checkOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('check'), () => false)
+  const statusRef = useRef<PyroStatus | null>(null)
   const shown = mode === 'live' && !!status && status.simTime > 0
 
   useEffect(() => {
@@ -193,6 +197,7 @@ export default function PyroLab() {
   }, [pyro])
   // The engine's reports; when it steps down from the default resolution on a slow GPU, the Solver tab follows.
   const onStatus = (s: PyroStatus) => {
+    statusRef.current = s
     setStatus(s)
     if (s.autoStepped) setPyro(p => (p.resolution === s.resolution ? p : { ...p, resolution: s.resolution }))
   }
@@ -487,6 +492,20 @@ export default function PyroLab() {
           </div>
         )}
       </div>
+
+      {checkOn && mode !== 'starting' && (
+        <DeviceCheck
+          engineRef={engineRef}
+          statusRef={statusRef}
+          frameRef={frameRef}
+          applyPreset={applyPreset}
+          ensureRunning={() => {
+            setPaused(false)
+            engineRef.current?.setPaused(false)
+          }}
+          fallback={mode === 'fallback'}
+        />
+      )}
 
       {mode !== 'fallback' && (
         <fieldset className="lab-controls" disabled={!inputOn}>

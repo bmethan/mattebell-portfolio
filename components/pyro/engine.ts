@@ -386,7 +386,18 @@ export class PyroEngine {
       }
       const info = got.adapter.info
       const name = [info?.vendor, info?.architecture, info?.description].filter(Boolean).join(' ') || 'unnamed adapter'
-      return new PyroEngine(own ?? canvas, own, ctx, got.device, onStatus, initial, onLost, name, ahead && !ahead.lost ? ahead.pipes : null)
+      const engine = new PyroEngine(own ?? canvas, own, ctx, got.device, onStatus, initial, onLost, name, ahead && !ahead.lost ? ahead.pipes : null)
+      engine.adapterFeatures = [...got.adapter.features].sort()
+      const lim = got.adapter.limits
+      engine.adapterLimits = {
+        maxBufferSize: lim.maxBufferSize,
+        maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+        maxStorageBuffersPerShaderStage: lim.maxStorageBuffersPerShaderStage,
+        maxStorageTexturesPerShaderStage: lim.maxStorageTexturesPerShaderStage,
+        maxTextureDimension3D: lim.maxTextureDimension3D,
+        maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
+      }
+      return engine
     } catch (err) {
       own?.remove()
       console.warn('Pyro: WebGPU unavailable', err)
@@ -395,6 +406,10 @@ export class PyroEngine {
   }
 
   readonly adapterName: string
+  // For the lab's device check (?check): what the adapter offers, and the WebGPU errors so far (the latest 50).
+  adapterFeatures: string[] = []
+  adapterLimits: Record<string, number> = {}
+  readonly gpuErrors: string[] = []
   readonly whenReady: Promise<boolean>
   state: PyroState
 
@@ -494,7 +509,11 @@ export class PyroEngine {
     const d = device
     this.format = navigator.gpu.getPreferredCanvasFormat()
     this.configure()
-    d.addEventListener('uncapturederror', ev => console.error(`Pyro WebGPU error: ${(ev as GPUUncapturedErrorEvent).error.message}`))
+    d.addEventListener('uncapturederror', ev => {
+      const message = (ev as GPUUncapturedErrorEvent).error.message
+      console.error(`Pyro WebGPU error: ${message}`)
+      if (this.gpuErrors.length < 50) this.gpuErrors.push(message.slice(0, 300))
+    })
     d.lost.then(info => {
       this.lost = true
       if (this.disposed) return
@@ -984,6 +1003,15 @@ export class PyroEngine {
   // Moves the collision ball to under the pointer, on the plane through the domain's middle, and gives it the
   // velocity of the move, so it pushes the gas.
   // Sets the ball down beside the fire, ready to be dragged into it.
+  // Puts the ball at (x, y) in the frame's plane, at rest (the device check holds it in the fire).
+  placeBall(x: number, y: number) {
+    this.ballPos = [x, y, 0]
+    this.ballVel = [0, 0, 0]
+    this.lightDirty = true
+    this.needsRender = true
+    this.kick()
+  }
+
   ballBeside() {
     if (!this.grids) return
     const s = this.state

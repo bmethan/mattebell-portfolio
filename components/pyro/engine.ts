@@ -1076,7 +1076,18 @@ export class PyroEngine {
         ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
-        fireSum: group(p.fireSum, [P, R, v(scal[0]), { buffer: this.bbBuf }, { buffer: firePartial }, { buffer: hrr }]),
+        fireSum: d.createBindGroup({
+          layout: p.fireSum.getBindGroupLayout(0),
+          entries: [
+            ...[P, R, s, v(scal[0])].map((resource, binding) => ({ binding, resource })),
+            ...[v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }].map((resource, k) => ({ binding: 5 + k, resource })),
+            { binding: 12, resource: this.dummy3d.createView() },
+            { binding: 13, resource: v(flame) },
+            { binding: 35, resource: v(vel[0]) },
+            { binding: 40, resource: { buffer: firePartial } },
+            { binding: 41, resource: { buffer: hrr } },
+          ],
+        }),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2)]),
         render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }]),
@@ -2131,28 +2142,11 @@ export class PyroEngine {
     }
     const d = this.device
     const p = this.pipes!
-    const g = this.grids!
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
     const accum: [GPUTexture, GPUTexture] = [0, 1].map(() => d.createTexture({ size: [t.w, t.h], format: 'rgba32float', usage: usage | GPUTextureUsage.COPY_SRC })) as [GPUTexture, GPUTexture]
     const comp = d.createTexture({ size: [t.w, t.h], format: 'rgba16float', usage })
     const v = (x: GPUTexture) => x.createView()
-    const entries = (res: GPUBindingResource[]) => res.map((resource, binding) => ({ binding, resource }))
-    const trace = [0, 1].map(k =>
-      d.createBindGroup({
-        layout: this.ptPipe!.getBindGroupLayout(0),
-        entries: [
-          ...entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView({ dimension: '2d-array' }), upres ? v(this.upres!.tex[0]) : this.dummy3d.createView(), v(g.flame)]),
-          { binding: 31, resource: { buffer: g.skin } },
-          { binding: 32, resource: { buffer: g.ballSheet } },
-          { binding: 33, resource: this.envTex.createView() },
-          { binding: 34, resource: v(g.light2) },
-          { binding: 35, resource: v(g.vel[0]) },
-          { binding: 36, resource: v(accum[k]) },
-          { binding: 37, resource: { buffer: this.ptBuf } },
-          { binding: 38, resource: this.envResTex.createView() },
-        ],
-      }),
-    ) as [GPUBindGroup, GPUBindGroup]
+    const trace = [0, 1].map(k => d.createBindGroup({ layout: this.ptPipe!.getBindGroupLayout(0), entries: this.traceEntries(accum[k], upres) })) as [GPUBindGroup, GPUBindGroup]
     const composite = [0, 1].map(k =>
       [0, 1].map(h =>
         d.createBindGroup({
@@ -2179,6 +2173,62 @@ export class PyroEngine {
     this.ptT = { targets: t, upres, accum, comp, trace, composite, display }
     this.pt.key = ''
     return this.ptT
+  }
+
+  // The path tracer's bindings (the image pass's, then the average it reads, its uniforms, the key-free map).
+  private traceEntries(prev: GPUTexture, upres: boolean): GPUBindGroupEntry[] {
+    const g = this.grids!
+    const v = (x: GPUTexture) => x.createView()
+    const res: GPUBindingResource[] = [{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), v(g.detA[0]), v(g.detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: g.fireLight }, this.blueTex.createView({ dimension: '2d-array' }), upres ? v(this.upres!.tex[0]) : this.dummy3d.createView(), v(g.flame)]
+    return [
+      ...res.map((resource, binding) => ({ binding, resource })),
+      { binding: 31, resource: { buffer: g.skin } },
+      { binding: 32, resource: { buffer: g.ballSheet } },
+      { binding: 33, resource: this.envTex.createView() },
+      { binding: 34, resource: v(g.light2) },
+      { binding: 35, resource: v(g.vel[0]) },
+      { binding: 36, resource: v(prev) },
+      { binding: 37, resource: { buffer: this.ptBuf } },
+      { binding: 38, resource: this.envResTex.createView() },
+    ]
+  }
+
+  // Development check of the fire's light (PATH_TRACE's fluence): per cell of the grid's middle plane along z, the
+  // image pass's fire light (its light volume), the reference's sampling of the flames' own (lux of luminance), and
+  // the soot's extinction there (1/m), four floats a cell, row 0 at the top.
+  async fireFieldCheck(): Promise<{ n: Vec3; data: Float32Array } | null> {
+    if (!this.grids) return null
+    const d = this.device
+    const [nx, ny] = this.grids.n
+    const m = d.createShaderModule({ code: PATH_TRACE })
+    const pipe = await d.createRenderPipelineAsync({
+      layout: 'auto',
+      vertex: { module: m, entryPoint: 'vs' },
+      fragment: { module: m, entryPoint: 'fluence', targets: [{ format: 'rgba32float' }] },
+      primitive: { topology: 'triangle-list' },
+    })
+    const target = d.createTexture({ size: [nx, ny], format: 'rgba32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC })
+    const prev = d.createTexture({ size: [1, 1], format: 'rgba32float', usage: GPUTextureUsage.TEXTURE_BINDING })
+    const group = d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: this.traceEntries(prev, this.upresActive() && !!this.upres) })
+    const bpr = Math.ceil((nx * 16) / 256) * 256
+    const read = d.createBuffer({ size: bpr * ny, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }] })
+    rp.setPipeline(pipe)
+    rp.setBindGroup(0, group)
+    rp.draw(3)
+    rp.end()
+    enc.copyTextureToBuffer({ texture: target }, { buffer: read, bytesPerRow: bpr }, [nx, ny])
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const raw = new Float32Array(read.getMappedRange())
+    const data = new Float32Array(nx * ny * 4)
+    for (let y = 0; y < ny; y++) data.set(raw.subarray((y * bpr) / 4, (y * bpr) / 4 + nx * 4), y * nx * 4)
+    read.unmap()
+    read.destroy()
+    target.destroy()
+    prev.destroy()
+    return { n: this.grids.n, data }
   }
 
   // The path-traced reference (PATH_TRACE), while paused: on, traced frames accumulate behind the wipe; off (or
@@ -2309,14 +2359,15 @@ export class PyroEngine {
     if (this.metering || !this.grids || this.state.sourceType !== 'fire') return
     this.metering = true
     const d = this.device
-    const read = d.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const read = d.createBuffer({ size: 48, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
-    enc.copyBufferToBuffer(this.grids.fireLight, 0, read, 0, 16)
+    enc.copyBufferToBuffer(this.grids.fireLight, 0, read, 0, 48)
     d.queue.submit([enc.finish()])
     try {
       await read.mapAsync(GPUMapMode.READ)
       const dx = DOMAIN_WIDTH / this.grids.n[0]
-      this.fireCd = new Float32Array(read.getMappedRange())[3] * dx * dx * dx
+      // (The cells' own glow, which the meter was set by; FIRE_SUM.)
+      this.fireCd = new Float32Array(read.getMappedRange())[10] * dx * dx * dx
       read.unmap()
     } catch {}
     read.destroy()

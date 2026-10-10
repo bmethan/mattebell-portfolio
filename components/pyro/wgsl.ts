@@ -2126,6 +2126,15 @@ fn density(w: vec3<f32>) -> f32 { return sigmaOf(textureSampleLevel(scal, samp, 
 // The fire's light here, shadowed by the soot: each slice of the fire's height as a point light at its brightness-
 // weighted centre, carrying its emitted intensity (I / r^2), through the optical depth on the way (12 samples). In
 // kilolux of luminance (the colour is the fire's overall colour), so it fits half precision near the flames.
+// The share of a uniformly glowing, absorbing sphere's light that leaves it, for its optical radius tau (the escape
+// probability; e.g. Modest, Radiative Heat Transfer): 3 / (4 tau) (1 - 1 / (2 tau^2) + (1 / tau + 1 / (2 tau^2)) e^(-2 tau)),
+// which goes to 1 for thin soot and to 3 / (4 tau), the surface's share, for thick. (Under 0.5 its series, which the
+// closed form loses to rounding there.)
+fn escapeSphere(tau: f32) -> f32 {
+  if (tau < 0.5) { return 1.0 + tau * (-0.75 + tau * (0.4 + tau * (-0.16666667 + tau * 0.05714286))); }
+  let t2 = tau * tau;
+  return 0.75 / tau * (1.0 - 0.5 / t2 + (1.0 / tau + 0.5 / t2) * exp(-2.0 * tau));
+}
 fn fireIrradiance(w: vec3<f32>) -> f32 {
   if (P.fire.x < 0.5) { return 0.0; }
   let vol = P.grid.x * P.grid.x * P.grid.x;
@@ -2148,9 +2157,20 @@ fn fireIrradiance(w: vec3<f32>) -> f32 {
       }
     }
     if (vis <= 0.0) { continue; }
-    var tau = 0.0;
-    for (var i = 0; i < 12; i++) { tau += density(w + d * ((f32(i) + 0.5) / 12.0)); }
-    e += vis * lum * exp(-tau * dist / 12.0) / (r2 + BAND_R2);
+    // The soot on the way: outside the slice (beyond the bed's radius from its centre) it dims the light as it does;
+    // inside, it is the slice's own, mixed with its glow, and the share of that glow that gets out is a glowing sphere's
+    // of that optical radius (escapeSphere). Counted all the way to the centre, the densest soot over the bed's middle
+    // hid most of a campfire's light from the smoke above it (by half, against the path-traced reference); counted only
+    // to the edge, dense smoke wrapped round an oil fire let three times too much through.
+    let rad = max(P.src.w, 0.1);
+    var tauOut = 0.0;
+    var tauIn = 0.0;
+    for (var i = 0; i < 12; i++) {
+      let f = (f32(i) + 0.5) / 12.0;
+      let s = density(w + d * f) * dist / 12.0;
+      if ((1.0 - f) * dist < rad) { tauIn += s; } else { tauOut += s; }
+    }
+    e += vis * lum * exp(-tauOut) * escapeSphere(tauIn) / (r2 + BAND_R2);
   }
   return 0.001 * e;
 }
@@ -2219,69 +2239,13 @@ fn planck(kelvin: f32) -> vec3<f32> {
 `
 }
 
-// 9b. Sums over the grid, each step, per workgroup and then across workgroups: the fire's light, for the smoke and
-// the floor (its total emitted intensity, from soot too thin to hide itself, and its brightness-weighted centre, lit
-// as a point light from there); the fire bed's area (its mask's integral, which spreads the fuel); and the heat
-// release rate.
-export const FIRE_SUM = /* wgsl */ `
-${SIM_COMMON}
-${RENDER_COMMON}
-${fireCommon(3)}
-@group(0) @binding(2) var scal: texture_3d<f32>;
-@group(0) @binding(4) var<storage, read_write> partial: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read> hrr: array<f32>;
-var<workgroup> sumE: array<vec4<f32>, 64>;
-var<workgroup> sumP: array<vec4<f32>, 64>;
-var<workgroup> sumB: array<vec4<f32>, 64>;
-
-@compute @workgroup_size(4, 4, 4)
-fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
-  let c = vec3<i32>(id);
-  let vol = P.grid.x * P.grid.x * P.grid.x;
-  var e = vec3<f32>(0.0);
-  var b = vec4<f32>(0.0);
-  if (all(c < nCells()) && P.fire.x > 0.5) {
-    let s = textureLoad(scal, c, 0);
-    // Emission per unit volume (cd/m3): what the soot absorbs times the blackbody radiance at its temperature.
-    let g = gasOf(s);
-    // (Only the soot formed by now glows; and the flame's own light, chemiluminescence.)
-    let heatMW = hrr[cellIndex(c)] * 1e-6;
-    var formed = 1.0;
-    if (heatMW > 0.0) { formed = sootFormed(g, heatMW); }
-    e = (1.0 - R.skyCol.w) * sigmaOf(s) * formed * chroma() * planck(radiatingKelvin(T_AMB + g.rise, heatMW));
-    e += CHEMI_COLOUR * (CHEMI_CD * heatMW);
-    let bed = bedMask(worldOf(vec3<f32>(id) + 0.5)) * P.grid.x * P.grid.x;
-    b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
-  }
-  let lum = ap1Lum(e);
-  sumE[li] = vec4<f32>(e, lum);
-  sumP[li] = vec4<f32>(worldOf(vec3<f32>(id) + 0.5) * lum, 0.0);
-  sumB[li] = b;
-  workgroupBarrier();
-  for (var st = 32u; st > 0u; st = st >> 1u) {
-    if (li < st) {
-      sumE[li] += sumE[li + st];
-      sumP[li] += sumP[li + st];
-      sumB[li] += sumB[li + st];
-    }
-    workgroupBarrier();
-  }
-  if (li == 0u) {
-    let k = wid.x + nw.x * (wid.y + nw.y * wid.z);
-    partial[3u * k] = sumE[0];
-    partial[3u * k + 1u] = sumP[0];
-    partial[3u * k + 2u] = sumB[0];
-  }
-}
-`
-
 export const FIRE_SUM_TOTAL = /* wgsl */ `
 // x: the number of partial sums (one per workgroup of FIRE_SUM); y, z, w: its workgroups along x, y and z.
 @group(0) @binding(0) var<uniform> C: vec4<u32>;
 @group(0) @binding(1) var<storage, read> partial: array<vec4<f32>>;
 // 0: the emitted intensity summed over cells, per unit of cell volume (rgb, and its luminance); 1: its centre; 2: the
-// bed's area (m2) and the heat release rate (W); then for each of FIRE_BANDS slices of the grid's height, its emitted
-// intensity (as 0) and its centre.
+// bed's area (m2), the heat release rate (W) and the cells' own glow (as 0's luminance, for the meter); then for each
+// of FIRE_BANDS slices of the grid's height, its emitted intensity (as 0) and its centre.
 @group(0) @binding(2) var<storage, read_write> result: array<vec4<f32>>;
 const FIRE_BANDS = ${FIRE_BANDS}u;
 var<workgroup> sE: array<vec4<f32>, 256>;
@@ -3060,10 +3024,13 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
     skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y * ch);
   }
   // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
-  // light from each band of its height, I cos / r^2 (the floor reaches beyond the light volume, and smoke rises away
-  // from the light between the flames and the floor, so the smoke does not shadow it here; the reference set does).
+  // light from each band of its height, I cos / r^2, shadowed by the soot on the way: the light volume's shadowed light
+  // just above the floor (or, beyond the gas, at the nearest point of it) over the same bands' unshadowed light there
+  // gives the mean transmittance (as for the collision ball); and by the reference set.
   var fireLux = 0.0;
+  var seen = 0.0;
   let cellVol = P.grid.x * P.grid.x * P.grid.x;
+  let q = clamp(pf + nf * P.grid.x, P.origin.xyz, domainHi());
   for (var b = 0u; b < FIRE_BANDS; b++) {
     let lum = fireLight[3u + 2u * b].w * cellVol;
     if (lum <= 0.0) { continue; }
@@ -3071,7 +3038,10 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
     let r2 = dot(d, d) + BAND_R2;
     let dl = length(d);
     fireLux += lum * max(dot(d, nf), 0.0) / (sqrt(r2) * r2) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
+    let dq = fireLight[4u + 2u * b].xyz - q;
+    seen += lum / (dot(dq, dq) + BAND_R2);
   }
+  if (seen > 0.0) { fireLux *= clamp(1000.0 * textureSampleLevel(light, samp, uvwOf(q), 0.0).w / seen, 0.0, 1.0); }
   let fireE = fireColour * fireLux;
   // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
   let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
@@ -3164,6 +3134,49 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
     col += T * select(R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(rd.y, 0.0))), envBackdrop(rd), envOn());
   }
   return col;
+}
+
+// The gas at w as the image pass marches it, step for step: extinction at 550 nm, the soot's glow per unit absorbed, the
+// flame's own light per metre; at moment tau of the shutter (0: the step's own). The path-traced reference marches the
+// same, and the fire's light is summed from it (FIRE_SUM).
+struct Gas3 { sig: f32, glow: vec3<f32>, chem: vec3<f32> }
+const ROT = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
+fn gasAt(w: vec3<f32>, tau: f32, withLight: bool) -> Gas3 {
+  var wm = w;
+  if (R.camera.x > 0.0 && tau != 0.0) {
+    let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
+    wm = w - u * tau;
+  }
+  let uvm = uvwOf(wm);
+  let s4 = scalSmooth(uvm);
+  let fade = edgeFade(uvm) * offBallStairs(wm);
+  var sig = sigmaOf(s4) * fade;
+  let upres = R.wb2.w > 0.5;
+  if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvm, 0.0).x, 0.0) * fade; }
+  var out = Gas3(0.0, vec3<f32>(0.0), vec3<f32>(0.0));
+  var heat = 0.0;
+  if (R.fire.x > 0.5) {
+    heat = textureSampleLevel(flameTex, samp, uvm, 0.0).x * offBallShell(wm);
+    if (heat > 0.0) {
+      sig *= sootFormed(gasOf(s4), heat);
+      if (withLight) { out.chem = CHEMI_COLOUR * (CHEMI_CD * heat * fade); }
+    }
+  }
+  if (sig > 1e-3) {
+    if (R.detail.z > 0.0 && !upres) {
+      let thin = 1.0 - smoothstep(0.2, 4.0, sig);
+      let faint = smoothstep(0.0, 1.0, sig);
+      sig *= clamp(1.0 + 2.0 * R.detail.z * detail(wm, uvm) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
+    }
+    let rise = riseOf(s4);
+    if (withLight && R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
+      var kelvin = radiatingKelvin(T_AMB + rise, heat);
+      if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, ROT)); }
+      out.glow = (1.0 - R.skyCol.w) * planck(kelvin);
+    }
+  }
+  out.sig = sig;
+  return out;
 }
 
 `
@@ -3351,6 +3364,80 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `
 
+// 9b. Sums over the grid, each step, per workgroup and then across workgroups: the fire's light, for the smoke and
+// the floor (its total emitted intensity, from soot too thin to hide itself, and its brightness-weighted centre, lit
+// as a point light from there); the fire bed's area (its mask's integral, which spreads the fuel); and the heat
+// release rate.
+export const FIRE_SUM = /* wgsl */ `
+${RENDER_LIB}
+@group(0) @binding(40) var<storage, read_write> partial: array<vec4<f32>>;
+@group(0) @binding(41) var<storage, read> hrr: array<f32>;
+var<workgroup> sumE: array<vec4<f32>, 64>;
+var<workgroup> sumP: array<vec4<f32>, 64>;
+var<workgroup> sumB: array<vec4<f32>, 64>;
+
+// Each cell's glow as the image pass draws it (gasAt): the mean of eight points, one in each eighth of the cell, of its
+// interpolated soot and temperature, its detail and its subgrid flame temperature, and the flame's own light. A
+// blackbody's glow climbs so steeply with temperature that the cells' own values give several times more: the hottest
+// cells, at the bed, are only a sliver of the interpolated field (for the campfire about four times more light than the
+// flames show; the path-traced reference found it). Cells with no soot, or too cool to glow and not burning (under
+// 600 K, below 0.05 MW/m3), are skipped: most of the smoke.
+// The cells' own glow is summed too, for the camera's meter, which was set by it.
+const OCTANTS = array<vec3<f32>, 8>(
+  vec3<f32>(-0.25, -0.25, -0.25), vec3<f32>(0.25, -0.25, -0.25), vec3<f32>(-0.25, 0.25, -0.25), vec3<f32>(0.25, 0.25, -0.25),
+  vec3<f32>(-0.25, -0.25, 0.25), vec3<f32>(0.25, -0.25, 0.25), vec3<f32>(-0.25, 0.25, 0.25), vec3<f32>(0.25, 0.25, 0.25));
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+  // (The bindings the glow reads, all of them, so the layout is the engine's.)
+  _ = textureDimensions(upresTex);
+  _ = textureDimensions(velTex);
+  let c = vec3<i32>(id);
+  let vol = P.grid.x * P.grid.x * P.grid.x;
+  var e = vec3<f32>(0.0);
+  var b = vec4<f32>(0.0);
+  if (all(c < nCells()) && P.fire.x > 0.5) {
+    let s = textureLoad(scal, c, 0);
+    let g = gasOf(s);
+    let heatMW = hrr[cellIndex(c)] * 1e-6;
+    // The cell's own glow, for the meter.
+    var formed = 1.0;
+    if (heatMW > 0.0) { formed = sootFormed(g, heatMW); }
+    let own = (1.0 - R.skyCol.w) * sigmaOf(s) * formed * chroma() * planck(radiatingKelvin(T_AMB + g.rise, heatMW)) + CHEMI_COLOUR * (CHEMI_CD * heatMW);
+    if ((s.x > 0.0 || heatMW > 0.0) && (g.rise > 300.0 || heatMW > 0.05)) {
+      let w = worldOf(vec3<f32>(id) + 0.5);
+      let ch = chroma();
+      for (var k = 0; k < 8; k++) {
+        let m = gasAt(w + OCTANTS[k] * P.grid.x, 0.0, true);
+        e += m.sig * ch * m.glow + m.chem;
+      }
+      e *= 0.125;
+    }
+    let bed = bedMask(worldOf(vec3<f32>(id) + 0.5)) * P.grid.x * P.grid.x;
+    b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, ap1Lum(own), 0.0);
+  }
+  let lum = ap1Lum(e);
+  sumE[li] = vec4<f32>(e, lum);
+  sumP[li] = vec4<f32>(worldOf(vec3<f32>(id) + 0.5) * lum, 0.0);
+  sumB[li] = b;
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st = st >> 1u) {
+    if (li < st) {
+      sumE[li] += sumE[li + st];
+      sumP[li] += sumP[li + st];
+      sumB[li] += sumB[li + st];
+    }
+    workgroupBarrier();
+  }
+  if (li == 0u) {
+    let k = wid.x + nw.x * (wid.y + nw.y * wid.z);
+    partial[3u * k] = sumE[0];
+    partial[3u * k + 1u] = sumP[0];
+    partial[3u * k + 2u] = sumB[0];
+  }
+}
+`
+
 // 12. The path-traced reference (paused, the Path trace button): the same scene and the same gas, its light
 // carried exactly, one path per pixel each frame, averaged. It checks the image pass's shortcuts: multiple scattering
 // as octaves of the sun's light, the fire's light as eight point lights through a half-resolution light volume, the
@@ -3431,48 +3518,6 @@ fn coneOf(i: i32) -> Cone {
   if (i == 0) { return Cone(Q.l0d.xyz, Q.l0d.w, Q.l0e.xyz); }
   if (i == 1) { return Cone(Q.l1d.xyz, Q.l1d.w, Q.l1e.xyz); }
   return Cone(Q.l2d.xyz, Q.l2d.w, Q.l2e.xyz);
-}
-
-// The gas at w (the image pass's, step for step): extinction at 550 nm, the soot's glow per unit absorbed, the flame's
-// own light per metre.
-struct Gas3 { sig: f32, glow: vec3<f32>, chem: vec3<f32> }
-const ROT = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
-fn gasAt(w: vec3<f32>, tau: f32, withLight: bool) -> Gas3 {
-  var wm = w;
-  if (R.camera.x > 0.0) {
-    let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
-    wm = w - u * tau;
-  }
-  let uvm = uvwOf(wm);
-  let s4 = scalSmooth(uvm);
-  let fade = edgeFade(uvm) * offBallStairs(wm);
-  var sig = sigmaOf(s4) * fade;
-  let upres = R.wb2.w > 0.5;
-  if (upres) { sig = R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvm, 0.0).x, 0.0) * fade; }
-  var out = Gas3(0.0, vec3<f32>(0.0), vec3<f32>(0.0));
-  var heat = 0.0;
-  if (R.fire.x > 0.5) {
-    heat = textureSampleLevel(flameTex, samp, uvm, 0.0).x * offBallShell(wm);
-    if (heat > 0.0) {
-      sig *= sootFormed(gasOf(s4), heat);
-      if (withLight) { out.chem = CHEMI_COLOUR * (CHEMI_CD * heat * fade); }
-    }
-  }
-  if (sig > 1e-3) {
-    if (R.detail.z > 0.0 && !upres) {
-      let thin = 1.0 - smoothstep(0.2, 4.0, sig);
-      let faint = smoothstep(0.0, 1.0, sig);
-      sig *= clamp(1.0 + 2.0 * R.detail.z * detail(wm, uvm) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
-    }
-    let rise = riseOf(s4);
-    if (withLight && R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
-      var kelvin = radiatingKelvin(T_AMB + rise, heat);
-      if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, ROT)); }
-      out.glow = (1.0 - R.skyCol.w) * planck(kelvin);
-    }
-  }
-  out.sig = sig;
-  return out;
 }
 
 // How much of the light from dist along l reaches p: none past a surface (the floor, the cyc, the balls, the set);
@@ -3820,6 +3865,43 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   if (!all(sample == sample) || any(abs(sample) > vec3<f32>(1e30))) { sample = vec3<f32>(0.0); }
   let prev = select(vec3<f32>(0.0), textureLoad(ptPrev, px, 0).xyz, Q.n > 0u);
   return vec4<f32>(prev + (sample - prev) / f32(Q.n + 1u), 1.0);
+}
+
+// (Development check, engine.ts fireFieldCheck: at the centres of the grid's cells in its middle plane along z, one a
+// pixel, the fire's light as the image pass has it (its light volume, lux of luminance), as the reference samples the
+// flames (64 points, as above, the light from within two cells left out), and the soot's extinction there.)
+@fragment
+fn fluence(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  rng = pcg(u32(fc.x) + u32(fc.y) * 8192u + 977u);
+  _ = fireLight[0];
+  _ = textureNumLayers(blueTex);
+  _ = textureDimensions(light2);
+  _ = textureDimensions(ptPrev);
+  _ = textureDimensions(envRes);
+  _ = Q.n;
+  _ = skin[0];
+  _ = ballSheet[0];
+  _ = textureDimensions(envTex);
+  _ = textureDimensions(velTex);
+  let n = vec3<f32>(P.dims.xyz);
+  let w = P.origin.xyz + vec3<f32>(floor(fc.x) + 0.5, n.y - floor(fc.y) - 0.5, 0.5 * n.z) * P.grid.x;
+  fireTot = 0.0;
+  if (R.fire.x > 0.5) {
+    for (var b = 0u; b < FIRE_BANDS; b++) { fireTot += max(fireLight[3u + 2u * b].w, 0.0); }
+  }
+  var acc = 0.0;
+  for (var i = 0; i < 64; i++) { acc += ap1Lum(fireToward(w, 0.0, chroma(), false, vec3<f32>(0.0, 1.0, 0.0), 0.0).L); }
+  // (And the flames' whole light as the sampling sees it, cd: its glow over the points' probability, averaged.)
+  var total = 0.0;
+  for (var i = 0; i < 64; i++) {
+    let x = fireSample();
+    let pdf = firePdf(x);
+    if (pdf > 0.0) {
+      let m = gasAt(x, 0.0, true);
+      total += ap1Lum(m.sig * chroma() * m.glow + m.chem) / pdf;
+    }
+  }
+  return vec4<f32>(acc / 64.0, 1000.0 * textureSampleLevel(light, samp, uvwOf(w), 0.0).w, total / 64.0, 1.0);
 }
 `
 

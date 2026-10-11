@@ -3099,12 +3099,21 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
   }
   // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
   // light from each band of its height, I cos / r^2, shadowed by the soot on the way: the light volume's shadowed light
-  // just above the floor (or, beyond the gas, at the nearest point of it) over the same bands' unshadowed light there
-  // gives the mean transmittance (as for the collision ball); and by the reference set.
+  // just above the floor (or, beyond the gas, where the line toward the fire's centre enters it) over the same bands'
+  // unshadowed light there gives the mean transmittance (as for the collision ball); and by the reference set. (Taken
+  // at the nearest point of the gas instead, the wall behind a fire read its shadow straight up through the plume
+  // above the flames, a far steeper line than the light it takes, and caught under half of it, as little as a ninth.)
   var fireLux = 0.0;
   var seen = 0.0;
   let cellVol = P.grid.x * P.grid.x * P.grid.x;
-  let q = clamp(pf + nf * P.grid.x, P.origin.xyz, domainHi());
+  let lo = P.origin.xyz;
+  let hi = domainHi();
+  var q = pf + nf * P.grid.x;
+  if (any(q < lo) || any(q > hi)) {
+    let toFire = normalize(fireLight[1].xyz - q);
+    let bh = boxHit(q, toFire, lo, hi);
+    q = select(clamp(q, lo, hi), q + toFire * (max(bh.x, 0.0) + 0.5 * P.grid.x), bh.y > max(bh.x, 0.0));
+  }
   for (var b = 0u; b < FIRE_BANDS; b++) {
     let lum = fireLight[3u + 2u * b].w * cellVol;
     if (lum <= 0.0) { continue; }

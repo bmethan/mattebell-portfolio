@@ -2119,9 +2119,17 @@ ${RENDER_COMMON}
 @group(0) @binding(3) var scal: texture_3d<f32>;
 @group(0) @binding(4) var lightOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(5) var<storage, read> fireSums: array<vec4<f32>>;
-@group(0) @binding(6) var light2Out: texture_storage_3d<rgba16float, write>; // x: optical depth toward the rig's rim
+// x: optical depth toward the rig's rim; y: the sky's (the dome's mean, as a depth); in the bottom layer, z and w: the
+// sun's and the fire's light on the floor below (floorLit).
+@group(0) @binding(6) var light2Out: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(7) var upresTex: texture_3d<f32>; // the upres grid's density over each coarse cell (UPRES_COARSE)
 
-fn density(w: vec3<f32>) -> f32 { return sigmaOf(textureSampleLevel(scal, samp, uvwOf(w), 0.0)); }
+// The smoke as the image pass draws it: with the upres grid on, its density. (Shadowed by the coarse grid's instead,
+// the densest smoke caught up to a third more of the sun than the path-traced reference gives it.)
+fn density(w: vec3<f32>) -> f32 {
+  if (R.wb2.w > 0.5) { return R.sunCol.w * max(textureSampleLevel(upresTex, samp, uvwOf(w), 0.0).x, 0.0); }
+  return sigmaOf(textureSampleLevel(scal, samp, uvwOf(w), 0.0));
+}
 
 // The fire's light here, shadowed by the soot: each slice of the fire's height as a point light at its brightness-
 // weighted centre, carrying its emitted intensity (I / r^2), through the optical depth on the way (12 samples). In
@@ -2135,7 +2143,7 @@ fn escapeSphere(tau: f32) -> f32 {
   let t2 = tau * tau;
   return 0.75 / tau * (1.0 - 0.5 / t2 + (1.0 / tau + 0.5 / t2) * exp(-2.0 * tau));
 }
-fn fireIrradiance(w: vec3<f32>) -> f32 {
+fn fireIrradiance(w: vec3<f32>, n: vec3<f32>) -> f32 {
   if (P.fire.x < 0.5) { return 0.0; }
   let vol = P.grid.x * P.grid.x * P.grid.x;
   var e = 0.0;
@@ -2170,7 +2178,8 @@ fn fireIrradiance(w: vec3<f32>) -> f32 {
       let s = density(w + d * f) * dist / 12.0;
       if ((1.0 - f) * dist < rad) { tauIn += s; } else { tauOut += s; }
     }
-    e += vis * lum * exp(-tauOut) * escapeSphere(tauIn) / (r2 + BAND_R2);
+    let facing = select(1.0, max(dot(d, n), 0.0) / dist, dot(n, n) > 0.0);
+    e += vis * facing * lum * exp(-tauOut) * escapeSphere(tauIn) / (r2 + BAND_R2);
   }
   return 0.001 * e;
 }
@@ -2213,10 +2222,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // Every cell gets its depths, smoke or not: the floor's shadow and sky lookups land in empty cells too.
   let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x, false);
   let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x, false);
-  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w)));
+  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w, vec3<f32>(0.0))));
   var tauRim = 0.0;
   if (R.rimDir.w > 0.5) { tauRim = depth(w, R.rimDir.xyz, 1.5 * P.grid.x, false); }
-  textureStore(light2Out, vec3<i32>(id), vec4<f32>(tauRim, 0.0, 0.0, 0.0));
+  // The sky's light through the smoke: the dome's mean transmittance (straight up and four ways at 30 degrees), kept as
+  // a depth. Halving the depth straight up stood in for it, which let too much sky into the middle of a plume and too
+  // little under its cap, where the sky comes in from the sides (against the path-traced reference, 20% over and 35%
+  // under).
+  var tm = exp(-tauUp);
+  for (var k = 0; k < 4; k++) {
+    let a = 0.78539816 + 1.5707963 * f32(k);
+    tm += exp(-depth(w, vec3<f32>(0.8660254 * cos(a), 0.5, 0.8660254 * sin(a)), 2.0 * P.grid.x, false));
+  }
+  let tauDome = -log(max(tm / 5.0, 1e-6));
+  // The bottom layer also holds the floor's light under it, for the light the floor sends up into the smoke: the sun's
+  // share on it (its cosine, through the smoke) and the fire's (kilolux, by the cosine). (The sky's is the layer's dome.)
+  var floorLit = vec2<f32>(0.0);
+  if (id.y == 0u) {
+    let pf = vec3<f32>(w.x, 0.5 * P.grid.x, w.z);
+    floorLit = vec2<f32>(max(R.sunDir.y, 0.0) * exp(-depth(pf, R.sunDir.xyz, 1.5 * P.grid.x, false)), fireIrradiance(pf, vec3<f32>(0.0, 1.0, 0.0)));
+  }
+  textureStore(light2Out, vec3<i32>(id), vec4<f32>(tauRim, tauDome, floorLit));
 }
 `
 
@@ -2293,9 +2319,10 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
 
 // 10. The image, in photometric units: march each camera ray through the volume (Hillaire's integration of each
 // step, T (1 - exp(-sigma dt)) S), lit by the sun through the light volume with Wrenninge's multiple-scattering
-// octaves (weighted by the smoke around: sunOctaves) and Henyey-Greenstein phase, by the sky through the optical depth
-// above, and by the fire; hot soot glows at its blackbody radiance; then a floor that catches the smoke's shadow,
-// fading to black. Written exposed, at high dynamic range, for the accumulation pass.
+// octaves (weighted by the smoke around and its albedo) and Henyey-Greenstein phase, by the sky through the smoke over
+// it and the floor's light through the smoke under it (smokeAround), and by the fire; hot soot glows at its blackbody
+// radiance; then a floor that catches the smoke's shadow, fading to black. Written exposed, at high dynamic range, for
+// the accumulation pass.
 // (Its library, which the path-traced reference shares: the bindings, the scene and the gas.)
 const RENDER_LIB = /* wgsl */ `
 ${SIM_COMMON}
@@ -3021,7 +3048,7 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
   var skyVis = vec3<f32>(1.0);
   let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
   if (all(uv.xz >= vec2<f32>(0.0)) && all(uv.xz <= vec2<f32>(1.0))) {
-    skyVis = exp(-0.5 * textureSampleLevel(light, samp, uv, 0.0).y * ch);
+    skyVis = exp(-textureSampleLevel(light2, samp, vec3<f32>(uv.x, 0.5 / f32(textureDimensions(light2).y), uv.z), 0.0).y * ch);
   }
   // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
   // light from each band of its height, I cos / r^2, shadowed by the soot on the way: the light volume's shadowed light
@@ -3076,7 +3103,7 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
   let ph1 = hg(cosT, 0.5 * g);
   let ph2 = hg(cosT, 0.25 * g);
   let albedo = R.skyCol.w;
-  let skyScatter = select(R.skyCol.xyz * INV_2PI, envScatter(rd, g), envOn());
+  let skyScatter = select(R.skyCol.xyz * INV_PI * domeShare(rd.y, g), envScatter(rd, g), envOn());
   let rimDir = R.rimDir.xyz;
   let pr0 = hg(dot(rd, rimDir), g);
   var col = vec3<f32>(0.0);
@@ -3106,13 +3133,10 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
       }
       if (sig > 1e-3) {
         let L = textureSampleLevel(light, samp, uvw, 0.0);
-        let tauS = L.x * ch;
-        let lsun = sunOctaves(tauS, ph0, ph1, ph2, max(L.x, L.y), albedo) * ballSun(w, sun);
-        var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + skyScatter * exp(-0.5 * L.y * ch) + fireColour * 1000.0 * L.w * INV_4PI);
-        if (rimOn()) {
-          let tauR = textureSampleLevel(light2, samp, uvw, 0.0).x * ch;
-          S += albedo * R.rimCol.xyz * INV_4PI * exp(-tauR) * pr0;
-        }
+        let near = smokeAround(uvw, w, L, rd, g, albedo, ch, fireColour, skyScatter);
+        let lsun = octaves(L.x * ch, ph0, ph1, ph2, near.f, albedo, g) * ballSun(w, sun);
+        var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + near.amb + fireColour * 1000.0 * L.w * INV_4PI);
+        if (rimOn()) { S += albedo * R.rimCol.xyz * INV_4PI * exp(-near.tauRim * ch) * pr0; }
         var B = vec3<f32>(0.0);
         let rise = riseOf(s4);
         if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) { B = (1.0 - albedo) * planck(radiatingKelvin(T_AMB + rise, heat)); }
@@ -3179,17 +3203,57 @@ fn gasAt(w: vec3<f32>, tau: f32, withLight: bool) -> Gas3 {
   return out;
 }
 
-// A light's share reaching a point of the smoke, scattered once (through tauS, the depth toward it, by phase p0) and
-// again (Wrenninge's octaves: through half and a quarter of the depth, by broader phases p1 and p2). Light scattered
-// once scatters again only if it meets more smoke and is scattered there rather than absorbed, so each octave is
-// weighted by the albedo times the chance of meeting smoke, 1 - exp(-depth), with depth the larger of the optical
-// depths toward the light and overhead (a stand-in for the depth around the point); the second octave by that twice.
-// The fixed weights (a half, a quarter) added three quarters again to every point's single scattering, whatever the
-// smoke, so sunlit smoke came out 30 to 60% brighter than the path-traced reference (dark smoke the most); weighted,
-// a plume's core is within 7% of it, near-white or sooty.
-fn sunOctaves(tauS: vec3<f32>, p0: f32, p1: f32, p2: f32, depth: f32, albedo: f32) -> vec3<f32> {
-  let a = albedo * (1.0 - exp(-depth));
-  return exp(-tauS) * p0 + a * exp(-0.5 * tauS) * p1 + a * a * exp(-0.25 * tauS) * p2;
+// Light that reaches a point of the smoke from a light outside it: scattered there once, through tauS (the optical depth
+// toward the light) by the phase p0; and, as Wrenninge's octaves, light that has scattered before, arriving by broader
+// phases (p1, p2) and dimmed less. Each further scattering needs the light to meet the smoke again and be scattered
+// rather than absorbed, so the first octave is weighted by a = c x albedo x f, with f the chance of meeting the smoke
+// again (smokeAround) and c = 1.35 - albedo / 2, and the second by a squared. Scattered light dims with depth as
+// diffusion theory has it, at sqrt(3 (1 - albedo) (1 - albedo g)) of the light's own rate (at least half: Wrenninge's
+// octaves halve it, which suits clouds, albedo near 1; smoke of albedo 0.6 dims its scattered light about as fast as the
+// light itself). The weights and their depths were fitted against the path-traced reference, the sun's light alone, on
+// plumes of albedo 0.2, 0.6 and 0.95. (With fixed weights, a half and a quarter, the octaves added three quarters again
+// to every point's single scattering, and sunlit smoke came out 30 to 60% brighter than the reference.)
+fn octaves(tauS: vec3<f32>, p0: f32, p1: f32, p2: f32, f: f32, albedo: f32, g: f32) -> vec3<f32> {
+  let b = clamp(sqrt(3.0 * (1.0 - albedo) * (1.0 - albedo * g)), 0.5, 1.0);
+  let a = (1.35 - 0.5 * albedo) * albedo * f;
+  return exp(-tauS) * p0 + a * exp(-b * tauS) * p1 + a * a * exp(-b * b * tauS) * p2;
+}
+
+// The share of a Henyey-Greenstein lobe (anisotropy g) about a direction of elevation sine mu that lies in the upper
+// hemisphere: the lobe's Legendre series against the hemisphere's, 1/2 + 3/4 g mu - 7/16 g^3 P3(mu). Smoke that scatters
+// forward, seen from below against the sky, takes more than half the sky's light toward the camera (a plume's top, a
+// tenth more), and seen from above, more of the floor's.
+fn domeShare(mu: f32, g: f32) -> f32 {
+  let p3 = 0.5 * mu * (5.0 * mu * mu - 3.0);
+  return clamp(0.5 + 0.75 * g * mu - 0.4375 * g * g * g * p3, 0.0, 1.0);
+}
+
+// The light around a point of the smoke (uvw; at wm, the light volume there L) besides the sun, the rim and the fire,
+// toward the camera along rd, per unit of albedo (cd/m2): the sky through the smoke over it (the dome's mean
+// transmittance) with its own octaves, and the floor's light through the smoke under it. The floor is the one straight
+// below (lit by the sun, the sky and the fire, through the smoke over it), its studio fade averaged over the floor the
+// point sees, by the lower hemisphere's share of the phase. (A map's spherical harmonics hold the light from below as
+// well; with a map, only the map.) Against the path-traced reference the sky's light scattered more than once was 5 to
+// 10% of a plume's, and the floor's 1 to 9%, the most low down. Also f, the chance that light scattered here meets the
+// smoke again (the mean of 1 - exp(-depth) toward the sun, up and down), and the depths down and toward the rim.
+struct Around { amb: vec3<f32>, f: f32, tauDown: f32, tauRim: f32 }
+fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f32, albedo: f32, ch: vec3<f32>, fireColour: vec3<f32>, skyScatter: vec3<f32>) -> Around {
+  let L2 = textureSampleLevel(light2, samp, uvw, 0.0);
+  let uvF = vec3<f32>(uvw.x, 0.5 / f32(textureDimensions(light2).y), uvw.z);
+  let tauDown = max(textureSampleLevel(light, samp, uvF, 0.0).y - L.y, 0.0);
+  let f = 1.0 - (exp(-L.x) + exp(-L.y) + exp(-tauDown)) / 3.0;
+  var amb = skyScatter * exp(-L2.y * ch);
+  if (!envOn()) {
+    let b = clamp(sqrt(3.0 * (1.0 - albedo) * (1.0 - albedo * g)), 0.5, 1.0);
+    let a = (1.35 - 0.5 * albedo) * albedo * f;
+    amb += R.skyCol.xyz * INV_2PI * (a * exp(-b * L2.y * ch) + a * a * exp(-b * b * L2.y * ch));
+    let F2 = textureSampleLevel(light2, samp, uvF, 0.0);
+    let r2 = R.floorCol.w * R.floorCol.w;
+    let fade = select(exp(-dot(wm.xz, wm.xz) / r2) / (1.0 + wm.y * wm.y / r2), 1.0, R.scene.x > 0.5);
+    let floorL = R.floorCol.xyz * INV_PI * fade * (R.sunCol.xyz * F2.z + R.skyCol.xyz * exp(-F2.y * ch) + fireColour * 1000.0 * F2.w);
+    amb += floorL * (1.0 - domeShare(rd.y, g)) * exp(-tauDown * ch);
+  }
+  return Around(amb, f, tauDown, L2.x);
 }
 `
 
@@ -3231,9 +3295,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let rot = mat3x3<f32>(0.8, -0.6, 0.0, 0.36, 0.48, 0.8, -0.48, -0.64, 0.6);
   // The fire's colour at unit luminance (its light's strength comes from the light volume).
   let fireColour = fireLight[0].xyz / max(fireLight[0].w, 1e-12);
-  // The sky's light scattered toward the camera, before the smoke above dims it: a uniform dome over open ground
-  // (radiance E / pi, half of it seen by an isotropic scatterer), or an HDR environment through the phase function.
-  let skyScatter = select(R.skyCol.xyz * INV_2PI, envScatter(rd, g), envOn());
+  // The sky's light scattered toward the camera, before the smoke dims it: a uniform dome over open ground (radiance
+  // E / pi, by its share of the phase, domeShare), or an HDR environment through the phase function.
+  let skyScatter = select(R.skyCol.xyz * INV_PI * domeShare(rd.y, g), envScatter(rd, g), envOn());
   // The softbox rig's rim, through the same phase octaves as the sun.
   let rimDir = R.rimDir.xyz;
   let cosR = dot(rd, rimDir);
@@ -3308,17 +3372,15 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           sig *= clamp(1.0 + 2.0 * R.detail.z * detail(wm, uvm) * (0.35 + 0.65 * thin) * faint, 0.0, 2.0);
         }
         let L = textureSampleLevel(light, samp, uvm, 0.0);
-        let tauS = L.x * ch;
-        let lsun = sunOctaves(tauS, ph0, ph1, ph2, max(L.x, L.y), albedo) * ballSun(wm, sun);
-        let amb = skyScatter * exp(-0.5 * L.y * ch);
+        let near = smokeAround(uvm, wm, L, rd, g, albedo, ch, fireColour, skyScatter);
+        let lsun = octaves(L.x * ch, ph0, ph1, ph2, near.f, albedo, g) * ballSun(wm, sun);
         // The fire's light, shadowed by the soot on the way (from the light volume, in kilolux).
         let fireE = fireColour * 1000.0 * L.w;
         // Light scattered toward the camera per unit of extinction, cd/m2: the phase function is hg / (4 pi).
-        var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + amb + fireE * INV_4PI);
+        var S = albedo * (R.sunCol.xyz * INV_4PI * lsun + near.amb + fireE * INV_4PI);
         if (rimOn()) {
-          let rimDepth = textureSampleLevel(light2, samp, uvm, 0.0).x;
-          let tauR = rimDepth * ch;
-          let lrim = sunOctaves(tauR, pr0, pr1, pr2, max(rimDepth, L.y), albedo) * ballSun(wm, rimDir);
+          let fRim = 1.0 - (exp(-near.tauRim) + exp(-L.y) + exp(-near.tauDown)) / 3.0;
+          let lrim = octaves(near.tauRim * ch, pr0, pr1, pr2, fRim, albedo, g) * ballSun(wm, rimDir);
           S += albedo * R.rimCol.xyz * INV_4PI * lrim;
         }
         // Emission (Kirchhoff's law): what the soot absorbs, it emits at the blackbody radiance of its temperature.
@@ -3448,9 +3510,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
 
 // 12. The path-traced reference (paused, the Path trace button): the same scene and the same gas, its light
 // carried exactly, one path per pixel each frame, averaged. It checks the image pass's shortcuts: multiple scattering
-// as octaves of the sun's light, the fire's light as eight point lights through a half-resolution light volume, the
-// sky through the optical depth straight up, the floor lit by the fire unshadowed, the environment as nine spherical
-// harmonics. Here the flames themselves are the fire's light, reached by the paths that find them.
+// as octaves, the fire's light as eight point lights through a half-resolution light volume, the sky's through the
+// dome's mean transmittance from five directions, the floor's light into the smoke as the floor's straight below, the
+// environment as nine spherical harmonics. Here the flames themselves are the fire's light, reached by the paths that
+// find them.
 //
 //   the gas       the image pass's own: its tricubic density, detail and subgrid flame temperature, the soot formed by
 //                 now, the flame's own blue light, the burning ball's flames, at one moment of the shutter per path
@@ -3481,7 +3544,7 @@ struct PtParams {
   frame: u32,     // seeds this frame's paths
   n: u32,         // paths averaged so far
   maxBounce: u32,
-  pad: u32,
+  parts: u32,     // (development: light left out, to split the reference's by where it comes from; engine.ts ptParts)
   l0d: vec4<f32>, // three cone lights: toward each, the cosine of its half-angle (0: off)
   l0e: vec4<f32>, // and its illuminance at normal incidence (lux, by colour)
   l1d: vec4<f32>,
@@ -3646,6 +3709,7 @@ fn fireToward(p: vec3<f32>, tau: f32, ch: vec3<f32>, surface: bool, dir: vec3<f3
 
 // What a path that leaves the scene finds. seen: a camera ray, or one off the chrome ball.
 fn leaving(d: vec3<f32>, seen: bool) -> vec3<f32> {
+  if (!seen && (Q.parts & 4u) != 0u) { return vec3<f32>(0.0); } // (the sky left out)
   var L = vec3<f32>(0.0);
   if (envOn()) {
     // A map (the rig's studio has none): seen whole, lit by without its key (a light of its own).
@@ -3735,6 +3799,7 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     for (var b = 0u; b < FIRE_BANDS; b++) { fireTot += max(fireLight[3u + 2u * b].w, 0.0); }
   }
   var sampled = false;
+  var lastLeg = false; // (single scattering only: the path goes on only to find the sky)
   var pv = vec3<f32>(0.0); // the vertex the segment leaves
   for (var bounce = 0u; bounce < 64u; bounce++) {
     // The surface ahead: the floor (or the cyc), the collision ball, the set.
@@ -3762,6 +3827,7 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     }
     // The gas up to it: glow, and a collision or not, step by step.
     var scattered = false;
+    var dead = false;
     let box = boxHit(ro, rd, P.origin.xyz, domainHi());
     if (box.y > max(box.x, 0.0) && box.x < tS) {
       let ds = 0.5 * P.grid.x;
@@ -3795,13 +3861,14 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           let sm = max(sc.x, max(sc.y, sc.z));
           let q = 1.0 - exp(-sm * ds);
           if (rand() < q) {
+            if (lastLeg) { dead = true; break; }
             // A collision, somewhere in the step: scattered (the albedo's share; the rest absorbed, in the weight).
             let tc = t + min(-log(max(1.0 - rand() * q, 1e-7)) / sm, ds);
             beta *= albedo * (1.0 - Ts) / q;
             let p = ro + rd * tc;
             for (var k = 0; k < 3; k++) {
               let c = coneOf(k);
-              if (c.c <= 0.0) { continue; }
+              if (c.c <= 0.0 || (Q.parts & 8u) != 0u) { continue; }
               let l = around(c.d, 1.0 - rand() * (1.0 - c.c));
               L += beta * c.e * shadowT(p, l, tau) * hg(dot(rd, l), g) * INV_4PI;
             }
@@ -3819,7 +3886,13 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         t += ds;
       }
     }
+    // (Development, Q.parts: 1 no light off the floor but the camera's own sight of it, 2 single scattering in the gas,
+    // 4 no sky, 8 no lights.)
+    if (dead) { break; }
+    if (scattered && (Q.parts & 2u) != 0u) { lastLeg = true; }
     if (!scattered) {
+      if (kind == 0 && tS < 1e8 && !seen && (Q.parts & 1u) != 0u) { break; }
+      if (lastLeg && tS < 1e8) { break; }
       if (tS >= 1e8) {
         L += beta * leaving(rd, seen);
         break;
@@ -3843,7 +3916,7 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       let po = p + s.ng * 1e-3;
       for (var k = 0; k < 3; k++) {
         let c = coneOf(k);
-        if (c.c <= 0.0) { continue; }
+        if (c.c <= 0.0 || (Q.parts & 8u) != 0u) { continue; }
         let l = around(c.d, 1.0 - rand() * (1.0 - c.c));
         L += beta * c.e * shadowT(po, l, tau) * surfF(s, v, l);
       }
@@ -4228,5 +4301,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     let bk = c / BLOCK;
     atomicStore(&heldNext[(bk.z * nb.y + bk.y) * nb.x + bk.x], 1u);
   }
+}
+`
+
+// The upres grid's density averaged over each coarse cell (its eight fine cells), for the light pass, whose lattice is
+// coarser still. (Read in every direction from every point of the lattice, the fine grid's texture, eight times the
+// size, took the light pass from 1 ms to 16 on a laptop.)
+export const UPRES_COARSE = /* wgsl */ `
+@group(0) @binding(0) var fine: texture_3d<f32>;
+@group(0) @binding(1) var coarse: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = textureDimensions(coarse);
+  if (any(id >= n)) { return; }
+  var s = 0.0;
+  for (var k = 0u; k < 8u; k++) {
+    s += max(textureLoad(fine, 2u * id + vec3<u32>(k & 1u, (k >> 1u) & 1u, k >> 2u), 0).x, 0.0);
+  }
+  textureStore(coarse, id, vec4<f32>(0.125 * s, 0.0, 0.0, 0.0));
 }
 `

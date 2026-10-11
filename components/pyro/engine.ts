@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -240,6 +240,7 @@ interface Pipes {
   glareDown: GPURenderPipeline
   glareUp: GPURenderPipeline
   upres: GPUComputePipeline
+  upresCoarse: GPUComputePipeline
   ptComposite: GPURenderPipeline
 }
 
@@ -385,7 +386,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       },
       primitive: { topology: 'triangle-list' },
     })
-  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -429,6 +430,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(DIFFUSE),
     compute(LIGHT),
     compute(UPRES),
+    compute(UPRES_COARSE),
     d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: renderModule, entryPoint: 'vs' },
@@ -457,7 +459,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       primitive: { topology: 'triangle-list' },
     }),
   ])
-  return { fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
+  return { fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
 }
 
 export function prewarmPyro() {
@@ -590,7 +592,7 @@ export class PyroEngine {
   // Wavelet-turbulence upres for a smoke source: its two textures (twice the grid's resolution), made when first
   // needed; the blocks of it that held smoke last step and this; the pass's bind group and uniform; the render bind
   // group that reads it; and whether it must refill from the coarse density on its next step.
-  private upres: { tex: [GPUTexture, GPUTexture]; held: [GPUBuffer, GPUBuffer]; group: GPUBindGroup; render: GPUBindGroup } | null = null
+  private upres: { tex: [GPUTexture, GPUTexture]; held: [GPUBuffer, GPUBuffer]; group: GPUBindGroup; render: GPUBindGroup; coarse: GPUTexture; coarseGroup: GPUBindGroup; light: GPUBindGroup } | null = null
   private upresBuf: GPUBuffer
   private upresInit = true
   private upresWasActive = false
@@ -605,6 +607,9 @@ export class PyroEngine {
   private ptBuf: GPUBuffer
   private wipeBuf: GPUBuffer
   private pt = { on: false, n: 0, idx: 0, wipe: 0.5, key: '', frame: 0 }
+  // (Development: light the reference leaves out, to split its light by where it comes from: 1 the floor's but for the
+  // camera's own sight of it, 2 all but single scattering in the gas, 4 the sky's, 8 the lights'; set before tracing.)
+  ptParts = 0
   private ptLights = new Float32Array(24)
   private ptT: { targets: Targets; upres: boolean; accum: [GPUTexture, GPUTexture]; comp: GPUTexture; trace: [GPUBindGroup, GPUBindGroup]; composite: GPUBindGroup[][]; display: GPUBindGroup } | null = null
   private stateVersion = 0
@@ -791,6 +796,7 @@ export class PyroEngine {
     const p = this.pipes!
     this.grids?.textures.forEach(t => t.destroy())
     this.upres?.tex.forEach(t => t.destroy())
+    this.upres?.coarse.destroy()
     this.upres?.held.forEach(b => b.destroy())
     this.upres = null
     this.fireLit = true
@@ -1089,7 +1095,7 @@ export class PyroEngine {
           ],
         }),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
-        light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2)]),
+        light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2), this.dummy3d.createView()]),
         render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }]),
       },
     }
@@ -1473,6 +1479,7 @@ export class PyroEngine {
     const up = upActive ? this.ensureUpres() : null
     if (up) {
       run(pass, p.upres, up.group, [Math.ceil((2 * nx) / 4), Math.ceil((2 * ny) / 4), Math.ceil((2 * nz) / 4)])
+      run(pass, p.upresCoarse, up.coarseGroup, cc) // (for the light pass)
     }
     run(pass, p.advDetail, g.bg.advDetail, cc)
     pass.end()
@@ -2010,7 +2017,14 @@ export class PyroEngine {
           { binding: 35, resource: v(g.vel[0]) },
         ],
       })
-      this.upres = { tex, held, group, render }
+      // (The light volume shadows the same smoke, averaged over each coarse cell.)
+      const coarse = d.createTexture({ size: [nx, ny, nz], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING })
+      const coarseGroup = d.createBindGroup({ layout: p.upresCoarse.getBindGroupLayout(0), entries: entries([v(tex[1]), v(coarse)]) })
+      const light = d.createBindGroup({
+        layout: p.light.getBindGroupLayout(0),
+        entries: entries([{ buffer: this.simBuf }, { buffer: this.renderBuf }, this.sampler, v(g.scal[0]), v(g.light), { buffer: g.fireLight }, v(g.light2), v(coarse)]),
+      })
+      this.upres = { tex, held, group, render, coarse, coarseGroup, light }
       this.upresInit = true
     }
     const ageA = (this.simTime / DETAIL_PERIOD) % 1
@@ -2067,7 +2081,7 @@ export class PyroEngine {
     if (this.lightDirty) {
       const pass = enc.beginComputePass()
       pass.setPipeline(p.light)
-      pass.setBindGroup(0, g.bg.light)
+      pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.light : g.bg.light)
       pass.dispatchWorkgroups(Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4))
       pass.end()
       this.lightDirty = false
@@ -2098,7 +2112,7 @@ export class PyroEngine {
       this.pt.key = key
       this.pt.n = 0
     }
-    const head = new Uint32Array([this.pt.frame++, this.pt.n, PT_BOUNCES, 0]) // (the seed, the count, the cap)
+    const head = new Uint32Array([this.pt.frame++, this.pt.n, PT_BOUNCES, this.ptParts]) // (the seed, the count, the cap, the parts left out)
     const buf = new ArrayBuffer(112)
     new Uint32Array(buf, 0, 4).set(head)
     new Float32Array(buf, 16, 24).set(this.ptLights)
@@ -2605,6 +2619,7 @@ export class PyroEngine {
     if (this.upresActive()) {
       const up = this.ensureUpres()
       timed('upres', one(p.upres, up.group, [Math.ceil((2 * nx) / 4), Math.ceil((2 * ny) / 4), Math.ceil((2 * nz) / 4)]))
+      timed('upres: coarse', one(p.upresCoarse, up.coarseGroup, cc))
       enc.copyTextureToTexture({ texture: up.tex[1] }, { texture: up.tex[0] }, [2 * nx, 2 * ny, 2 * nz])
     }
     timed('detail', one(p.advDetail, g.bg.advDetail, cc))
@@ -2613,7 +2628,7 @@ export class PyroEngine {
       one(p.fireTotal, g.bg.fireTotal, [1 + FIRE_BANDS, 1, 1])(pass)
     })
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
-    timed('light', one(p.light, g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
+    timed('light', one(p.light, this.upresActive() && this.upres ? this.upres.light : g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
     const k = labels.length
     labels.push('render')
     const t = this.ensureTargets()

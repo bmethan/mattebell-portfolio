@@ -2034,6 +2034,14 @@ struct RParams {
 
 const FIRE_BANDS = ${FIRE_BANDS}u;
 const BAND_R2 = 0.02; // m2: softens each band of the fire's light over the flame's width
+// How much of a round light gets past a round occluder of radius a, missing its centre by miss, where the light's radius
+// as seen across the occluder is pen: the occluder hides at most its share of the light's disc, (a / pen)^2, and that
+// fades out as the two discs part (an approximation of their overlap). For a light much smaller than the occluder, a
+// sharp edge softened over pen.
+fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
+  let cover = min(a * a / max(pen * pen, 1e-10), 1.0);
+  return 1.0 - cover * (1.0 - smoothstep(abs(pen - a), pen + a, miss));
+}
 // Where fuel is burning, soot radiates at the flame's temperature, not the cell's. The burning happens in sheets far
 // thinner than a cell, at about 1400 K, and the soot forms in them, while the cell's mean temperature spreads the same
 // heat over all of it (a thin flame on a burning surface would never glow at the mean). How much of a cell's soot sits
@@ -2153,7 +2161,8 @@ fn fireIrradiance(w: vec3<f32>, n: vec3<f32>) -> f32 {
     let d = fireSums[4u + 2u * b].xyz - w;
     let r2 = dot(d, d);
     // The collision ball's shadow, soft: the band is a slice of flame as wide as the bed, whose penumbra at the ball
-    // is that width scaled by how far along the way the ball sits (and this lattice is too coarse for a hard edge).
+    // is that width scaled by how far along the way the ball sits (and this lattice is too coarse for a hard edge); a ball
+// smaller than the penumbra hides only its share of the slice (discVis).
     let dist = max(sqrt(r2), 1e-6);
     var vis = 1.0;
     if (P.ball.w > 0.0) {
@@ -2161,7 +2170,7 @@ fn fireIrradiance(w: vec3<f32>, n: vec3<f32>) -> f32 {
       if (along > 0.0 && along < dist) {
         let miss = length(P.ball.xyz - w - d / dist * along);
         let pen = max(P.src.w, 0.1) * along / dist + P.grid.x;
-        vis = smoothstep(P.ball.w - pen, P.ball.w + pen, miss);
+        vis = discVis(P.ball.w, pen, miss);
       }
     }
     if (vis <= 0.0) { continue; }
@@ -2912,13 +2921,15 @@ fn refMat(what: i32) -> BallMat {
 }
 // How much of a light at distance dist along l reaches p past the set (its balls, their stands and the chart; all but
 // the piece skip, the one p is on), soft over a penumbra that widens with the distance behind each, pen0 + penK x (as
-// for the collision ball).
+// for the collision ball): the light's own radius as seen across the piece. A piece smaller than that hides only its
+// share of the light: a ball of radius a, (a / pen)^2 of it; a stand, a strip across it, about 4 a / (pi pen); the chart
+// as a disc of its area. (Ramped to black whatever its size, the set's shadows of the fire on the floor came out two to
+// three times too dark against the path-traced reference: a stand 1.6 cm across, in front of a flame a metre wide.)
 fn sphereVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK: f32) -> f32 {
   let tb = s.xyz - p;
   let along = dot(tb, l);
   if (along <= 0.0 || along >= dist) { return 1.0; }
-  let pen = pen0 + penK * along;
-  return smoothstep(s.w - pen, s.w + pen, length(tb - l * along));
+  return discVis(s.w, pen0 + penK * along, length(tb - l * along));
 }
 // A stand: where the way to the light passes its upright line (seen from above), how far from it, if at a height the
 // stand reaches.
@@ -2930,7 +2941,8 @@ fn standVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK
   if (t <= 0.0 || t >= dist || y < 0.0 || y > s.y - s.w) { return 1.0; }
   let pen = pen0 + penK * t;
   let r = P.refChartO.w;
-  return smoothstep(r - pen, r + pen, length(p.xz + l.xz * t - s.xz));
+  let cover = min(4.0 * r / (3.14159265 * max(pen, 1e-6)), 1.0);
+  return 1.0 - cover * (1.0 - smoothstep(max(r - pen, 0.0), r + pen, length(p.xz + l.xz * t - s.xz)));
 }
 fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32, skip: i32) -> f32 {
   if (!refOn()) { return 1.0; }
@@ -2955,7 +2967,10 @@ fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32, skip: 
       let b = dot(q, V) / lv;
       let inside = min(min(a, lu - a), min(b, lv - b));
       let pen = pen0 + penK * t;
-      vis *= smoothstep(-pen, pen, -inside);
+      // (Its edges for a sharp shadow; for a soft one, a disc of its area, about its centre.)
+      let aeq = sqrt(lu * lv * 0.31830989);
+      let soft = discVis(aeq, pen, length(vec2<f32>(a - 0.5 * lu, b - 0.5 * lv)));
+      vis *= mix(smoothstep(-pen, pen, -inside), soft, smoothstep(0.5 * aeq, 2.0 * aeq, pen));
     }
   }
   return vis;

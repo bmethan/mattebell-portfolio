@@ -578,6 +578,7 @@ export class PyroEngine {
   private readingBall = false
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
+  private fireCdDrawn = 0 // (the fire's glow as drawn, for the meter's A/B)
   private metering = false
   private meterEV: number | null = null
   private meterAt = 0
@@ -2339,8 +2340,9 @@ export class PyroEngine {
     const rig = s.env === 'rig' ? luxOfEV(s.sunEV) * Math.max((s.rigKey ? 1 : 0) + (s.rigFill ? RIG.fill.ratio : 0), 0.05) : 0
     const lux = s.env === 'rig' ? rig : this.envLight ? luxOfEV(s.skyEV) : luxOfEV(s.sunEV) + luxOfEV(s.skyEV)
     const ambient = Math.log2((METER_AMBIENT * lux) / 2.5)
-    if (s.sourceType !== 'fire' || this.fireCd <= 0) return ambient
-    return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(this.fireCd / METER_FIRE_CD))
+    const cd = s.meterAB === 'b' ? this.fireCdDrawn : this.fireCd
+    if (s.sourceType !== 'fire' || cd <= 0) return ambient
+    return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(cd / METER_FIRE_CD))
   }
   private exposureEV() {
     const s = this.state
@@ -2367,7 +2369,9 @@ export class PyroEngine {
       await read.mapAsync(GPUMapMode.READ)
       const dx = DOMAIN_WIDTH / this.grids.n[0]
       // (The cells' own glow, which the meter was set by; FIRE_SUM.)
-      this.fireCd = new Float32Array(read.getMappedRange())[10] * dx * dx * dx
+      const sums = new Float32Array(read.getMappedRange())
+      this.fireCd = sums[10] * dx * dx * dx
+      this.fireCdDrawn = sums[3] * dx * dx * dx
       read.unmap()
     } catch {}
     read.destroy()

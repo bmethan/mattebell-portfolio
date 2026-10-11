@@ -818,6 +818,17 @@ export default function PyroLab() {
                       Manual
                     </Pill>
                   </Group>
+                  {/* TEMPORARY A/B of the fire meter (params.ts meterAB): remove once decided. */}
+                  {pyro.exposureMode === 'auto' && pyro.sourceType === 'fire' && (
+                    <Group label="Meter A/B">
+                      <Pill on={pyro.meterAB === 'a'} onClick={() => update({ meterAB: 'a' })}>
+                        A: as now
+                      </Pill>
+                      <Pill on={pyro.meterAB === 'b'} onClick={() => update({ meterAB: 'b' })}>
+                        B: follows the fire
+                      </Pill>
+                    </Group>
+                  )}
                   {pyro.exposureMode === 'auto' ? (
                     <Slider label="Compensation" min={-3} max={3} step={0.25} value={pyro.exposureComp} digits={2} unit=" EV" onChange={v => update({ exposureComp: v })} />
                   ) : (

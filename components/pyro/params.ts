@@ -67,6 +67,9 @@ export interface PyroState {
   shutter: number // degrees: a film camera's shutter angle at 24 frames a second (180 is open 1/48 s; 0, no motion blur)
   glare: number // the share of the light the lens scatters into its glare (0 to 0.1)
   reference: boolean // the on-set reference beside the fire: a colour chart, a grey ball and a chrome ball
+  // TEMPORARY A/B for Matthew's call (remove once decided): the auto exposure's fire meter on the cells' own glow, as
+  // it was set ('a'), or on the fire's glow as the flames are drawn, which the fire's light now follows ('b').
+  meterAB: 'a' | 'b'
   // One of the Lookdev lab's HDR environments lighting the scene (environment.ts), its softbox rig ('rig': key, fill
   // and rim, engine.ts RIG), or none (the sun and a flat sky). With a map, the light azimuth turns it, the Sky EV sets
   // its illuminance on open ground, and the floor runs to the horizon under it. With the rig, the light azimuth and
@@ -132,6 +135,7 @@ export const PYRO_DEFAULTS: PyroState = {
   shutter: 180,
   glare: 0.04,
   reference: true,
+  meterAB: 'a',
   env: 'none',
   rigKey: true,
   rigFill: true,

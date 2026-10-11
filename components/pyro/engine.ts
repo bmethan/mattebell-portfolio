@@ -608,7 +608,8 @@ export class PyroEngine {
   private wipeBuf: GPUBuffer
   private pt = { on: false, n: 0, idx: 0, wipe: 0.5, key: '', frame: 0 }
   // (Development: light the reference leaves out, to split its light by where it comes from: 1 the floor's but for the
-  // camera's own sight of it, 2 all but single scattering in the gas, 4 the sky's, 8 the lights'; set before tracing.)
+  // camera's own sight of it, 2 all but single scattering in the gas, 4 the sky's, 8 the lights', 16 all scattering in
+  // the gas (its glow alone, dimmed); set before tracing.)
   ptParts = 0
   private ptLights = new Float32Array(24)
   private ptT: { targets: Targets; upres: boolean; accum: [GPUTexture, GPUTexture]; comp: GPUTexture; trace: [GPUBindGroup, GPUBindGroup]; composite: GPUBindGroup[][]; display: GPUBindGroup } | null = null
@@ -1906,8 +1907,8 @@ export class PyroEngine {
     }
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
     const tex = (more = 0) => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: usage | more })
-    const hdr = tex()
-    // (The history is readable, for the probes that compare it with the path-traced reference.)
+    // (The frame and its history are readable, for the probes that compare them with the path-traced reference.)
+    const hdr = tex(GPUTextureUsage.COPY_SRC)
     const hist: [GPUTexture, GPUTexture] = [tex(GPUTextureUsage.COPY_SRC), tex(GPUTextureUsage.COPY_SRC)]
     const gw = Math.max(1, w >> 1)
     const gh = Math.max(1, h >> 1)
@@ -1976,6 +1977,25 @@ export class PyroEngine {
     }
     draw(screen.createView(), p.display, t.display[next], false, stamp(true, true))
     this.histIndex = next
+  }
+
+  // (Development: the fire's sums again for the frame as it stands, for the probes, which read them at a paused frame.)
+  async resumFire() {
+    const g = this.grids!
+    const p = this.pipes!
+    const [nx, ny, nz] = g.n
+    const enc = this.device.createCommandEncoder()
+    const pass = enc.beginComputePass()
+    pass.setPipeline(p.fireSum)
+    pass.setBindGroup(0, g.bg.fireSum)
+    pass.dispatchWorkgroups(Math.ceil(nx / 4), Math.ceil(ny / 4), Math.ceil(nz / 4))
+    pass.setPipeline(p.fireTotal)
+    pass.setBindGroup(0, g.bg.fireTotal)
+    pass.dispatchWorkgroups(1 + FIRE_BANDS, 1, 1)
+    pass.end()
+    this.device.queue.submit([enc.finish()])
+    await this.device.queue.onSubmittedWorkDone()
+    this.lightDirty = true
   }
 
   private upresActive() {

@@ -3022,6 +3022,52 @@ fn ballSurface(ph: vec3<f32>, rd: vec3<f32>, ch: vec3<f32>, fireColour: vec3<f32
 }
 
 // The floor's (or the cyc's) light toward the camera, cd/m2: at pf, facing nf, met tFloor along rd.
+// The cyc (the gray and charcoal backgrounds): its wall stands as tall and wide as the view behind the fire, so every
+// point of it sees the sky only in front, the quarter of directions up and toward the camera (a cosine-weighted
+// (n.y + n.z) / 2 of it: half for the floor and for the wall, where the open floor would see all of it), and the rest
+// of what it sees is the cyc itself. Against the path-traced reference the floor in front took the whole sky and came
+// out up to a quarter too bright, and the wall, without the floor's light, a tenth too dark.
+fn cycOn() -> bool { return R.scene.x > 1.5 && !envOn(); }
+// What the rest of the cyc gives a point p of it facing n (lux on that rest): the floor sees the wall, lit by its open
+// quarter of sky, the sun and the fire straight on (at the fire's height behind p); the wall sees the floor, lit by the
+// sky and the sun (the fire's light on the floor comes in through cycFireBounce); the sweep between, some of each.
+fn cycSeen(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let other = vec3<f32>(0.0, n.z, n.y);
+  var e = R.skyCol.xyz * 0.5 + R.sunCol.xyz * max(dot(other, R.sunDir.xyz), 0.0);
+  if (R.fire.x > 0.5) {
+    let c = fireLight[1].xyz;
+    let d = c - vec3<f32>(p.x, c.y, CYC_Z - CYC_R);
+    let d2 = dot(d, d) + BAND_R2;
+    e += other.z * fireLight[0].xyz * P.grid.x * P.grid.x * P.grid.x * max(d.z, 0.0) / (sqrt(d2) * d2);
+  }
+  return e;
+}
+// The fire-lit floor about the fire as a light on a point p facing n (lux): a 6 x 4 grid of floor patches, 3 m across
+// the fire's centre by the domain's depth, each a Lambertian of the cyc's albedo lit by the fire's light on the floor
+// there (the light volume's bottom layer). (The wall behind a bonfire takes a tenth to a fifth of its light so.)
+fn cycFireBounce(p: vec3<f32>, n: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
+  if (R.fire.x < 0.5) { return vec3<f32>(0.0); }
+  let lo = P.origin.xyz;
+  let hi = domainHi();
+  let c = fireLight[1].xyz;
+  let fy = 0.5 / f32(textureDimensions(light2).y);
+  let pw = 0.5;
+  let pd = (hi.z - lo.z) / 4.0;
+  var e = 0.0;
+  for (var i = 0; i < 6; i++) {
+    for (var j = 0; j < 4; j++) {
+      let q = vec3<f32>(c.x + (f32(i) - 2.5) * pw, 0.0, lo.z + (f32(j) + 0.5) * pd);
+      let ux = (q.x - lo.x) / (hi.x - lo.x);
+      if (ux < 0.0 || ux > 1.0) { continue; }
+      let ef = 1000.0 * textureSampleLevel(light2, samp, vec3<f32>(ux, fy, (q.z - lo.z) / (hi.z - lo.z)), 0.0).w;
+      let d = q - p;
+      let d2 = max(dot(d, d), 0.04);
+      e += ef * max(-d.y, 0.0) * max(dot(n, d), 0.0) / (d2 * d2);
+    }
+  }
+  return fireColour * R.floorCol.x * INV_PI * e * pw * pd;
+}
+
 fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
   let sun = R.sunDir.xyz;
   let rimDir = R.rimDir.xyz;
@@ -3071,9 +3117,16 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
   }
   if (seen > 0.0) { fireLux *= clamp(1000.0 * textureSampleLevel(light, samp, uvwOf(q), 0.0).w / seen, 0.0, 1.0); }
   let fireE = fireColour * fireLux;
-  // The sky on a surface facing nf: the flat sky's open half (all of it on the floor), or the environment.
-  let skyE = select(R.skyCol.xyz * (0.5 + 0.5 * nf.y), envIrradiance(nf), envOn());
-  var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
+  // The sky on a surface facing nf: the flat sky's open half (all of it on the floor; on the cyc, its open quarter, and
+  // the rest of the cyc), or the environment.
+  var skyShare = 0.5 + 0.5 * nf.y;
+  var bounce = vec3<f32>(0.0);
+  if (cycOn()) {
+    skyShare = 0.5 * (max(nf.y, 0.0) + max(nf.z, 0.0));
+    bounce = R.floorCol.xyz * (1.0 - skyShare) * cycSeen(pf, nf) + cycFireBounce(pf, nf, fireColour);
+  }
+  let skyE = select(R.skyCol.xyz * skyShare, envIrradiance(nf), envOn());
+  var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE + bounce;
   if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch) * refShadow(pf, rimDir, 1e9, 0.01, 0.15, -1); }
   var floorL = R.floorCol.xyz * INV_PI * E * fade;
   // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
@@ -3140,7 +3193,11 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
         if (rimOn()) { S += albedo * R.rimCol.xyz * INV_4PI * exp(-near.tauRim * ch) * pr0; }
         var B = vec3<f32>(0.0);
         let rise = riseOf(s4);
-        if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) { B = (1.0 - albedo) * planck(radiatingKelvin(T_AMB + rise, heat)); }
+        if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
+          let glow = planck(radiatingKelvin(T_AMB + rise, heat));
+          B = (1.0 - albedo) * glow;
+          S += albedo * flameSelfLit(sig, ch, glow, fireColour * 1000.0 * L.w);
+        }
         let Ts = exp(-sig * ch * ds);
         col += T * (1.0 - Ts) * (S + B);
         T *= Ts;
@@ -3220,6 +3277,16 @@ fn octaves(tauS: vec3<f32>, p0: f32, p1: f32, p2: f32, f: f32, albedo: f32, g: f
   return exp(-tauS) * p0 + a * exp(-b * tauS) * p1 + a * a * exp(-b * b * tauS) * p2;
 }
 
+// Kirchhoff in the flames: soot that glows sits in its own glow, which it scatters as it does any light. Where the soot
+// is thick the light about it nears its blackbody radiance from every side (in a thick flame the radiance is the
+// blackbody's, whatever the albedo), and the fire's light from farther off (fireE, lux) is hidden by it; over l, a bed
+// radius, the light it scatters toward the camera (per unit of albedo, cd/m2) takes glow (1 - exp(-sig l)) of the near
+// glow in place of that share of the far light. Without it a thick flame glowed only (1 - albedo) of its blackbody: the
+// bonfire's flames came out a fifth to two fifths dark against the path-traced reference.
+fn flameSelfLit(sig: f32, ch: vec3<f32>, glow: vec3<f32>, fireE: vec3<f32>) -> vec3<f32> {
+  return (1.0 - exp(-sig * ch * max(P.src.w, 0.1))) * (glow - fireE * INV_4PI);
+}
+
 // The share of a Henyey-Greenstein lobe (anisotropy g) about a direction of elevation sine mu that lies in the upper
 // hemisphere: the lobe's Legendre series against the hemisphere's, 1/2 + 3/4 g mu - 7/16 g^3 P3(mu). Smoke that scatters
 // forward, seen from below against the sky, takes more than half the sky's light toward the camera (a plume's top, a
@@ -3251,7 +3318,10 @@ fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f3
     let F2 = textureSampleLevel(light2, samp, uvF, 0.0);
     let r2 = R.floorCol.w * R.floorCol.w;
     let fade = select(exp(-dot(wm.xz, wm.xz) / r2) / (1.0 + wm.y * wm.y / r2), 1.0, R.scene.x > 0.5);
-    let floorL = R.floorCol.xyz * INV_PI * fade * (R.sunCol.xyz * F2.z + R.skyCol.xyz * exp(-F2.y * ch) + fireColour * 1000.0 * F2.w);
+    var floorE = R.sunCol.xyz * F2.z + R.skyCol.xyz * exp(-F2.y * ch) + fireColour * 1000.0 * F2.w;
+    // (On the cyc the floor sees half the sky, and the wall.)
+    if (cycOn()) { floorE += R.skyCol.xyz * exp(-F2.y * ch) * -0.5 + R.floorCol.xyz * 0.5 * cycSeen(vec3<f32>(wm.x, 0.0, wm.z), vec3<f32>(0.0, 1.0, 0.0)); }
+    let floorL = R.floorCol.xyz * INV_PI * fade * floorE;
     amb += floorL * (1.0 - domeShare(rd.y, g)) * exp(-tauDown * ch);
   }
   return Around(amb, f, tauDown, L2.x);
@@ -3390,7 +3460,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
           var kelvin = radiatingKelvin(T_AMB + rise, heat);
           if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, rot)); }
-          B = (1.0 - albedo) * planck(kelvin);
+          let glow = planck(kelvin);
+          B = (1.0 - albedo) * glow;
+          S += albedo * flameSelfLit(sig, ch, glow, fireE);
         }
         // Integrated exactly over the step for constant properties (Hillaire 2015).
         let Ts = exp(-sig * ch * ds);
@@ -3862,7 +3934,7 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           let sm = max(sc.x, max(sc.y, sc.z));
           let q = 1.0 - exp(-sm * ds);
           if (rand() < q) {
-            if (lastLeg) { dead = true; break; }
+            if (lastLeg || (Q.parts & 16u) != 0u) { dead = true; break; }
             // A collision, somewhere in the step: scattered (the albedo's share; the rest absorbed, in the weight).
             let tc = t + min(-log(max(1.0 - rand() * q, 1e-7)) / sm, ds);
             beta *= albedo * (1.0 - Ts) / q;
@@ -3888,7 +3960,7 @@ fn pt(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       }
     }
     // (Development, Q.parts: 1 no light off the floor but the camera's own sight of it, 2 single scattering in the gas,
-    // 4 no sky, 8 no lights.)
+    // 4 no sky, 8 no lights, 16 no scattering in the gas: its glow, dimmed.)
     if (dead) { break; }
     if (scattered && (Q.parts & 2u) != 0u) { lastLeg = true; }
     if (!scattered) {
@@ -4008,9 +4080,11 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 
 // 11. Temporal accumulation, then the camera. Each frame's march is blended into a running history, which averages
 // away the sampling noise (and, with the motion blur, the shutter's moments); the history is first clamped to the range
-// of the current frame's 3 x 3 neighbourhood (in a luminance-compressed space, so a bright flame does not dominate), so
-// what moves or flickers is not smeared behind it. Then the lens's glare (GLARE), and DISPLAY: the white balance, the
-// view transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and a dither against banding.
+// of the current frame's 3 x 3 neighbourhood (found in a luminance-compressed space, so a bright flame does not set it),
+// so what moves or flickers is not smeared behind it, and the blend is in linear light. (Blended compressed, a
+// flickering flame averaged a sixth darker than its frames do.) Then the lens's glare (GLARE), and DISPLAY: the white
+// balance, the view transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and a dither against
+// banding.
 export const RESOLVE = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
@@ -4041,12 +4115,11 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
       hi = max(hi, q);
     }
   }
-  var blended = cur;
   if (T.x > 0.5) {
     let h = clamp(squash(textureLoad(history, p, 0).xyz), lo, hi);
-    blended = mix(h, cur, T.y);
+    return vec4<f32>(mix(unsquash(h), unsquash(cur), T.y), 1.0);
   }
-  return vec4<f32>(unsquash(blended), 1.0);
+  return vec4<f32>(unsquash(cur), 1.0);
 }
 `
 

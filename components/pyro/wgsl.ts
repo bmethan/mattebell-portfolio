@@ -3045,10 +3045,11 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
     let d2 = dot(tb, tb);
     ballSky = 1.0 - P.ball.w * P.ball.w / d2 * max(dot(tb, nf), 0.0) / sqrt(d2);
   }
+  // (The sky through the smoke: the dome's mean transmittance here, light2.y.)
   var skyVis = vec3<f32>(1.0);
   let uv = uvwOf(pf + vec3<f32>(0.0, 0.5 * P.grid.x, 0.0));
   if (all(uv.xz >= vec2<f32>(0.0)) && all(uv.xz <= vec2<f32>(1.0))) {
-    skyVis = exp(-textureSampleLevel(light2, samp, vec3<f32>(uv.x, 0.5 / f32(textureDimensions(light2).y), uv.z), 0.0).y * ch);
+    skyVis = exp(-textureSampleLevel(light2, samp, uv, 0.0).y * ch);
   }
   // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
   // light from each band of its height, I cos / r^2, shadowed by the soot on the way: the light volume's shadowed light

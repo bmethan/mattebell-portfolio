@@ -55,8 +55,10 @@ export const luxOfEV = (ev: number) => 2.5 * 2 ** ev
 export const exposureOfEV = (ev: number) => 1 / (1.2 * 2 ** ev)
 // Auto exposure. The ambient light is metered as an incident meter reads it, less 2.3 EV (smoke is pale and sits in
 // the open, and the camera's saturation-based exposure runs darker than a meter's grey); a fire sets the least
-// exposure (the highest EV) the frame may take: EV 7 for an 80 kW campfire (about 130 cd), and half a stop more for
-// each doubling of the fire's intensity (less than in proportion: photographers let flames burn out a little).
+// exposure (the highest EV) the frame may take: EV 7 for 130 cd of flame, and a third of a stop more (0.35 EV) for each
+// doubling of the fire's intensity (less than in proportion: photographers let flames burn out a little). The fire's
+// intensity is its flames' as they are drawn (FIRE_SUM): an 80 kW campfire's some 400 to 2,000 cd as it puffs, so
+// EV 7.5 to 8.5.
 export const METER_AMBIENT = 0.2
 export const METER_FIRE_EV = 7
 export const METER_FIRE_CD = 130

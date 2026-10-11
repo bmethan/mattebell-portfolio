@@ -578,7 +578,6 @@ export class PyroEngine {
   private readingBall = false
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
-  private fireCdDrawn = 0 // (the fire's glow as drawn, for the meter's A/B)
   private metering = false
   private meterEV: number | null = null
   private meterAt = 0
@@ -2340,9 +2339,8 @@ export class PyroEngine {
     const rig = s.env === 'rig' ? luxOfEV(s.sunEV) * Math.max((s.rigKey ? 1 : 0) + (s.rigFill ? RIG.fill.ratio : 0), 0.05) : 0
     const lux = s.env === 'rig' ? rig : this.envLight ? luxOfEV(s.skyEV) : luxOfEV(s.sunEV) + luxOfEV(s.skyEV)
     const ambient = Math.log2((METER_AMBIENT * lux) / 2.5)
-    const cd = s.meterAB === 'b' ? this.fireCdDrawn : this.fireCd
-    if (s.sourceType !== 'fire' || cd <= 0) return ambient
-    return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(cd / METER_FIRE_CD))
+    if (s.sourceType !== 'fire' || this.fireCd <= 0) return ambient
+    return Math.max(ambient, METER_FIRE_EV + METER_FIRE_SLOPE * Math.log2(this.fireCd / METER_FIRE_CD))
   }
   private exposureEV() {
     const s = this.state
@@ -2361,17 +2359,14 @@ export class PyroEngine {
     if (this.metering || !this.grids || this.state.sourceType !== 'fire') return
     this.metering = true
     const d = this.device
-    const read = d.createBuffer({ size: 48, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const read = d.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
-    enc.copyBufferToBuffer(this.grids.fireLight, 0, read, 0, 48)
+    enc.copyBufferToBuffer(this.grids.fireLight, 0, read, 0, 16)
     d.queue.submit([enc.finish()])
     try {
       await read.mapAsync(GPUMapMode.READ)
       const dx = DOMAIN_WIDTH / this.grids.n[0]
-      // (The cells' own glow, which the meter was set by; FIRE_SUM.)
-      const sums = new Float32Array(read.getMappedRange())
-      this.fireCd = sums[10] * dx * dx * dx
-      this.fireCdDrawn = sums[3] * dx * dx * dx
+      this.fireCd = new Float32Array(read.getMappedRange())[3] * dx * dx * dx
       read.unmap()
     } catch {}
     read.destroy()

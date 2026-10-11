@@ -2244,8 +2244,8 @@ export const FIRE_SUM_TOTAL = /* wgsl */ `
 @group(0) @binding(0) var<uniform> C: vec4<u32>;
 @group(0) @binding(1) var<storage, read> partial: array<vec4<f32>>;
 // 0: the emitted intensity summed over cells, per unit of cell volume (rgb, and its luminance); 1: its centre; 2: the
-// bed's area (m2), the heat release rate (W) and the cells' own glow (as 0's luminance, for the meter); then for each
-// of FIRE_BANDS slices of the grid's height, its emitted intensity (as 0) and its centre.
+// bed's area (m2) and the heat release rate (W); then for each of FIRE_BANDS slices of the grid's height, its emitted
+// intensity (as 0) and its centre.
 @group(0) @binding(2) var<storage, read_write> result: array<vec4<f32>>;
 const FIRE_BANDS = ${FIRE_BANDS}u;
 var<workgroup> sE: array<vec4<f32>, 256>;
@@ -3381,8 +3381,7 @@ var<workgroup> sumB: array<vec4<f32>, 64>;
 // blackbody's glow climbs so steeply with temperature that the cells' own values give several times more: the hottest
 // cells, at the bed, are only a sliver of the interpolated field (for the campfire about four times more light than the
 // flames show; the path-traced reference found it). Cells with no soot, or too cool to glow and not burning (under
-// 600 K, below 0.05 MW/m3), are skipped: most of the smoke.
-// The cells' own glow is summed too, for the camera's meter, which was set by it.
+// 600 K, below 0.05 MW/m3), are skipped: most of the smoke. The camera's meter reads the same sums.
 const OCTANTS = array<vec3<f32>, 8>(
   vec3<f32>(-0.25, -0.25, -0.25), vec3<f32>(0.25, -0.25, -0.25), vec3<f32>(-0.25, 0.25, -0.25), vec3<f32>(0.25, 0.25, -0.25),
   vec3<f32>(-0.25, -0.25, 0.25), vec3<f32>(0.25, -0.25, 0.25), vec3<f32>(-0.25, 0.25, 0.25), vec3<f32>(0.25, 0.25, 0.25));
@@ -3400,10 +3399,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     let s = textureLoad(scal, c, 0);
     let g = gasOf(s);
     let heatMW = hrr[cellIndex(c)] * 1e-6;
-    // The cell's own glow, for the meter.
-    var formed = 1.0;
-    if (heatMW > 0.0) { formed = sootFormed(g, heatMW); }
-    let own = (1.0 - R.skyCol.w) * sigmaOf(s) * formed * chroma() * planck(radiatingKelvin(T_AMB + g.rise, heatMW)) + CHEMI_COLOUR * (CHEMI_CD * heatMW);
     if ((s.x > 0.0 || heatMW > 0.0) && (g.rise > 300.0 || heatMW > 0.05)) {
       let w = worldOf(vec3<f32>(id) + 0.5);
       let ch = chroma();
@@ -3414,7 +3409,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
       e *= 0.125;
     }
     let bed = bedMask(worldOf(vec3<f32>(id) + 0.5)) * P.grid.x * P.grid.x;
-    b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, ap1Lum(own), 0.0);
+    b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
   }
   let lum = ap1Lum(e);
   sumE[li] = vec4<f32>(e, lum);

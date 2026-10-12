@@ -2612,6 +2612,8 @@ fn bandSpread(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
 @group(0) @binding(35) var velTex: texture_3d<f32>; // the velocity, for the motion blur
 @group(0) @binding(39) var cycBounce: texture_2d<f32>; // the light the rest of the cyc sends to each point of it (CYC_BOUNCE), lux
 @group(0) @binding(43) var cycDirectMap: texture_2d<f32>; // the light straight onto each point of it (CYC_DIRECT), lux
+@group(0) @binding(44) var flameNear: texture_3d<f32>; // the fire's light about each point of the flames (FLAME_NEAR), k cd/m2
+@group(0) @binding(45) var flameNearDir: texture_3d<f32>; // its luminance's first moment and mean (FLAME_NEAR), k cd/m2
 fn rimOn() -> bool { return R.rimDir.w > 0.5; }
 // The rim's shadow on a surface point outside the gas: the optical depth where the way to the rim enters the domain.
 fn rimShadow(p: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
@@ -3479,7 +3481,7 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
         if (R.fire.x > 0.5 && (rise > 400.0 || heat > 0.2)) {
           let glow = planck(radiatingKelvin(T_AMB + rise, heat));
           B = (1.0 - albedo) * glow;
-          S += albedo * flameSelfLit(sig, ch, glow, fireColour * 1000.0 * L.w);
+          S += albedo * flameSelfLit(uvw, fireColour * 1000.0 * L.w, rd, g);
         }
         let Ts = exp(-sig * ch * ds);
         col += T * (1.0 - Ts) * (S + B);
@@ -3560,22 +3562,19 @@ fn octaves(tauS: vec3<f32>, p0: f32, p1: f32, p2: f32, f: f32, albedo: f32, g: f
   return exp(-tauS) * p0 + a * exp(-b * tauS) * p1 + a * a * exp(-b * b * tauS) * p2;
 }
 
-// Kirchhoff in the flames: soot that glows sits in its own glow, which it scatters as it does any light. Where the soot
-// is thick the light about it nears its blackbody radiance from every side (in a thick flame the radiance is the
-// blackbody's, whatever the albedo), and the fire's light from farther off (fireE, lux) is hidden by it; over l, a bed
-// radius, the light it scatters toward the camera (per unit of albedo, cd/m2) takes glow (1 - exp(-sig l)) of the near
-// glow in place of that share of the far light. Without it a thick flame glowed only (1 - albedo) of its blackbody: the
-// bonfire's flames came out a fifth to two fifths dark against the path-traced reference. (It runs over, though: split
-// against the reference, the bonfire's flames scatter a quarter more of the fire's light than they should, nearly all
-// of it this term, at their base. Probed, a point's own glow is 2.7 times the light arriving at it in the sooty core,
-// where the hottest gas is the sootiest, and half to all of it at the sides. Tried: the light arriving from the glowing
-// gas within a bed's radius, marched on the light lattice from each cell's glow as the fire sums draw it (14 ways,
-// dimmed by absorption alone), with the far light dimmed by the mean transmittance. It brought the flames' scattered
-// light within 2% of the reference's but the flames at the bed's edges from 0.95 to 1.28, the far light counting the
-// near cells' light again and the half-resolution lattice reaching into the bed's hot sheet; taking the near light out
-// of the far left the flames 14% short; and it cost 7 ms a frame. Not kept.)
-fn flameSelfLit(sig: f32, ch: vec3<f32>, glow: vec3<f32>, fireE: vec3<f32>) -> vec3<f32> {
-  return (1.0 - exp(-sig * ch * max(P.src.w, 0.1))) * (glow - fireE * INV_4PI);
+// Kirchhoff in the flames: soot that glows sits in the glow about it, which it scatters as it does any light. Where the
+// soot is thick the light about it nears the blackbody radiance of the gas within a mean free path or so (in a thick
+// flame of even temperature, the blackbody's, whatever the albedo). So a glowing point scatters the fire's light as it
+// arrives there (FLAME_NEAR, per unit of albedo, cd/m2): the glowing gas's within a bed's radius, marched, and the rest
+// of the fire's as the slices' point lights have it, through the soot on the way, in place of the slices' alone.
+// (Taken as the point's own glow in place of a share of the slices', the light about it ran 2.7 times what arrives in
+// the bonfire's sooty core, where the hottest gas is the sootiest, and its flames scattered a quarter too much.)
+fn flameSelfLit(uvw: vec3<f32>, fireE: vec3<f32>, rd: vec3<f32>, g: f32) -> vec3<f32> {
+  // (By the phase to first order in its anisotropy, from the light's first moment: soot scatters forward, and the side
+  // of the flames toward the camera scatters the light from the core behind it most.)
+  let m = textureSampleLevel(flameNearDir, samp, uvw, 0.0);
+  let lobe = clamp(1.0 + 3.0 * g * dot(rd, m.xyz) / max(m.w, 1e-9), 0.0, 2.5);
+  return textureSampleLevel(flameNear, samp, uvw, 0.0).xyz * 1000.0 * lobe - fireE * INV_4PI;
 }
 
 // The share of a Henyey-Greenstein lobe (anisotropy g) about a direction of elevation sine mu that lies in the upper
@@ -3720,6 +3719,118 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
+// 9e. The fire's light about the flames (FLAME_NEAR), at each point of the light lattice within reach of the flames
+// (each slice's light-weighted centre, three standard deviations of its spread and a bed's radius out; elsewhere
+// nothing is marched: 0.3 ms a frame). The glowing gas's light within a bed's radius, 16 ways spread evenly over the
+// sphere, a cell and a half a step, from each cell's glow and extinction as the fire sums drew them (eight points a
+// cell, its subgrid temperature among them: one read a step), dimmed on the way by absorption alone (in a thick flame
+// of even temperature that tends to its blackbody radiance, as Kirchhoff's law has it, scattering and all); and the
+// rest of the fire's light, the slices' as point lights (with their escape, and the smoke's shadow as the light volume
+// has it), each less the share of its light within the bed's radius of the point (already marched: the share of a
+// Gaussian of the slice's spread within that ball), through the near soot the way it comes. With them, the light's
+// first moment, for the phase (flameSelfLit). (Counting the slices' whole light again on top of the near light lit the
+// low flames at the bonfire's bed a third to two thirds too bright; marched along the axes and the cube's diagonals,
+// four ways lay in the bed's thin hot sheet, and its edges came out two fifths too bright.)
+export const FLAME_NEAR = /* wgsl */ `
+${RENDER_LIB}
+@group(0) @binding(40) var nearOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(41) var emitTex: texture_3d<f32>;
+@group(0) @binding(42) var nearDirOut: texture_storage_3d<rgba16float, write>;
+
+// The standard normal's distribution function (a tanh fit, within 2e-4).
+fn normCdf(x: f32) -> f32 { return 0.5 * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x))); }
+// The share of an isotropic Gaussian (standard deviation s, its centre d away) within l of a point: the non-central chi
+// distribution's, three degrees of freedom.
+fn ballShare(d: f32, s: f32, l: f32) -> f32 {
+  let dd = max(d, 1e-3);
+  let a = (l - dd) / s;
+  let b = (l + dd) / s;
+  return clamp(normCdf(a) - normCdf(-b) - s / (dd * 2.5066283) * (exp(-0.5 * a * a) - exp(-0.5 * b * b)), 0.0, 1.0);
+}
+const NEAR_N = 16u;
+const NEAR_STEP = 1.5; // (cells)
+fn nearDir(k: u32) -> vec3<f32> {
+  let mu = 1.0 - (f32(k) + 0.5) * 2.0 / f32(NEAR_N);
+  let sn = sqrt(max(1.0 - mu * mu, 0.0));
+  let phi = 2.39996323 * f32(k);
+  return vec3<f32>(sn * cos(phi), mu, sn * sin(phi));
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let ld = textureDimensions(nearOut);
+  if (any(id >= ld)) { return; }
+  let uvw = (vec3<f32>(id) + 0.5) / vec3<f32>(ld);
+  let w = P.origin.xyz + uvw * vec3<f32>(P.dims.xyz) * P.grid.x;
+  let rad = max(P.src.w, 0.1);
+  var out = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  var mom = vec4<f32>(0.0);
+  // (Within reach of the flames only.)
+  var near = false;
+  if (R.fire.x > 0.5) {
+    for (var b = 0u; b < FIRE_BANDS; b++) {
+      if (fireLight[3u + 2u * b].w <= 0.0) { continue; }
+      let sd = sqrt(max(fireLight[SPREAD_BASE + b].xyz, vec3<f32>(0.0)));
+      if (all(abs(w - fireLight[4u + 2u * b].xyz) < 3.0 * sd + rad + P.grid.x)) { near = true; }
+    }
+  }
+  if (near) {
+    let ch = chroma() * (1.0 - R.skyCol.w);
+    let ds = NEAR_STEP * P.grid.x;
+    let lo = P.origin.xyz;
+    let hi = domainHi();
+    var l = vec3<f32>(0.0);
+    var dip = vec3<f32>(0.0);
+    var tk = array<f32, 16>(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+    for (var k = 0u; k < NEAR_N; k++) {
+      let d = nearDir(k);
+      let reach = min(rad, max(boxHit(w, d, lo, hi).y, 0.0));
+      var tr = vec3<f32>(1.0);
+      var lk = vec3<f32>(0.0);
+      for (var i = 0; i < 64; i++) {
+        let t = (f32(i) + 0.5) * ds;
+        if (t > reach) { break; }
+        let q = textureSampleLevel(emitTex, samp, uvwOf(w + d * t), 0.0);
+        let a = exp(-q.w * ch * ds);
+        lk += tr * q.xyz * ds * select((vec3<f32>(1.0) - a) / max(-log(a), vec3<f32>(1e-6)), vec3<f32>(1.0), a > vec3<f32>(0.9999));
+        tr *= a;
+      }
+      l += lk;
+      dip += d * ap1Lum(lk);
+      tk[k] = dot(tr, vec3<f32>(0.2676, 0.6744, 0.058));
+    }
+    // The rest of the fire's light: each slice's, less its share within the bed's radius, through the near soot toward
+    // it; the smoke's shadow beyond as the light volume has it (its light over the slices' unshadowed).
+    let vol = P.grid.x * P.grid.x * P.grid.x;
+    var far = 0.0;
+    var dfar = vec3<f32>(0.0);
+    var seen = 0.0;
+    for (var b = 0u; b < FIRE_BANDS; b++) {
+      let lum = fireLight[3u + 2u * b].w * vol;
+      if (lum <= 0.0) { continue; }
+      let dv = fireLight[4u + 2u * b].xyz - w;
+      let dist = length(dv);
+      let e = lum * bandOut(b, w) / (dist * dist + BAND_R2);
+      seen += e;
+      let sd = sqrt(max(dot(fireLight[SPREAD_BASE + b].xyz, vec3<f32>(1.0 / 3.0)), P.grid.x * P.grid.x));
+      var best = 0u;
+      var bd = -2.0;
+      for (var k = 0u; k < NEAR_N; k++) { let c = dot(nearDir(k), dv / max(dist, 1e-6)); if (c > bd) { bd = c; best = k; } }
+      let fb = e * (1.0 - ballShare(dist, sd, rad)) * tk[best];
+      far += fb;
+      dfar += dv / max(dist, 1e-6) * fb;
+    }
+    let shade = select(1.0, clamp(1000.0 * textureSampleLevel(light, samp, uvw, 0.0).w / max(seen, 1e-20), 0.0, 1.0), seen > 0.0);
+    far *= shade;
+    let fireColour = select(vec3<f32>(0.0), fireLight[0].xyz / max(fireLight[0].w, 1e-12), fireLight[0].w > 0.0);
+    out = vec4<f32>(l / f32(NEAR_N) + fireColour * far * INV_4PI * 1e-3, 1.0);
+    mom = vec4<f32>(dip / f32(NEAR_N) + dfar * shade * ap1Lum(fireColour) * INV_4PI * 1e-3, ap1Lum(out.xyz));
+  }
+  textureStore(nearOut, vec3<i32>(id), out);
+  textureStore(nearDirOut, vec3<i32>(id), mom);
+}
+`
+
 export const RENDER = /* wgsl */ `
 ${RENDER_LIB}
 @fragment
@@ -3859,7 +3970,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           if (R.size.w > 0.0) { kelvin = max(T_AMB, kelvin + subgridKelvin(wm, uvm, rot)); }
           let glow = planck(kelvin);
           B = (1.0 - albedo) * glow;
-          S += albedo * flameSelfLit(sig, ch, glow, fireE);
+          S += albedo * flameSelfLit(uvm, fireE, rd, g);
         }
         // Integrated exactly over the step for constant properties (Hillaire 2015).
         let Ts = exp(-sig * ch * ds);
@@ -3917,6 +4028,7 @@ export const FIRE_SUM = /* wgsl */ `
 ${RENDER_LIB}
 @group(0) @binding(40) var<storage, read_write> partial: array<vec4<f32>>;
 @group(0) @binding(41) var<storage, read> hrr: array<f32>;
+@group(0) @binding(42) var emitOut: texture_storage_3d<rgba16float, write>; // each cell's glow and flame light per metre as drawn (k cd/m2 per m), and its extinction (1/m): FLAME_NEAR
 var<workgroup> sumE: array<vec4<f32>, 64>;
 var<workgroup> sumP: array<vec4<f32>, 64>;
 var<workgroup> sumB: array<vec4<f32>, 64>;
@@ -3952,9 +4064,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
   let c = vec3<i32>(id);
   let vol = P.grid.x * P.grid.x * P.grid.x;
   var e = vec3<f32>(0.0);
+  var sg = 0.0; // (the cell's extinction, for FLAME_NEAR)
   var b = vec4<f32>(0.0);
   if (all(c < nCells()) && P.fire.x > 0.5) {
     let s = textureLoad(scal, c, 0);
+    sg = sigmaOf(s);
     let g = gasOf(s);
     let heatMW = hrr[cellIndex(c)] * 1e-6;
     if ((s.x > 0.0 || heatMW > 0.0) && (g.rise > 300.0 || heatMW > 0.05)) {
@@ -3963,6 +4077,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
       for (var k = 0; k < 8; k++) {
         let m = gasAt(w + OCTANTS[k] * P.grid.x, 0.0, true);
         e += m.sig * ch * m.glow + m.chem;
+        if (k == 0) { sg = 0.0; }
+        sg += 0.125 * m.sig;
       }
       e *= 0.125;
     }
@@ -3970,6 +4086,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
   }
   let lum = ap1Lum(e);
+  if (all(c < nCells())) { textureStore(emitOut, c, vec4<f32>(e * 1e-3, sg)); }
   // This step's quarter of the table, k = 4 j + phase: j 0..3, then 4..6 and the light of the cells marched.
   let phase = P.dims.w % ESCAPE_PHASES;
   var x0 = vec4<f32>(0.0);

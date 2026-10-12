@@ -6,23 +6,31 @@ import { FIRE_BANDS } from './physics'
 import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
 // The fire's escape table's rings (degrees of elevation; RENDER_COMMON's escapeDir) and their sines, by which the
-// table is read; and the share of the sphere each stands for, with straight down first and straight up last, when it
-// is read linearly in the sine between them (a hat function in the sine, whose measure over the sphere is even):
-// half the span between its neighbours, over 2. (For the table's mean over the sphere.)
-const ESCAPE_RINGS = [-30, -15, 0, 30, 60]
+// table is read; and the share of the sphere each stands for, with straight down first and straight up last (for the
+// table's mean over the sphere). Between rings the table is read linearly in the sine (a hat function in the sine,
+// whose measure over the sphere is even: each end takes half its span, over 2); toward a pole, linearly in the
+// angle from the pole, as the root of 1 - |sine| (the pole a third, the ring two thirds of its span, over 2).
+const ESCAPE_RINGS = [-30, -15, 0, 30, 60, 75]
 const ESCAPE_SINES = ESCAPE_RINGS.map(d => Math.sin((d * Math.PI) / 180))
 // The directions (eight a ring, then straight up and straight down), the table's entries (four to an entry, with the
 // mean over the sphere after the directions: up, down and the mean in the last), and the steps a table takes to march.
 const ESCAPE_NDIRS = 8 * ESCAPE_RINGS.length + 2
 const ESCAPE_ENTRIES = Math.ceil((ESCAPE_NDIRS + 1) / 4)
 const ESCAPE_POLES = 2 * ESCAPE_RINGS.length
-export const ESCAPE_PHASES = 6
+export const ESCAPE_PHASES = 8
 // The fire's light and its tables in the sums (FIRE_SUM_TOTAL), vec4 entries: the totals, two a slice, then each
 // slice's escape table, scattered light's table, spread and escape table by height.
 export const FIRE_LIGHT_ENTRIES = 3 + (3 + 3 * ESCAPE_ENTRIES) * FIRE_BANDS
 const ESCAPE_WEIGHTS = (() => {
   const m = [-1, ...ESCAPE_SINES, 1]
-  return m.map((_, i) => (m[Math.min(i + 1, m.length - 1)] - m[Math.max(i - 1, 0)]) / 4)
+  const w = m.map(() => 0)
+  for (let i = 0; i + 1 < m.length; i++) {
+    const half = (m[i + 1] - m[i]) / 2
+    const toLower = i === 0 ? 1 / 3 : i + 2 === m.length ? 2 / 3 : 1 / 2
+    w[i] += half * toLower
+    w[i + 1] += half * (1 - toLower)
+  }
+  return w
 })()
 
 // The share of slice b's light that gets out of its own soot toward p (bandOut), from the escape tables in the fire's
@@ -55,11 +63,14 @@ fn bandEscape(base: u32, u: vec3<f32>) -> f32 {
   let a1 = (a0 + 1u) % 8u;
   let fa = az - floor(az);
   let m = u.y;
+  // (Toward a pole, by the angle from it, the root of 1 - |sine|, within 1% to 30 degrees from the pole: straight up
+  // looks along the whole flame column, and the escape falls toward it evenly in the angle; read in the sine, which
+  // bunches near the pole, the upper slices' light toward 70 to 85 degrees came out a quarter short.)
   if (m <= ESCAPE_SINES[0]) {
-    return mix(escTab(base, ESCAPE_DIRS - 1u), escRing(base, 0u, a0, a1, fa), (m + 1.0) / (ESCAPE_SINES[0] + 1.0));
+    return mix(escTab(base, ESCAPE_DIRS - 1u), escRing(base, 0u, a0, a1, fa), sqrt(max(m + 1.0, 0.0) / (ESCAPE_SINES[0] + 1.0)));
   }
   if (m >= ESCAPE_SINES[ESCAPE_NRINGS - 1u]) {
-    return mix(escRing(base, ESCAPE_NRINGS - 1u, a0, a1, fa), escTab(base, ESCAPE_DIRS - 2u), (m - ESCAPE_SINES[ESCAPE_NRINGS - 1u]) / (1.0 - ESCAPE_SINES[ESCAPE_NRINGS - 1u]));
+    return mix(escRing(base, ESCAPE_NRINGS - 1u, a0, a1, fa), escTab(base, ESCAPE_DIRS - 2u), 1.0 - sqrt(max(1.0 - m, 0.0) / (1.0 - ESCAPE_SINES[ESCAPE_NRINGS - 1u])));
   }
   var r = 0u;
   for (var q = 1u; q < ESCAPE_NRINGS - 1u; q++) { if (m >= ESCAPE_SINES[q]) { r = q; } }
@@ -2157,9 +2168,14 @@ fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
 // the poles, the escape from a slice's soot came out short wherever it bends between rings: up toward the wall above
 // a bonfire, where straight up looks along the whole flame column and pulls the reading down, three fifths of the
 // cells' own at 50 to 60 degrees, and just below the level, where it climbs steeply, a fifth short at -20; the rings
-// at -15 and 60 bring both within a tenth.) A step marches a sixth of the directions in turn (ESCAPE_PHASES), and keeps
-// the rest from the steps before: all of them every step added some 1.6 ms, and the share that gets out changes far
-// more slowly than the flames flicker (each direction is marched again within a fifth of a second).
+// at -15 and 60 bring both within a tenth. Above 60, read toward straight up, a ring at 75 and the caps by the angle
+// bring every slice within two hundredths, where the upper slices were a quarter short.) A step marches an eighth of the
+// directions in turn (ESCAPE_PHASES), and keeps the rest from the steps before: all of them every step added some
+// 1.6 ms, and the share that gets out changes far more slowly than the flames flicker (each direction is marched again
+// within a quarter of a second). (Cells with under ESCAPE_SKIP of their slice's light are left out; dim and outer, they
+// let more of it out, so the table reads a bonfire's lowest slice 5 to 10% low, all directions alike. Kept in, the
+// fire's light alone comes a third closer to the reference, but its whole frame further, where the smoke over the
+// flames is already bright.)
 const ESCAPE_DIRS = ${ESCAPE_NDIRS}u;
 const ESCAPE_PHASES = ${ESCAPE_PHASES}u;
 const ESCAPE_NRINGS = ${ESCAPE_RINGS.length}u;

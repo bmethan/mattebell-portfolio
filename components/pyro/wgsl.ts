@@ -9,8 +9,17 @@ import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SO
 // table is read; and the share of the sphere each stands for, with straight down first and straight up last, when it
 // is read linearly in the sine between them (a hat function in the sine, whose measure over the sphere is even):
 // half the span between its neighbours, over 2. (For the table's mean over the sphere.)
-const ESCAPE_RINGS = [-30, 0, 30]
+const ESCAPE_RINGS = [-30, -15, 0, 30, 60]
 const ESCAPE_SINES = ESCAPE_RINGS.map(d => Math.sin((d * Math.PI) / 180))
+// The directions (eight a ring, then straight up and straight down), the table's entries (four to an entry, with the
+// mean over the sphere after the directions: up, down and the mean in the last), and the steps a table takes to march.
+const ESCAPE_NDIRS = 8 * ESCAPE_RINGS.length + 2
+const ESCAPE_ENTRIES = Math.ceil((ESCAPE_NDIRS + 1) / 4)
+const ESCAPE_POLES = 2 * ESCAPE_RINGS.length
+export const ESCAPE_PHASES = 6
+// The fire's light and its tables in the sums (FIRE_SUM_TOTAL), vec4 entries: the totals, two a slice, then each
+// slice's escape table, scattered light's table, spread and escape table by height.
+export const FIRE_LIGHT_ENTRIES = 3 + (3 + 3 * ESCAPE_ENTRIES) * FIRE_BANDS
 const ESCAPE_WEIGHTS = (() => {
   const m = [-1, ...ESCAPE_SINES, 1]
   return m.map((_, i) => (m[Math.min(i + 1, m.length - 1)] - m[Math.max(i - 1, 0)]) / 4)
@@ -47,12 +56,13 @@ fn bandEscape(base: u32, u: vec3<f32>) -> f32 {
   let fa = az - floor(az);
   let m = u.y;
   if (m <= ESCAPE_SINES[0]) {
-    return mix(escTab(base, 25u), escRing(base, 0u, a0, a1, fa), (m + 1.0) / (ESCAPE_SINES[0] + 1.0));
+    return mix(escTab(base, ESCAPE_DIRS - 1u), escRing(base, 0u, a0, a1, fa), (m + 1.0) / (ESCAPE_SINES[0] + 1.0));
   }
-  if (m >= ESCAPE_SINES[2]) {
-    return mix(escRing(base, 2u, a0, a1, fa), escTab(base, 24u), (m - ESCAPE_SINES[2]) / (1.0 - ESCAPE_SINES[2]));
+  if (m >= ESCAPE_SINES[ESCAPE_NRINGS - 1u]) {
+    return mix(escRing(base, ESCAPE_NRINGS - 1u, a0, a1, fa), escTab(base, ESCAPE_DIRS - 2u), (m - ESCAPE_SINES[ESCAPE_NRINGS - 1u]) / (1.0 - ESCAPE_SINES[ESCAPE_NRINGS - 1u]));
   }
-  let r = select(0u, 1u, m >= ESCAPE_SINES[1]);
+  var r = 0u;
+  for (var q = 1u; q < ESCAPE_NRINGS - 1u; q++) { if (m >= ESCAPE_SINES[q]) { r = q; } }
   let f = (m - ESCAPE_SINES[r]) / (ESCAPE_SINES[r + 1u] - ESCAPE_SINES[r]);
   return mix(escRing(base, r, a0, a1, fa), escRing(base, r + 1u, a0, a1, fa), f);
 }
@@ -62,8 +72,8 @@ fn bandOut(b: u32, p: vec3<f32>) -> f32 {
   let albedo = R.skyCol.w * (1.0 - R.sunDir.w) / max(1.0 - R.skyCol.w * R.sunDir.w, 1e-3);
   let base = ESCAPE_BASE + ESCAPE_STRIDE * b;
   let base2 = ESCAPE_BASE2 + ESCAPE_STRIDE * b;
-  let mean = ${sums}[base + 6u].z;
-  let meanS = ${sums}[base2 + 6u].z;
+  let mean = ${sums}[base + ESCAPE_POLES].z;
+  let meanS = ${sums}[base2 + ESCAPE_POLES].z;
   let scat = albedo * (1.0 - mean) / (1.0 - albedo * (1.0 - meanS));
   let e = clamp(bandEscape(base, d / dist) + scat * bandEscape(base2, d / dist), 1e-6, 1.0);
   let rad = max(P.src.w, 0.1);
@@ -82,8 +92,8 @@ fn bandOutFloor(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
   let albedo = R.skyCol.w * (1.0 - R.sunDir.w) / max(1.0 - R.skyCol.w * R.sunDir.w, 1e-3);
   let base = ESCAPE_BASE + ESCAPE_STRIDE * b;
   let base2 = ESCAPE_BASE2 + ESCAPE_STRIDE * b;
-  let mean = ${sums}[base + 6u].z;
-  let meanS = ${sums}[base2 + 6u].z;
+  let mean = ${sums}[base + ESCAPE_POLES].z;
+  let meanS = ${sums}[base2 + ESCAPE_POLES].z;
   let scat = albedo * (1.0 - mean) / (1.0 - albedo * (1.0 - meanS));
   let e0 = bandEscape(base, d / dist);
   let eh = bandEscape(ESCAPE_BASE3 + ESCAPE_STRIDE * b, d / dist);
@@ -2138,26 +2148,32 @@ fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
 // The fire's escape table (FIRE_SUM): for each slice of its height, the share of its light that gets out of its own
 // soot, over a bed's radius, toward each of ESCAPE_DIRS directions: rings at ESCAPE_RINGS degrees of elevation, each
 // toward eight azimuths from +x round toward +z (8 ring + azimuth), then straight up and straight down, and its mean
-// over the sphere. Seven entries of the sums per slice, after the slices' own: the rings, two entries each, then (up,
-// down, mean); the scattered light's table follows the slices' escape tables (ESCAPE_BASE2), laid out the same, and
-// after the slices' spread, the escape by height (ESCAPE_BASE3: each cell's light that gets out times its height over
-// the floor, over the light times the height, of the cells marched), for the floor (bandOutFloor). (Four
+// over the sphere. ESCAPE_STRIDE entries of the sums per slice, after the slices' own: the rings, two entries each,
+// then (up, down, mean); the scattered light's table follows the slices' escape tables (ESCAPE_BASE2), laid out the
+// same, and after the slices' spread, the escape by height (ESCAPE_BASE3: each cell's light that gets out times its
+// height over the floor, over the light times the height, of the cells marched), for the floor (bandOutFloor). (Four
 // azimuths missed a flame sheet lying across the diagonal: the bonfire's light fell a fifth short on one side of its
-// cyc and a quarter over on the other.) A step marches a quarter of the directions, those of one
-// component of every entry, in turn (ESCAPE_PHASES), and keeps the rest from the steps before: all of them every step
-// added some 1.6 ms, a quarter adds 0.4, and the share that gets out changes far more slowly than the flames flicker.
-const ESCAPE_DIRS = 26u;
-const ESCAPE_PHASES = 4u;
-const ESCAPE_RINGS = array<f32, 3>(${ESCAPE_RINGS.map(wf).join(', ')});
-const ESCAPE_SINES = array<f32, 3>(${ESCAPE_SINES.map(wf).join(', ')});
+// cyc and a quarter over on the other. With rings at -30, 0 and 30 only, read linearly in the sine between them and
+// the poles, the escape from a slice's soot came out short wherever it bends between rings: up toward the wall above
+// a bonfire, where straight up looks along the whole flame column and pulls the reading down, three fifths of the
+// cells' own at 50 to 60 degrees, and just below the level, where it climbs steeply, a fifth short at -20; the rings
+// at -15 and 60 bring both within a tenth.) A step marches a sixth of the directions in turn (ESCAPE_PHASES), and keeps
+// the rest from the steps before: all of them every step added some 1.6 ms, and the share that gets out changes far
+// more slowly than the flames flicker (each direction is marched again within a fifth of a second).
+const ESCAPE_DIRS = ${ESCAPE_NDIRS}u;
+const ESCAPE_PHASES = ${ESCAPE_PHASES}u;
+const ESCAPE_NRINGS = ${ESCAPE_RINGS.length}u;
+const ESCAPE_POLES = ${ESCAPE_POLES}u; // (the entry with straight up, straight down and the mean)
+const ESCAPE_RINGS = array<f32, ${ESCAPE_RINGS.length}>(${ESCAPE_RINGS.map(wf).join(', ')});
+const ESCAPE_SINES = array<f32, ${ESCAPE_RINGS.length}>(${ESCAPE_SINES.map(wf).join(', ')});
 const ESCAPE_BASE = 3u + 2u * FIRE_BANDS;
-const ESCAPE_STRIDE = 7u;
-const ESCAPE_BASE2 = 3u + 9u * FIRE_BANDS; // (the scattered light's table)
-const SPREAD_BASE = 3u + 16u * FIRE_BANDS; // (each slice's spread, FIRE_SUM: its variance in x, y and z, and its xz covariance)
-const ESCAPE_BASE3 = 3u + 17u * FIRE_BANDS; // (the escape table by height, laid out as the others)
+const ESCAPE_STRIDE = ${ESCAPE_ENTRIES}u;
+const ESCAPE_BASE2 = 3u + ${2 + ESCAPE_ENTRIES}u * FIRE_BANDS; // (the scattered light's table)
+const SPREAD_BASE = 3u + ${2 + 2 * ESCAPE_ENTRIES}u * FIRE_BANDS; // (each slice's spread, FIRE_SUM: its variance in x, y and z, and its xz covariance)
+const ESCAPE_BASE3 = 3u + ${3 + 2 * ESCAPE_ENTRIES}u * FIRE_BANDS; // (the escape table by height, laid out as the others)
 fn escapeDir(k: u32) -> vec3<f32> {
-  if (k == 24u) { return vec3<f32>(0.0, 1.0, 0.0); }
-  if (k == 25u) { return vec3<f32>(0.0, -1.0, 0.0); }
+  if (k == ESCAPE_DIRS - 2u) { return vec3<f32>(0.0, 1.0, 0.0); }
+  if (k == ESCAPE_DIRS - 1u) { return vec3<f32>(0.0, -1.0, 0.0); }
   let el = radians(ESCAPE_RINGS[k / 8u]);
   let az = f32(k % 8u) * 0.78539816;
   return vec3<f32>(cos(el) * cos(az), sin(el), cos(el) * sin(az));
@@ -2475,7 +2491,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
     // mean over the sphere from the whole table: each ring's eight azimuths averaged, weighted by the share of the
     // sphere it stands for.
     marched = sB[0].w;
-    writeTable(3u + 2u * FIRE_BANDS + 7u * u32(band), phase, sP[0], sB[0], marched);
+    writeTable(3u + 2u * FIRE_BANDS + ${ESCAPE_ENTRIES}u * u32(band), phase, sP[0], sB[0], marched);
   }
   // Then the scattered light's table the same way (after the escape table, the same layout), and the slice's spread
   // (its moments about the origin over its light, less its centre's).
@@ -2493,10 +2509,10 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
     workgroupBarrier();
   }
   if (li == 0u) {
-    writeTable(3u + 9u * FIRE_BANDS + 7u * u32(band), phase, sP[0], sB[0], marched);
+    writeTable(3u + ${2 + ESCAPE_ENTRIES}u * FIRE_BANDS + ${ESCAPE_ENTRIES}u * u32(band), phase, sP[0], sB[0], marched);
     let m = sE[0] / max(lumB, 1e-30);
     let v = vec4<f32>(m.x - cen.x * cen.x, m.y - cen.y * cen.y, m.z - cen.z * cen.z, m.w - cen.x * cen.z);
-    result[3u + 16u * FIRE_BANDS + u32(band)] = select(vec4<f32>(0.0), vec4<f32>(max(v.xyz, vec3<f32>(0.0)), v.w), lumB > 0.0);
+    result[3u + ${2 + 2 * ESCAPE_ENTRIES}u * FIRE_BANDS + u32(band)] = select(vec4<f32>(0.0), vec4<f32>(max(v.xyz, vec3<f32>(0.0)), v.w), lumB > 0.0);
   }
   // Then the escape table by height, over the light times the height of the cells marched.
   workgroupBarrier();
@@ -2510,19 +2526,20 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
     }
     workgroupBarrier();
   }
-  if (li == 0u) { writeTable(3u + 17u * FIRE_BANDS + 7u * u32(band), phase, sP[0], sB[0], sB[0].w); }
+  if (li == 0u) { writeTable(3u + ${3 + 2 * ESCAPE_ENTRIES}u * FIRE_BANDS + ${ESCAPE_ENTRIES}u * u32(band), phase, sP[0], sB[0], sB[0].w); }
 }
 fn writeTable(base: u32, phase: u32, lo: vec4<f32>, hi: vec4<f32>, marched: f32) {
   for (var j = 0u; j < 7u; j++) {
-    if (4u * j + phase < 26u) { // (RENDER_COMMON's ESCAPE_DIRS)
+    let k = ${ESCAPE_PHASES}u * j + phase;
+    if (k < ${ESCAPE_NDIRS}u) { // (RENDER_COMMON's ESCAPE_DIRS)
       let v = select(hi[j % 4u], lo[j % 4u], j < 4u);
-      result[base + j][phase] = select(1.0, v / marched, marched > 0.0);
+      result[base + k / 4u][k % 4u] = select(1.0, v / marched, marched > 0.0);
     }
   }
-  let w = array<f32, 5>(${ESCAPE_WEIGHTS.map(wf).join(', ')});
-  var mean = w[0] * result[base + 6u].y + w[4] * result[base + 6u].x;
-  for (var r = 0u; r < 3u; r++) { mean += w[r + 1u] * 0.125 * dot(result[base + 2u * r] + result[base + 2u * r + 1u], vec4<f32>(1.0)); }
-  result[base + 6u].z = mean;
+  let w = array<f32, ${ESCAPE_RINGS.length + 2}>(${ESCAPE_WEIGHTS.map(wf).join(', ')});
+  var mean = w[0] * result[base + ${ESCAPE_POLES}u].y + w[${ESCAPE_RINGS.length + 1}] * result[base + ${ESCAPE_POLES}u].x;
+  for (var r = 0u; r < ${ESCAPE_RINGS.length}u; r++) { mean += w[r + 1u] * 0.125 * dot(result[base + 2u * r] + result[base + 2u * r + 1u], vec4<f32>(1.0)); }
+  result[base + ${ESCAPE_POLES}u].z = mean;
 }
 `
 
@@ -3927,7 +3944,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     // R.sunDir.w; bandOut has the rest.)
     let ch = chroma() * (1.0 - R.skyCol.w * R.sunDir.w);
     for (var j = 0u; j < 7u; j++) {
-      let k = 4u * j + phase;
+      let k = ESCAPE_PHASES * j + phase;
       if (k >= ESCAPE_DIRS) { break; }
       let dir = escapeDir(k);
       let reach = min(rad, max(boxHit(w, dir, P.origin.xyz, domainHi()).y, 0.0));

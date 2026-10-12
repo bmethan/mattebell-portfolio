@@ -992,8 +992,8 @@ export class PyroEngine {
     }
     // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
     const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
-    const firePartial = storage(groups * 12)
-    const fireLight = d.createBuffer({ size: (3 + 2 * FIRE_BANDS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+    const firePartial = storage(groups * 20)
+    const fireLight = d.createBuffer({ size: (3 + 9 * FIRE_BANDS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
     // The heat release rate in each cell (W/m3), from the step's burning: for the expansion, the sums and validation.
     const hrr = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     // A fire's mass keeping: the volume each cell's gas was spread over, and the ratio its advection is scaled by.
@@ -1088,6 +1088,7 @@ export class PyroEngine {
           entries: [
             ...[P, R, s, v(scal[0])].map((resource, binding) => ({ binding, resource })),
             ...[v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }].map((resource, k) => ({ binding: 5 + k, resource })),
+            { binding: 10, resource: { buffer: fireLight } },
             { binding: 12, resource: this.dummy3d.createView() },
             { binding: 13, resource: v(flame) },
             { binding: 35, resource: v(vel[0]) },
@@ -1979,21 +1980,26 @@ export class PyroEngine {
     this.histIndex = next
   }
 
-  // (Development: the fire's sums again for the frame as it stands, for the probes, which read them at a paused frame.)
+  // (Development: the fire's sums again for the frame as it stands, for the probes, which read them at a paused frame;
+  // the escape table's four quarters each, the step's own last, the frame's word of the uniforms set for each.)
   async resumFire() {
     const g = this.grids!
     const p = this.pipes!
     const [nx, ny, nz] = g.n
-    const enc = this.device.createCommandEncoder()
-    const pass = enc.beginComputePass()
-    pass.setPipeline(p.fireSum)
-    pass.setBindGroup(0, g.bg.fireSum)
-    pass.dispatchWorkgroups(Math.ceil(nx / 4), Math.ceil(ny / 4), Math.ceil(nz / 4))
-    pass.setPipeline(p.fireTotal)
-    pass.setBindGroup(0, g.bg.fireTotal)
-    pass.dispatchWorkgroups(1 + FIRE_BANDS, 1, 1)
-    pass.end()
-    this.device.queue.submit([enc.finish()])
+    for (let k = 1; k <= 4; k++) {
+      this.device.queue.writeBuffer(this.simBuf, 12, new Uint32Array([this.frame + k]))
+      const enc = this.device.createCommandEncoder()
+      const pass = enc.beginComputePass()
+      pass.setPipeline(p.fireSum)
+      pass.setBindGroup(0, g.bg.fireSum)
+      pass.dispatchWorkgroups(Math.ceil(nx / 4), Math.ceil(ny / 4), Math.ceil(nz / 4))
+      pass.setPipeline(p.fireTotal)
+      pass.setBindGroup(0, g.bg.fireTotal)
+      pass.dispatchWorkgroups(1 + FIRE_BANDS, 1, 1)
+      pass.end()
+      this.device.queue.submit([enc.finish()])
+    }
+    this.device.queue.writeBuffer(this.simBuf, 12, new Uint32Array([this.frame]))
     await this.device.queue.onSubmittedWorkDone()
     this.lightDirty = true
   }

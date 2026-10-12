@@ -3565,7 +3565,15 @@ fn octaves(tauS: vec3<f32>, p0: f32, p1: f32, p2: f32, f: f32, albedo: f32, g: f
 // blackbody's, whatever the albedo), and the fire's light from farther off (fireE, lux) is hidden by it; over l, a bed
 // radius, the light it scatters toward the camera (per unit of albedo, cd/m2) takes glow (1 - exp(-sig l)) of the near
 // glow in place of that share of the far light. Without it a thick flame glowed only (1 - albedo) of its blackbody: the
-// bonfire's flames came out a fifth to two fifths dark against the path-traced reference.
+// bonfire's flames came out a fifth to two fifths dark against the path-traced reference. (It runs over, though: split
+// against the reference, the bonfire's flames scatter a quarter more of the fire's light than they should, nearly all
+// of it this term, at their base. Probed, a point's own glow is 2.7 times the light arriving at it in the sooty core,
+// where the hottest gas is the sootiest, and half to all of it at the sides. Tried: the light arriving from the glowing
+// gas within a bed's radius, marched on the light lattice from each cell's glow as the fire sums draw it (14 ways,
+// dimmed by absorption alone), with the far light dimmed by the mean transmittance. It brought the flames' scattered
+// light within 2% of the reference's but the flames at the bed's edges from 0.95 to 1.28, the far light counting the
+// near cells' light again and the half-resolution lattice reaching into the bed's hot sheet; taking the near light out
+// of the far left the flames 14% short; and it cost 7 ms a frame. Not kept.)
 fn flameSelfLit(sig: f32, ch: vec3<f32>, glow: vec3<f32>, fireE: vec3<f32>) -> vec3<f32> {
   return (1.0 - exp(-sig * ch * max(P.src.w, 0.1))) * (glow - fireE * INV_4PI);
 }

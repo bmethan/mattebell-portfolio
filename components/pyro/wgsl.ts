@@ -3673,6 +3673,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let ro = R.camPos.xyz;
   let frame = R.camRight.w;
   let jitter = jitterAt(fc.xy, frame);
+  // The ray's moment within the shutter (the motion blur): blue noise of its own, apart from the march's offset, so
+  // where the flow along the ray matches the step the two do not land every pixel on the same points.
+  let shutterTau = (jitterAt(fc.xy + vec2<f32>(32.0, 32.0), frame) - 0.5) * R.camera.x;
 
   // The stage under and behind the fire: the floor's plane, or the cyc (and the normal where the ray meets it).
   var tFloor = select(1e9, -ro.y / rd.y, rd.y < -1e-5);
@@ -3738,15 +3741,17 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           T *= tf;
         }
       }
-      // Motion blur: this sample's moment within the shutter (stratified along the ray, a different set each frame,
-      // which the accumulation averages), and the gas that was here then, carried back along the flow. (The velocity
-      // in one lookup: each component lives on its own faces, a quarter cell either way of where this reads it, near
-      // enough for a blur.)
+      // Motion blur: the ray's moment within the shutter, one for all its samples (a different one each pixel and
+      // frame, which the accumulation averages), and the gas that was here then, carried back along the flow. A sheet
+      // of soot that moves across the ray covers it for part of the shutter; with a moment for each sample, as this
+      // took them, it dimmed the light behind it at every sample instead, and the moving flames came out a tenth to two
+      // fifths off the path-traced reference's (a moment a path) where they move most. (The velocity in one lookup:
+      // each component lives on its own faces, a quarter cell either way of where this reads it, near enough for a
+      // blur.)
       var wm = w;
       if (R.camera.x > 0.0) {
-        let tau = (fract(jitter + f32(i) * 0.618034) - 0.5) * R.camera.x;
         let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
-        wm = w - u * tau;
+        wm = w - u * shutterTau;
       }
       let uvm = uvwOf(wm);
       let s4 = scalSmooth(uvm);

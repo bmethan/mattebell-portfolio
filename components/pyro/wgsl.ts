@@ -3509,8 +3509,14 @@ fn domeShare(mu: f32, g: f32) -> f32 {
 // below (lit by the sun, the sky and the fire, through the smoke over it), its studio fade averaged over the floor the
 // point sees, by the lower hemisphere's share of the phase. (A map's spherical harmonics hold the light from below as
 // well; with a map, only the map.) Against the path-traced reference the sky's light scattered more than once was 5 to
-// 10% of a plume's, and the floor's 1 to 9%, the most low down. Also f, the chance that light scattered here meets the
-// smoke again (the mean of 1 - exp(-depth) toward the sun, up and down), and the depths down and toward the rim.
+// 10% of a plume's, and the floor's 1 to 9%, the most low down. (The floor straight below gives a bonfire's smoke over
+// its flames half again the fire's light off the floor that the reference does, and the gas low beside its bed a third.
+// Gathered over the whole lower hemisphere instead, from a map of the floor's light through the smoke, 24 to 128
+// directions, its transmittance within 3% of the reference gas's marched a cell a step with its detail, and with the
+// octaves' weights and the similarity relation, the low gas came to four fifths, but the flames and the smoke beside
+// them fell to half and the frame came no closer: the light scattered on through the flames' soot, which neither has,
+// is likely what is left.) Also f, the chance that light scattered here meets the smoke again (the mean of
+// 1 - exp(-depth) toward the sun, up and down), and the depths down and toward the rim.
 struct Around { amb: vec3<f32>, f: f32, tauDown: f32, tauRim: f32 }
 fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f32, albedo: f32, ch: vec3<f32>, fireColour: vec3<f32>, skyScatter: vec3<f32>) -> Around {
   let L2 = textureSampleLevel(light2, samp, uvw, 0.0);
@@ -3541,9 +3547,9 @@ fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f3
 // and its bounce there (the map's last, so each update adds an order of the bounce), times its albedo, through the
 // smoke on the way. Twice an update. (In its place, the wall's light straight behind the fire at the flames' height, its
 // brightest, gave the far floor of a bonfire five times the fire's light back that the path-traced reference does, and
-// a patch grid of the fire-lit floor about the bed gave the wall a third to a fifth of the light it takes from it. Of
-// the fire's light that a bonfire's floor near the fire takes back, the reference brings two thirds by way of the smoke,
-// light scattered in the gas just before it meets the floor, which this leaves out.)
+// a patch grid of the fire-lit floor about the bed gave the wall a third to a fifth of the light it takes from it.
+// Where a bonfire's floor near the fire shows, the reference brings two thirds of the bounced fire light by way of the
+// smoke, the low gas lit by the floor and what it sends back down, of which smokeAround's floor light gives a fifth.)
 export const CYC_DIRECT = /* wgsl */ `
 ${RENDER_LIB}
 @group(0) @binding(40) var directOut: texture_storage_2d<rgba16float, write>;

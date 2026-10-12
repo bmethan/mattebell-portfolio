@@ -76,6 +76,9 @@ fn bandOut(b: u32, p: vec3<f32>) -> f32 {
 // this radius into a wall 2.3 m back.
 export const CYC_Z = -1.1
 export const CYC_R = 1.2
+// The map of the cyc's light (CYC_DIRECT, CYC_BOUNCE): across the view from x0, and along the cyc from the floor at
+// front (m from the fire) back to the sweep, up it, and up the wall to wallTop; texels dx (m) square.
+export const CYC_MAP = { x0: -4.8, front: 4.0, wallTop: 5.0, dx: 0.2, w: 48, h: 54 }
 
 // WGSL for the pyro lab: a gas solver on a staggered (MAC) grid, as production FX solvers lay it out, and a
 // volume renderer for it.
@@ -2532,6 +2535,7 @@ fn bandSpread(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
 @group(0) @binding(33) var envTex: texture_2d<f32>; // an HDR environment's backdrop, softened (environment.ts)
 @group(0) @binding(34) var light2: texture_3d<f32>; // x: optical depth toward the softbox rig's rim (LIGHT)
 @group(0) @binding(35) var velTex: texture_3d<f32>; // the velocity, for the motion blur
+@group(0) @binding(39) var cycBounce: texture_2d<f32>; // the light the rest of the cyc sends to each point of it (CYC_BOUNCE), lux
 fn rimOn() -> bool { return R.rimDir.w > 0.5; }
 // The rim's shadow on a surface point outside the gas: the optical depth where the way to the rim enters the domain.
 fn rimShadow(p: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
@@ -2573,6 +2577,26 @@ fn envIrradiance(n: vec3<f32>) -> vec3<f32> { return shAt(toEnv(n), 3.14159265, 
 // 1e9 for none).
 const CYC_Z = ${wf(CYC_Z)};
 const CYC_R = ${wf(CYC_R)};
+const CYC_MAP_X0 = ${wf(CYC_MAP.x0)};
+const CYC_MAP_FRONT = ${wf(CYC_MAP.front)};
+const CYC_MAP_SIZE = vec2<f32>(${wf(CYC_MAP.w * CYC_MAP.dx)}, ${wf(CYC_MAP.h * CYC_MAP.dx)});
+const CYC_FLOOR_LEN = ${wf(CYC_MAP.front - CYC_Z)};
+const CYC_SWEEP_LEN = ${wf((Math.PI / 2) * CYC_R)};
+// A point of the cyc and its normal from its place on the map (x, and s along it), and back.
+fn cycPoint(x: f32, sc: f32) -> array<vec3<f32>, 2> {
+  if (sc <= CYC_FLOOR_LEN) { return array<vec3<f32>, 2>(vec3<f32>(x, 0.0, CYC_MAP_FRONT - sc), vec3<f32>(0.0, 1.0, 0.0)); }
+  if (sc <= CYC_FLOOR_LEN + CYC_SWEEP_LEN) {
+    let a = (sc - CYC_FLOOR_LEN) / CYC_R;
+    return array<vec3<f32>, 2>(vec3<f32>(x, CYC_R - CYC_R * cos(a), CYC_Z - CYC_R * sin(a)), vec3<f32>(0.0, cos(a), sin(a)));
+  }
+  return array<vec3<f32>, 2>(vec3<f32>(x, CYC_R + sc - CYC_FLOOR_LEN - CYC_SWEEP_LEN, CYC_Z - CYC_R), vec3<f32>(0.0, 0.0, 1.0));
+}
+fn cycUv(p: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+  var sc = CYC_MAP_FRONT - p.z;
+  if (n.y < 1e-4) { sc = CYC_FLOOR_LEN + CYC_SWEEP_LEN + p.y - CYC_R; }
+  else if (n.z > 1e-4) { sc = CYC_FLOOR_LEN + CYC_R * atan2(n.z, n.y); }
+  return vec2<f32>((p.x - CYC_MAP_X0) / CYC_MAP_SIZE.x, sc / CYC_MAP_SIZE.y);
+}
 fn cycHit(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
   var best = vec4<f32>(1e9, 0.0, 1.0, 0.0);
   if (rd.y < -1e-5) {
@@ -3225,53 +3249,41 @@ fn ballSurface(ph: vec3<f32>, rd: vec3<f32>, ch: vec3<f32>, fireColour: vec3<f32
 // of what it sees is the cyc itself. Against the path-traced reference the floor in front took the whole sky and came
 // out up to a quarter too bright, and the wall, without the floor's light, a tenth too dark.
 fn cycOn() -> bool { return R.scene.x > 1.5 && !envOn(); }
-// What the rest of the cyc gives a point p of it facing n (lux on that rest): the floor sees the wall, lit by its open
-// quarter of sky, the sun and the fire straight on (at the fire's height behind p); the wall sees the floor, lit by the
-// sky and the sun (the fire's light on the floor comes in through cycFireBounce); the sweep between, some of each.
-fn cycSeen(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-  let other = vec3<f32>(0.0, n.z, n.y);
-  var e = R.skyCol.xyz * 0.5 + R.sunCol.xyz * max(dot(other, R.sunDir.xyz), 0.0);
-  if (R.fire.x > 0.5) {
-    let c = fireLight[1].xyz;
-    let d = c - vec3<f32>(p.x, c.y, CYC_Z - CYC_R);
-    let d2 = dot(d, d) + BAND_R2;
-    e += other.z * fireLight[0].xyz * P.grid.x * P.grid.x * P.grid.x * max(d.z, 0.0) / (sqrt(d2) * d2);
-  }
-  return e;
-}
-// The fire-lit floor about the fire as a light on a point p facing n (lux): a 6 x 4 grid of floor patches, 3 m across
-// the fire's centre by the domain's depth, each a Lambertian of the cyc's albedo lit by the fire's light on the floor
-// there (the light volume's bottom layer). (The wall behind a bonfire takes a tenth to a fifth of its light so.)
-fn cycFireBounce(p: vec3<f32>, n: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
-  if (R.fire.x < 0.5) { return vec3<f32>(0.0); }
-  let lo = P.origin.xyz;
-  let hi = domainHi();
-  let c = fireLight[1].xyz;
-  let fy = 0.5 / f32(textureDimensions(light2).y);
-  let pw = 0.5;
-  let pd = (hi.z - lo.z) / 4.0;
-  var e = 0.0;
-  for (var i = 0; i < 6; i++) {
-    for (var j = 0; j < 4; j++) {
-      let q = vec3<f32>(c.x + (f32(i) - 2.5) * pw, 0.0, lo.z + (f32(j) + 0.5) * pd);
-      let ux = (q.x - lo.x) / (hi.x - lo.x);
-      if (ux < 0.0 || ux > 1.0) { continue; }
-      let ef = 1000.0 * textureSampleLevel(light2, samp, vec3<f32>(ux, fy, (q.z - lo.z) / (hi.z - lo.z)), 0.0).w;
-      let d = q - p;
-      let d2 = max(dot(d, d), 0.04);
-      e += ef * max(-d.y, 0.0) * max(dot(n, d), 0.0) / (d2 * d2);
-    }
-  }
-  return fireColour * R.floorCol.x * INV_PI * e * pw * pd;
+// The light the rest of the cyc sends to a point p of it facing n (CYC_BOUNCE), lux.
+fn cycBounceAt(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  return textureSampleLevel(cycBounce, samp, cycUv(p, n), 0.0).xyz;
 }
 
-fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
+// The fire's light on the floor or the cyc at pf facing nf (lux, of luminance; floorLight says how).
+fn fireOnSurface(pf: vec3<f32>, nf: vec3<f32>) -> f32 {
+  var fireLux = 0.0;
+  var seen = 0.0;
+  let cellVol = P.grid.x * P.grid.x * P.grid.x;
+  let lo = P.origin.xyz;
+  let hi = domainHi();
+  var q = pf + nf * P.grid.x;
+  if (any(q < lo) || any(q > hi)) {
+    let toFire = normalize(fireLight[1].xyz - q);
+    let bh = boxHit(q, toFire, lo, hi);
+    q = select(clamp(q, lo, hi), q + toFire * (max(bh.x, 0.0) + 0.5 * P.grid.x), bh.y > max(bh.x, 0.0));
+  }
+  for (var b = 0u; b < FIRE_BANDS; b++) {
+    let lum = fireLight[3u + 2u * b].w * cellVol;
+    if (lum <= 0.0) { continue; }
+    let d = fireLight[4u + 2u * b].xyz - pf;
+    let dl = length(d);
+    fireLux += lum * bandOut(b, pf) * bandSpread(b, pf, nf) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
+    let dq = fireLight[4u + 2u * b].xyz - q;
+    seen += lum * bandOut(b, q) / (dot(dq, dq) + BAND_R2);
+  }
+  if (seen > 0.0) { fireLux *= clamp(1000.0 * textureSampleLevel(light, samp, uvwOf(q), 0.0).w / seen, 0.0, 1.0); }
+  return fireLux;
+}
+// The light straight onto the floor or the cyc at pf facing nf (lux, rgb): the sun, the sky, the fire and the rig's
+// rim, each through the smoke (floorLight adds the rest of the cyc's, CYC_BOUNCE).
+fn surfaceDirect(pf: vec3<f32>, nf: vec3<f32>, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
   let sun = R.sunDir.xyz;
   let rimDir = R.rimDir.xyz;
-  let skyStage = R.scene.x > 0.5 && R.scene.x < 1.5;
-  // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon; the cyc is lit
-  // as it stands.
-  let fade = select(exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
   // The smoke's shadow: the light volume's depth at the point where the sun ray from the floor enters the domain.
   let sb = boxHit(pf, sun, P.origin.xyz, domainHi());
   var shadow = vec3<f32>(1.0);
@@ -3306,39 +3318,23 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
   // there is taken toward q itself, as the light volume takes it: for the bottom band, a few centimetres up, the floor
   // and the point a cell above it lie either side of level, where its light gets out fastest-changing, and the floor
   // lost a tenth.)
-  var fireLux = 0.0;
-  var seen = 0.0;
-  let cellVol = P.grid.x * P.grid.x * P.grid.x;
-  let lo = P.origin.xyz;
-  let hi = domainHi();
-  var q = pf + nf * P.grid.x;
-  if (any(q < lo) || any(q > hi)) {
-    let toFire = normalize(fireLight[1].xyz - q);
-    let bh = boxHit(q, toFire, lo, hi);
-    q = select(clamp(q, lo, hi), q + toFire * (max(bh.x, 0.0) + 0.5 * P.grid.x), bh.y > max(bh.x, 0.0));
-  }
-  for (var b = 0u; b < FIRE_BANDS; b++) {
-    let lum = fireLight[3u + 2u * b].w * cellVol;
-    if (lum <= 0.0) { continue; }
-    let d = fireLight[4u + 2u * b].xyz - pf;
-    let dl = length(d);
-    fireLux += lum * bandOut(b, pf) * bandSpread(b, pf, nf) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
-    let dq = fireLight[4u + 2u * b].xyz - q;
-    seen += lum * bandOut(b, q) / (dot(dq, dq) + BAND_R2);
-  }
-  if (seen > 0.0) { fireLux *= clamp(1000.0 * textureSampleLevel(light, samp, uvwOf(q), 0.0).w / seen, 0.0, 1.0); }
-  let fireE = fireColour * fireLux;
-  // The sky on a surface facing nf: the flat sky's open half (all of it on the floor; on the cyc, its open quarter, and
-  // the rest of the cyc), or the environment.
+  let fireE = fireColour * fireOnSurface(pf, nf);
+  // The sky on a surface facing nf: the flat sky's open half (all of it on the floor; on the cyc, its open quarter, the
+  // rest being the cyc), or the environment.
   var skyShare = 0.5 + 0.5 * nf.y;
-  var bounce = vec3<f32>(0.0);
-  if (cycOn()) {
-    skyShare = 0.5 * (max(nf.y, 0.0) + max(nf.z, 0.0));
-    bounce = R.floorCol.xyz * (1.0 - skyShare) * cycSeen(pf, nf) + cycFireBounce(pf, nf, fireColour);
-  }
+  if (cycOn()) { skyShare = 0.5 * (max(nf.y, 0.0) + max(nf.z, 0.0)); }
   let skyE = select(R.skyCol.xyz * skyShare, envIrradiance(nf), envOn());
-  var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE + bounce;
+  var E = R.sunCol.xyz * max(dot(nf, sun), 0.0) * shadow + skyE * skyVis * ballSky + fireE;
   if (rimOn()) { E += R.rimCol.xyz * max(dot(nf, rimDir), 0.0) * rimShadow(pf, ch) * refShadow(pf, rimDir, 1e9, 0.01, 0.15, -1); }
+  return E;
+}
+fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
+  let skyStage = R.scene.x > 0.5 && R.scene.x < 1.5;
+  // In the studio the floor fades to black away from the fire; under the sky it runs to the horizon; the cyc is lit
+  // as it stands, and by the rest of itself (CYC_BOUNCE).
+  let fade = select(exp(-dot(pf.xz, pf.xz) / (R.floorCol.w * R.floorCol.w)), 1.0, R.scene.x > 0.5);
+  var E = surfaceDirect(pf, nf, ch, fireColour);
+  if (cycOn()) { E += cycBounceAt(pf, nf); }
   var floorL = R.floorCol.xyz * INV_PI * E * fade;
   // Under the sky, the far floor fades into the horizon's haze (aerial perspective, over some 40 m).
   let haze = select(R.skyCol.xyz * INV_PI * 1.25, envBackdrop(normalize(vec3<f32>(rd.x, 0.0, rd.z))), envOn());
@@ -3530,12 +3526,88 @@ fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f3
     let r2 = R.floorCol.w * R.floorCol.w;
     let fade = select(exp(-dot(wm.xz, wm.xz) / r2) / (1.0 + wm.y * wm.y / r2), 1.0, R.scene.x > 0.5);
     var floorE = R.sunCol.xyz * F2.z + R.skyCol.xyz * exp(-F2.y * ch) + fireColour * 1000.0 * F2.w;
-    // (On the cyc the floor sees half the sky, and the wall.)
-    if (cycOn()) { floorE += R.skyCol.xyz * exp(-F2.y * ch) * -0.5 + R.floorCol.xyz * 0.5 * cycSeen(vec3<f32>(wm.x, 0.0, wm.z), vec3<f32>(0.0, 1.0, 0.0)); }
+    // (On the cyc the floor sees half the sky, and the rest of the cyc's light, CYC_BOUNCE.)
+    if (cycOn()) { floorE += R.skyCol.xyz * exp(-F2.y * ch) * -0.5 + cycBounceAt(vec3<f32>(wm.x, 0.0, wm.z), vec3<f32>(0.0, 1.0, 0.0)); }
     let floorL = R.floorCol.xyz * INV_PI * fade * floorE;
     amb += floorL * (1.0 - domeShare(rd.y, g)) * exp(-tauDown * ch);
   }
   return Around(amb, f, tauDown, L2.x);
+}
+`
+
+// 9c. The cyc's light: a map of it (CYC_MAP), across the view and along its floor, sweep and wall. First the light
+// straight onto each point (CYC_DIRECT, as floorLight's surfaceDirect has it); then the light the rest of the cyc sends
+// it (CYC_BOUNCE): 32 rays over the point's sky, cosine-weighted in rings, to where they meet the cyc, its direct light
+// and its bounce there (the map's last, so each update adds an order of the bounce), times its albedo, through the
+// smoke on the way. Twice an update. (In its place, the wall's light straight behind the fire at the flames' height, its
+// brightest, gave the far floor of a bonfire five times the fire's light back that the path-traced reference does, and
+// a patch grid of the fire-lit floor about the bed gave the wall a third to a fifth of the light it takes from it. Of
+// the fire's light that a bonfire's floor near the fire takes back, the reference brings two thirds by way of the smoke,
+// light scattered in the gas just before it meets the floor, which this leaves out.)
+export const CYC_DIRECT = /* wgsl */ `
+${RENDER_LIB}
+@group(0) @binding(40) var directOut: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  _ = textureDimensions(light);
+  _ = textureDimensions(light2);
+  _ = fireLight[0];
+  let dims = textureDimensions(directOut);
+  if (any(id.xy >= dims)) { return; }
+  var e = vec3<f32>(0.0);
+  if (cycOn()) {
+    let pn = cycPoint(CYC_MAP_X0 + (f32(id.x) + 0.5) * CYC_MAP_SIZE.x / f32(dims.x), (f32(id.y) + 0.5) * CYC_MAP_SIZE.y / f32(dims.y));
+    let fireColour = select(vec3<f32>(0.0), fireLight[0].xyz / max(fireLight[0].w, 1e-12), fireLight[0].w > 0.0);
+    e = surfaceDirect(pn[0], pn[1], chroma(), fireColour);
+  }
+  textureStore(directOut, vec2<i32>(id.xy), vec4<f32>(e, 0.0));
+}
+`
+
+export const CYC_BOUNCE = /* wgsl */ `
+${RENDER_LIB}
+@group(0) @binding(40) var bounceOut: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(41) var cycDirect: texture_2d<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  _ = textureDimensions(scal);
+  let dims = textureDimensions(bounceOut);
+  if (any(id.xy >= dims)) { return; }
+  var e = vec3<f32>(0.0);
+  if (cycOn()) {
+    let pn = cycPoint(CYC_MAP_X0 + (f32(id.x) + 0.5) * CYC_MAP_SIZE.x / f32(dims.x), (f32(id.y) + 0.5) * CYC_MAP_SIZE.y / f32(dims.y));
+    let p = pn[0];
+    let n = pn[1];
+    let t1 = vec3<f32>(1.0, 0.0, 0.0);
+    let t2 = vec3<f32>(0.0, n.z, -n.y);
+    let ch = chroma();
+    let lo = P.origin.xyz;
+    let hi = domainHi();
+    for (var k = 0u; k < 32u; k++) {
+      let u = (f32(k / 8u) + 0.5) / 4.0;
+      let phi = 6.2831853 * (f32(k % 8u) + 0.5 * f32((k / 8u) & 1u) + 0.25) / 8.0;
+      let d = (t1 * cos(phi) + t2 * sin(phi)) * sqrt(u) + n * sqrt(1.0 - u);
+      let h = cycHit(p + n * 1e-3, d);
+      if (h.x >= 1e8) { continue; }
+      let hp = p + d * h.x;
+      let uv = cycUv(hp, vec3<f32>(0.0, h.z, h.w));
+      var src = textureSampleLevel(cycDirect, samp, uv, 0.0).xyz + textureSampleLevel(cycBounce, samp, uv, 0.0).xyz;
+      // (Through the smoke on the way, where the way crosses the gas.)
+      let bh = boxHit(p, d, lo, hi);
+      let t0 = max(bh.x, 0.0);
+      let t1b = min(bh.y, h.x);
+      if (t1b > t0) {
+        var od = 0.0;
+        for (var i = 0; i < 12; i++) { od += sigmaOf(textureSampleLevel(scal, samp, uvwOf(p + d * (t0 + (f32(i) + 0.5) * (t1b - t0) / 12.0)), 0.0)); }
+        src *= exp(-od * (t1b - t0) / 12.0 * ch);
+      }
+      e += src;
+    }
+    e *= R.floorCol.xyz / 32.0;
+  }
+  textureStore(bounceOut, vec2<i32>(id.xy), vec4<f32>(e, 0.0));
 }
 `
 

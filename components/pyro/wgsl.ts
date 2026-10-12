@@ -2125,6 +2125,7 @@ const ESCAPE_SINES = array<f32, 3>(${ESCAPE_SINES.map(wf).join(', ')});
 const ESCAPE_BASE = 3u + 2u * FIRE_BANDS;
 const ESCAPE_STRIDE = 7u;
 const ESCAPE_BASE2 = 3u + 9u * FIRE_BANDS; // (the scattered light's table)
+const SPREAD_BASE = 3u + 16u * FIRE_BANDS; // (each slice's spread, FIRE_SUM: its variance in x, y and z, and its xz covariance)
 fn escapeDir(k: u32) -> vec3<f32> {
   if (k == 24u) { return vec3<f32>(0.0, 1.0, 0.0); }
   if (k == 25u) { return vec3<f32>(0.0, -1.0, 0.0); }
@@ -2382,16 +2383,18 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
   var x1 = vec4<f32>(0.0);
   var x2 = vec4<f32>(0.0);
   var x3 = vec4<f32>(0.0);
+  var mo = vec4<f32>(0.0);
   let phase = u32(partial[1].w); // (the step's quarter of the escape table, as FIRE_SUM marched it)
   for (var k = li; k < C.x; k += 256u) {
     if (band >= 0 && i32(((k / C.y) % C.z) * FIRE_BANDS / C.z) != band) { continue; }
-    e += partial[7u * k];
-    p += partial[7u * k + 1u];
-    b += partial[7u * k + 2u];
-    x0 += partial[7u * k + 3u];
-    x1 += partial[7u * k + 4u];
-    x2 += partial[7u * k + 5u];
-    x3 += partial[7u * k + 6u];
+    e += partial[8u * k];
+    p += partial[8u * k + 1u];
+    b += partial[8u * k + 2u];
+    x0 += partial[8u * k + 3u];
+    x1 += partial[8u * k + 4u];
+    x2 += partial[8u * k + 5u];
+    x3 += partial[8u * k + 6u];
+    mo += partial[8u * k + 7u];
   }
   sE[li] = e;
   sP[li] = p;
@@ -2405,8 +2408,12 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
     }
     workgroupBarrier();
   }
+  var lumB = 0.0;
+  var cen = vec3<f32>(0.0);
   if (li == 0u) {
     let centre = vec4<f32>(sP[0].xyz / max(sE[0].w, 1e-9), 0.0);
+    lumB = sE[0].w;
+    cen = centre.xyz;
     if (band < 0) {
       result[0] = sE[0];
       result[1] = centre;
@@ -2437,19 +2444,27 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
     marched = sB[0].w;
     writeTable(3u + 2u * FIRE_BANDS + 7u * u32(band), phase, sP[0], sB[0], marched);
   }
-  // Then the scattered light's table the same way (after the escape table, the same layout).
+  // Then the scattered light's table the same way (after the escape table, the same layout), and the slice's spread
+  // (its moments about the origin over its light, less its centre's).
   workgroupBarrier();
   sP[li] = x2;
   sB[li] = x3;
+  sE[li] = mo;
   workgroupBarrier();
   for (var st = 128u; st > 0u; st = st >> 1u) {
     if (li < st) {
       sP[li] += sP[li + st];
       sB[li] += sB[li + st];
+      sE[li] += sE[li + st];
     }
     workgroupBarrier();
   }
-  if (li == 0u) { writeTable(3u + 9u * FIRE_BANDS + 7u * u32(band), phase, sP[0], sB[0], marched); }
+  if (li == 0u) {
+    writeTable(3u + 9u * FIRE_BANDS + 7u * u32(band), phase, sP[0], sB[0], marched);
+    let m = sE[0] / max(lumB, 1e-30);
+    let v = vec4<f32>(m.x - cen.x * cen.x, m.y - cen.y * cen.y, m.z - cen.z * cen.z, m.w - cen.x * cen.z);
+    result[3u + 16u * FIRE_BANDS + u32(band)] = select(vec4<f32>(0.0), vec4<f32>(max(v.xyz, vec3<f32>(0.0)), v.w), lumB > 0.0);
+  }
 }
 fn writeTable(base: u32, phase: u32, lo: vec4<f32>, hi: vec4<f32>, marched: f32) {
   for (var j = 0u; j < 7u; j++) {
@@ -2485,6 +2500,31 @@ ${RENDER_COMMON}
 ${fireCommon(9)}
 @group(0) @binding(10) var<storage, read> fireLight: array<vec4<f32>>;
 ${bandOutWgsl('fireLight')}
+// The geometry of slice b's light on a surface at p facing n, cos / r^2 per unit of its intensity, with the slice
+// spread as its flames are (FIRE_SUM's light-weighted spread of its glowing cells): six points along the spread's
+// principal axes, root 3 standard deviations out, which hold its spread exactly (the unscented transform; up and down
+// no further than keeps both above the floor, which keeps its mean height), each softened by a sixth of BAND_R2.
+// Far off, the same as one point at the centre. (One point at the centre left the floor at the edge of a campfire's
+// bed with half its light, the flames leaning to that side. Two points an axis, weighted by the light on each side of
+// the centre, put the lesser side's further out and a tenth too much light there.)
+fn bandSpread(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
+  let c = fireLight[4u + 2u * b].xyz;
+  let m = fireLight[SPREAD_BASE + b];
+  let mid = 0.5 * (m.x + m.z);
+  let dev = sqrt(max(0.25 * (m.x - m.z) * (m.x - m.z) + m.w * m.w, 0.0));
+  let ang = 0.5 * atan2(2.0 * m.w, m.x - m.z);
+  let e1 = vec3<f32>(cos(ang), 0.0, sin(ang)) * sqrt(max(mid + dev, 0.0) * 3.0);
+  let e2 = vec3<f32>(-sin(ang), 0.0, cos(ang)) * sqrt(max(mid - dev, 0.0) * 3.0);
+  let e3 = vec3<f32>(0.0, min(sqrt(m.y * 3.0), max(c.y - 0.5 * P.grid.x, 0.0)), 0.0);
+  var g = 0.0;
+  for (var k = 0u; k < 6u; k++) {
+    let o = select(select(e3, e2, k / 2u == 1u), e1, k / 2u == 0u) * select(1.0, -1.0, (k & 1u) == 1u);
+    let d = c + o - p;
+    let r2 = dot(d, d) + BAND_R2 / 6.0;
+    g += max(dot(d, n), 0.0) / (sqrt(r2) * r2);
+  }
+  return g / 6.0;
+}
 @group(0) @binding(11) var blueTex: texture_2d_array<f32>; // spatiotemporal blue noise, a slice a frame
 @group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
@@ -3255,16 +3295,17 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
     skyVis = exp(-textureSampleLevel(light2, samp, uv, 0.0).y * ch);
   }
   // Illuminance on the floor (lux): the sun, the sky and the fire, seen as Lambertian radiance E / pi. The fire's
-  // light from each band of its height, I cos / r^2, as it leaves the band's own soot toward the point (bandOut),
-  // shadowed by the soot beyond: the light volume's shadowed light just above the floor (or, beyond the gas, where the
-  // line toward the fire's centre enters it) over the same bands' light there gives the mean transmittance (as for the
-  // collision ball); and by the reference set. (Taken at the nearest point of the gas instead, the wall behind a fire
-  // read its shadow straight up through the plume above the flames, a far steeper line than the light it takes, and
-  // caught under half of it, as little as a ninth. With the bands' own soot in that mean too, a bonfire's floor took
-  // the bottom band's: the band it hardly sees, edge on, and the one whose light gets out the least that way, which
-  // left the floor in front of it 40% dark. The bands' light there is taken toward q itself, as the light volume
-  // takes it: for the bottom band, a few centimetres up, the floor and the point a cell above it lie either side of
-  // level, where its light gets out fastest-changing, and the floor lost a tenth.)
+  // light from each band of its height, I cos / r^2 from the band spread as its flames are (bandSpread), as it leaves
+  // the band's own soot toward the point (bandOut), shadowed by the soot beyond: the light volume's shadowed light
+  // just above the floor (or, beyond the gas, where the line toward the fire's centre enters it) over the same bands'
+  // light there gives the mean transmittance (as for the collision ball); and by the reference set. (Taken at the
+  // nearest point of the gas instead, the wall behind a fire read its shadow straight up through the plume above the
+  // flames, a far steeper line than the light it takes, and caught under half of it, as little as a ninth. With the
+  // bands' own soot in that mean too, a bonfire's floor took the bottom band's: the band it hardly sees, edge on, and
+  // the one whose light gets out the least that way, which left the floor in front of it 40% dark. The bands' light
+  // there is taken toward q itself, as the light volume takes it: for the bottom band, a few centimetres up, the floor
+  // and the point a cell above it lie either side of level, where its light gets out fastest-changing, and the floor
+  // lost a tenth.)
   var fireLux = 0.0;
   var seen = 0.0;
   let cellVol = P.grid.x * P.grid.x * P.grid.x;
@@ -3280,9 +3321,8 @@ fn floorLight(pf: vec3<f32>, nf: vec3<f32>, rd: vec3<f32>, tFloor: f32, ch: vec3
     let lum = fireLight[3u + 2u * b].w * cellVol;
     if (lum <= 0.0) { continue; }
     let d = fireLight[4u + 2u * b].xyz - pf;
-    let r2 = dot(d, d) + BAND_R2;
     let dl = length(d);
-    fireLux += lum * bandOut(b, pf) * max(dot(d, nf), 0.0) / (sqrt(r2) * r2) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
+    fireLux += lum * bandOut(b, pf) * bandSpread(b, pf, nf) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
     let dq = fireLight[4u + 2u * b].xyz - q;
     seen += lum * bandOut(b, q) / (dot(dq, dq) + BAND_R2);
   }
@@ -3694,6 +3734,7 @@ ${RENDER_LIB}
 var<workgroup> sumE: array<vec4<f32>, 64>;
 var<workgroup> sumP: array<vec4<f32>, 64>;
 var<workgroup> sumB: array<vec4<f32>, 64>;
+var<workgroup> sumM: array<vec4<f32>, 64>; // the slices' spread: x^2, y^2, z^2 and xz, light-weighted
 var<workgroup> sumX: array<vec4<f32>, 256>; // this step's quarter of the two escape tables, four per cell
 
 // Each cell's glow as the image pass draws it (gasAt): the mean of eight points, one in each eighth of the cell, of its
@@ -3779,8 +3820,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     x1.w = lum;
   }
   sumE[li] = vec4<f32>(e, lum);
-  sumP[li] = vec4<f32>(worldOf(vec3<f32>(id) + 0.5) * lum, 0.0);
+  let wc = worldOf(vec3<f32>(id) + 0.5);
+  sumP[li] = vec4<f32>(wc * lum, 0.0);
   sumB[li] = b;
+  sumM[li] = vec4<f32>(wc.x * wc.x, wc.y * wc.y, wc.z * wc.z, wc.x * wc.z) * lum;
   sumX[4u * li] = x0;
   sumX[4u * li + 1u] = x1;
   sumX[4u * li + 2u] = x2;
@@ -3791,16 +3834,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
       sumE[li] += sumE[li + st];
       sumP[li] += sumP[li + st];
       sumB[li] += sumB[li + st];
+      sumM[li] += sumM[li + st];
       for (var j = 0u; j < 4u; j++) { sumX[4u * li + j] += sumX[4u * (li + st) + j]; }
     }
     workgroupBarrier();
   }
   if (li == 0u) {
     let k = wid.x + nw.x * (wid.y + nw.y * wid.z);
-    partial[7u * k] = sumE[0];
-    partial[7u * k + 1u] = vec4<f32>(sumP[0].xyz, f32(phase)); // (the phase, for the totals)
-    partial[7u * k + 2u] = sumB[0];
-    for (var j = 0u; j < 4u; j++) { partial[7u * k + 3u + j] = sumX[j]; }
+    partial[8u * k] = sumE[0];
+    partial[8u * k + 1u] = vec4<f32>(sumP[0].xyz, f32(phase)); // (the phase, for the totals)
+    partial[8u * k + 2u] = sumB[0];
+    for (var j = 0u; j < 4u; j++) { partial[8u * k + 3u + j] = sumX[j]; }
+    partial[8u * k + 7u] = sumM[0];
   }
 }
 `

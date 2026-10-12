@@ -992,8 +992,8 @@ export class PyroEngine {
     }
     // The fire's light: per-workgroup partial sums, then the total (intensity and centre), read by the renderer.
     const groups = Math.ceil(n[0] / 4) * Math.ceil(n[1] / 4) * Math.ceil(n[2] / 4)
-    const firePartial = storage(groups * 20)
-    const fireLight = d.createBuffer({ size: (3 + 9 * FIRE_BANDS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+    const firePartial = storage(groups * 28)
+    const fireLight = d.createBuffer({ size: (3 + 16 * FIRE_BANDS) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
     // The heat release rate in each cell (W/m3), from the step's burning: for the expansion, the sums and validation.
     const hrr = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     // A fire's mass keeping: the volume each cell's gas was spread over, and the ratio its advection is scaled by.

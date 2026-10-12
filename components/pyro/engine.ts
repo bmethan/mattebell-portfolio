@@ -1133,7 +1133,7 @@ export class PyroEngine {
             ],
           }),
         ) as [GPUBindGroup, GPUBindGroup],
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }, { binding: 43, resource: v(cycDirect) }]),
       },
     }
     this.resetSkin()
@@ -2077,6 +2077,7 @@ export class PyroEngine {
           { binding: 34, resource: v(g.light2) },
           { binding: 35, resource: v(g.vel[0]) },
           { binding: 39, resource: v(g.cycBounce[0]) },
+          { binding: 43, resource: v(g.cycDirect) },
         ],
       })
       // (The light volume shadows the same smoke, averaged over each coarse cell.)

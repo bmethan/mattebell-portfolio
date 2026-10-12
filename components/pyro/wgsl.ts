@@ -2172,10 +2172,9 @@ fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
 // bring every slice within two hundredths, where the upper slices were a quarter short.) A step marches an eighth of the
 // directions in turn (ESCAPE_PHASES), and keeps the rest from the steps before: all of them every step added some
 // 1.6 ms, and the share that gets out changes far more slowly than the flames flicker (each direction is marched again
-// within a quarter of a second). (Cells with under ESCAPE_SKIP of their slice's light are left out; dim and outer, they
-// let more of it out, so the table reads a bonfire's lowest slice 5 to 10% low, all directions alike. Kept in, the
-// fire's light alone comes a third closer to the reference, but its whole frame further, where the smoke over the
-// flames is already bright.)
+// within a quarter of a second). (Cells with under ESCAPE_SKIP of their slice's light are left out. Dim and outer,
+// they let more of it out than the rest: left out at a ten-thousandth, the table read a bonfire's lowest slice 5 to 10%
+// low in every direction.)
 const ESCAPE_DIRS = ${ESCAPE_NDIRS}u;
 const ESCAPE_PHASES = ${ESCAPE_PHASES}u;
 const ESCAPE_NRINGS = ${ESCAPE_RINGS.length}u;
@@ -2612,6 +2611,7 @@ fn bandSpread(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
 @group(0) @binding(34) var light2: texture_3d<f32>; // x: optical depth toward the softbox rig's rim (LIGHT)
 @group(0) @binding(35) var velTex: texture_3d<f32>; // the velocity, for the motion blur
 @group(0) @binding(39) var cycBounce: texture_2d<f32>; // the light the rest of the cyc sends to each point of it (CYC_BOUNCE), lux
+@group(0) @binding(43) var cycDirectMap: texture_2d<f32>; // the light straight onto each point of it (CYC_DIRECT), lux
 fn rimOn() -> bool { return R.rimDir.w > 0.5; }
 // The rim's shadow on a surface point outside the gas: the optical depth where the way to the rim enters the domain.
 fn rimShadow(p: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
@@ -3440,7 +3440,7 @@ fn mirrorView(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, ch: vec3<f32>, fireColo
   let ph1 = hg(cosT, 0.5 * g);
   let ph2 = hg(cosT, 0.25 * g);
   let albedo = R.skyCol.w;
-  let skyScatter = select(R.skyCol.xyz * INV_PI * domeShare(rd.y, g), envScatter(rd, g), envOn());
+  let skyScatter = select(R.skyCol.xyz * INV_PI * skyShareOf(rd, g), envScatter(rd, g), envOn());
   let rimDir = R.rimDir.xyz;
   let pr0 = hg(dot(rd, rimDir), g);
   var col = vec3<f32>(0.0);
@@ -3578,6 +3578,15 @@ fn domeShare(mu: f32, g: f32) -> f32 {
   let p3 = 0.5 * mu * (5.0 * mu * mu - 3.0);
   return clamp(0.5 + 0.75 * g * mu - 0.4375 * g * g * g * p3, 0.0, 1.0);
 }
+// On the cyc the wall, as tall and wide as the view, hides every way back (toward -z) from the smoke in front of it, so
+// the smoke sees the sky only over the upper hemisphere's front quarter: its share of the phase, to first order in the
+// anisotropy, 1/4 + 3/8 g (y + z) of the view's direction (the quarter's first moment, (0, pi/2, pi/2)). Smoke seen
+// against the wall scatters toward the camera mostly the light from behind it, the wall's; taking the whole sky, the
+// bonfire's smoke over its flames took 1.6 times the path-traced reference's sky light (with the wall, 1.15).
+fn cycQuarterShare(rd: vec3<f32>, g: f32) -> f32 {
+  return clamp(0.25 + 0.375 * g * (rd.y + rd.z), 0.0, domeShare(rd.y, g));
+}
+fn skyShareOf(rd: vec3<f32>, g: f32) -> f32 { return select(domeShare(rd.y, g), cycQuarterShare(rd, g), cycOn()); }
 
 // The light around a point of the smoke (uvw; at wm, the light volume there L) besides the sun, the rim and the fire,
 // toward the camera along rd, per unit of albedo (cd/m2): the sky through the smoke over it (the dome's mean
@@ -3603,7 +3612,17 @@ fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f3
   if (!envOn()) {
     let b = clamp(sqrt(3.0 * (1.0 - albedo) * (1.0 - albedo * g)), 0.5, 1.0);
     let a = (1.35 - 0.5 * albedo) * albedo * f;
-    amb += R.skyCol.xyz * INV_2PI * (a * exp(-b * L2.y * ch) + a * a * exp(-b * b * L2.y * ch));
+    // (On the cyc, the wall behind and above: its light as the map has it, at the point straight behind, by its share
+    // of the phase; and the light scattered more than once, half the sky's, half the wall's.)
+    var skyOct = R.skyCol.xyz * INV_2PI;
+    if (cycOn()) {
+      let wp = vec3<f32>(wm.x, max(wm.y, CYC_R), CYC_Z - CYC_R);
+      let wuv = cycUv(wp, vec3<f32>(0.0, 0.0, 1.0));
+      let wallL = R.floorCol.xyz * INV_PI * (textureSampleLevel(cycDirectMap, samp, wuv, 0.0).xyz + textureSampleLevel(cycBounce, samp, wuv, 0.0).xyz);
+      amb += wallL * max(domeShare(rd.y, g) - cycQuarterShare(rd, g), 0.0) * exp(-L2.y * ch);
+      skyOct = R.skyCol.xyz * INV_PI * 0.25 + wallL * 0.25;
+    }
+    amb += skyOct * (a * exp(-b * L2.y * ch) + a * a * exp(-b * b * L2.y * ch));
     let F2 = textureSampleLevel(light2, samp, uvF, 0.0);
     let r2 = R.floorCol.w * R.floorCol.w;
     let fade = select(exp(-dot(wm.xz, wm.xz) / r2) / (1.0 + wm.y * wm.y / r2), 1.0, R.scene.x > 0.5);
@@ -3736,7 +3755,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let fireColour = fireLight[0].xyz / max(fireLight[0].w, 1e-12);
   // The sky's light scattered toward the camera, before the smoke dims it: a uniform dome over open ground (radiance
   // E / pi, by its share of the phase, domeShare), or an HDR environment through the phase function.
-  let skyScatter = select(R.skyCol.xyz * INV_PI * domeShare(rd.y, g), envScatter(rd, g), envOn());
+  let skyScatter = select(R.skyCol.xyz * INV_PI * skyShareOf(rd, g), envScatter(rd, g), envOn());
   // The softbox rig's rim, through the same phase octaves as the sun.
   let rimDir = R.rimDir.xyz;
   let cosR = dot(rd, rimDir);
@@ -3909,7 +3928,7 @@ const OCTANTS = array<vec3<f32>, 8>(
 // step), through the soot as the image draws it (formed by now), weighted by the cell's light. (Trilinear rather than
 // the image's tricubic, at an eighth of the cost.) A cell with under ESCAPE_SKIP of its slice's light (at the last
 // step) is left out: the glow climbs so steeply with temperature that most glowing cells carry almost none of it.
-const ESCAPE_SKIP = 1e-4; // (of the slice's light)
+const ESCAPE_SKIP = 1e-5; // (of the slice's light)
 fn sootSig(w: vec3<f32>) -> f32 {
   let uvw = uvwOf(w);
   let s4 = textureSampleLevel(scal, samp, uvw, 0.0);

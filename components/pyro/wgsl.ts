@@ -4499,8 +4499,10 @@ fn leaving(d: vec3<f32>, seen: bool) -> vec3<f32> {
   } else if (!seen && d.y > 0.0) {
     L = R.skyCol.xyz * INV_PI;
   }
-  // The lights, where seen: their radiance, illuminance over solid angle.
-  if (seen) {
+  // The lights, where seen: their radiance, illuminance over solid angle. (Left out with the rest of the lights in the
+  // parts' split, 8: seen in the chrome ball, the sun's disc stayed in the fire's light alone, one path in a hundred
+  // finding it, a single pixel worth two thirds of the fire's light about the ball.)
+  if (seen && (Q.parts & 8u) == 0u) {
     for (var i = 0; i < 3; i++) {
       let c = coneOf(i);
       if (c.c > 0.0 && dot(d, c.d) > c.c) { L += c.e / (TWO_PI * (1.0 - c.c)); }

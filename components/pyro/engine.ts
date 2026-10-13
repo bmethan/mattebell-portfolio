@@ -2057,7 +2057,7 @@ export class PyroEngine {
   }
 
   // The fire's sums again for the frame as it stands, every direction of its escape tables marched for it: each step
-  // marches a seventeenth of them (ESCAPE_PHASES), so a paused frame's tables were a blend of the last 0.57 s, and a
+  // marches a nineteenth of them (ESCAPE_PHASES), so a paused frame's tables were a blend of the last 0.63 s, and a
   // bonfire's soot about its flames moves the share that gets out each way by a seventh from one step to the next and a
   // quarter over the blend; and they march with the shading's albedo and anisotropy (the similarity relation), which a
   // paused frame can change. (Left as the steps left them, the bonfire's wall took from under half to twice the fire's

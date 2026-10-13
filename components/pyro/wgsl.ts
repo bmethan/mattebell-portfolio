@@ -12,15 +12,22 @@ import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SO
 // angle from the pole, as the root of 1 - |sine| (the pole a third, the ring two thirds of its span, over 2).
 const ESCAPE_RINGS = [-30, -15, 0, 30, 45, 60, 75]
 const ESCAPE_SINES = ESCAPE_RINGS.map(d => Math.sin((d * Math.PI) / 180))
-// The directions (eight a ring, then straight up and straight down), the table's entries (four to an entry, with the
+// The directions (sixteen a ring, then straight up and straight down), the table's entries (four to an entry, with the
 // mean over the sphere after the directions: up, down and the mean in the last), and the steps a table takes to march.
-const ESCAPE_NDIRS = 8 * ESCAPE_RINGS.length + 2
+const ESCAPE_AZ = 16
+const ESCAPE_NDIRS = ESCAPE_AZ * ESCAPE_RINGS.length + 2
 const ESCAPE_ENTRIES = Math.ceil((ESCAPE_NDIRS + 1) / 4)
-const ESCAPE_POLES = 2 * ESCAPE_RINGS.length
-export const ESCAPE_PHASES = 9
+const ESCAPE_POLES = (ESCAPE_AZ / 4) * ESCAPE_RINGS.length
+export const ESCAPE_PHASES = 17
 // The fire's light and its tables in the sums (FIRE_SUM_TOTAL), vec4 entries: the totals, two a slice, then each
 // slice's escape table, scattered light's table, spread and escape table by height.
 export const FIRE_LIGHT_ENTRIES = 3 + (3 + 3 * ESCAPE_ENTRIES) * FIRE_BANDS
+// The share of the turn each of a quadrant's four azimuths stands for, at the diamond angle's quarters (half the gaps
+// either side), for the table's mean.
+const AZ_SHARES = (() => {
+  const a = [0, 1, 2, 3, 4].map(i => Math.atan2(i / 4, 1 - i / 4))
+  return [0, 1, 2, 3].map(i => ((a[i + 1] - a[i]) / 2 + (i === 0 ? a[1] - a[0] : a[i] - a[i - 1]) / 2) / (2 * Math.PI))
+})()
 const ESCAPE_WEIGHTS = (() => {
   const m = [-1, ...ESCAPE_SINES, 1]
   const w = m.map(() => 0)
@@ -35,14 +42,14 @@ const ESCAPE_WEIGHTS = (() => {
 
 // The share of slice b's light that gets out of its own soot toward p (bandOut), from the escape tables in the fire's
 // sums (FIRE_SUM): read linearly in the sine of the elevation between the rings (and straight up and down), and in
-// azimuth between the eight by the diamond angle (|z| over |x| + |z| round the quadrants, exact at the eight and with
-// no inverse trigonometry: each surface reads the tables thirty-two times a pixel). With the light the soot scatters
-// back out: it scatters what it stops by its albedo, and mostly onward (the lab's anisotropy). By the similarity
-// relation the escape table counts the onward share as never stopped (FIRE_SUM), and the rest is scattered evenly
-// every way, at the albedo a (1 - g) / (1 - a g). Of the share the soot stops (1 - the table's mean over the sphere),
-// that much is scattered from where it was stopped, and gets out by the second table, the share of such light that
-// leaves each way; what the soot stops of that, again, and so on: albedo (1 - mean) / (1 - albedo (1 - its mean)) of
-// the light, each way by the second table. (Scattered light starts nearer the soot's edge than the flames that made
+// azimuth between the sixteen by the diamond angle (|z| over |x| + |z| round the quadrants, exact at the sixteen and
+// with no inverse trigonometry: each surface reads the tables thirty-two times a pixel). With the light the soot
+// scatters back out: it scatters what it stops by its albedo, and mostly onward (the lab's anisotropy). By the
+// similarity relation the escape table counts the onward share as never stopped (FIRE_SUM), and the rest is scattered
+// evenly every way, at the albedo a (1 - g) / (1 - a g). Of the share the soot stops (1 - the table's mean over the
+// sphere), that much is scattered from where it was stopped, and gets out by the second table, the share of such light
+// that leaves each way; what the soot stops of that, again, and so on: albedo (1 - mean) / (1 - albedo (1 - its mean))
+// of the light, each way by the second table. (Scattered light starts nearer the soot's edge than the flames that made
 // it, and gets out more easily and more evenly. Let out as the flames' own light is, the floor beside a bonfire had
 // seven tenths of the scattered light the path-traced reference gives it, and the wall and smoke beside the fire were
 // 9% dark.) Within a bed's radius of the slice's centre, Beer's law over the share of it crossed. (For the light pass,
@@ -51,16 +58,16 @@ function bandOutWgsl(sums: string) {
   return /* wgsl */ `
 fn escTab(base: u32, k: u32) -> f32 { return ${sums}[base + k / 4u][k % 4u]; }
 fn escRing(base: u32, r: u32, a0: u32, a1: u32, fa: f32) -> f32 {
-  return mix(escTab(base, 8u * r + a0), escTab(base, 8u * r + a1), fa);
+  return mix(escTab(base, ${ESCAPE_AZ}u * r + a0), escTab(base, ${ESCAPE_AZ}u * r + a1), fa);
 }
 fn bandEscape(base: u32, u: vec3<f32>) -> f32 {
   let ax = abs(u.x);
   let az2 = abs(u.z);
   let q = select(az2 / (ax + az2), 0.0, ax + az2 < 1e-6);
   let dia = select(select(3.0 + 1.0 - q, 2.0 + q, u.x < 0.0), select(1.0 + 1.0 - q, q, u.x >= 0.0), u.z >= 0.0);
-  let az = 2.0 * dia;
-  let a0 = u32(floor(az)) % 8u;
-  let a1 = (a0 + 1u) % 8u;
+  let az = ${ESCAPE_AZ / 4}.0 * dia;
+  let a0 = u32(floor(az)) % ${ESCAPE_AZ}u;
+  let a1 = (a0 + 1u) % ${ESCAPE_AZ}u;
   let fa = az - floor(az);
   let m = u.y;
   // (Toward a pole, by the angle from it, the root of 1 - |sine|, within 1% to 30 degrees from the pole: straight up
@@ -2158,27 +2165,35 @@ fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
 }
 // The fire's escape table (FIRE_SUM): for each slice of its height, the share of its light that gets out of its own
 // soot, over a bed's radius, toward each of ESCAPE_DIRS directions: rings at ESCAPE_RINGS degrees of elevation, each
-// toward eight azimuths from +x round toward +z (8 ring + azimuth), then straight up and straight down, and its mean
-// over the sphere. ESCAPE_STRIDE entries of the sums per slice, after the slices' own: the rings, two entries each,
-// then (up, down, mean); the scattered light's table follows the slices' escape tables (ESCAPE_BASE2), laid out the
-// same, and after the slices' spread, the escape by height (ESCAPE_BASE3: each cell's light that gets out times its
-// height over the floor, over the light times the height, of the cells marched), for the floor (bandOutFloor). (Four
-// azimuths missed a flame sheet lying across the diagonal: the bonfire's light fell a fifth short on one side of its
-// cyc and a quarter over on the other. With rings at -30, 0 and 30 only, read linearly in the sine between them and
-// the poles, the escape from a slice's soot came out short wherever it bends between rings: up toward the wall above
-// a bonfire, where straight up looks along the whole flame column and pulls the reading down, three fifths of the
-// cells' own at 50 to 60 degrees, and just below the level, where it climbs steeply, a fifth short at -20; the rings
-// at -15 and 60 bring both within a tenth. Above 60, read toward straight up, a ring at 75 and the caps by the angle
-// bring every slice within two hundredths, where the upper slices were a quarter short; and between 30 and 60, where
-// the lowest slice's escape peaks near 40, a ring at 45 brings it within a hundredth, where it was an eighth short.) A
-// step marches a ninth of the directions in turn (ESCAPE_PHASES), seven, and keeps the rest from the steps before: all
-// of them every step added some 1.6 ms, and the share that gets out changes far more slowly than the flames flicker
-// (each direction is marched again within a third of a second). (Cells with under ESCAPE_SKIP of their slice's light are left out. Dim and outer,
-// they let more of it out than the rest: left out at a ten-thousandth, the table read a bonfire's lowest slice 5 to 10%
-// low in every direction.)
+// toward ESCAPE_AZ azimuths from +x round toward +z (ESCAPE_AZ ring + azimuth), at the quarters of the diamond angle in
+// each quadrant (0, 18.4, 45 and 71.6 degrees from its first axis, where bandEscape reads them exactly), then straight
+// up and straight down, and its mean over the sphere. ESCAPE_STRIDE entries of the sums per slice, after the slices'
+// own: the rings, four entries each (a quadrant an entry), then (up, down, mean); the scattered light's table follows
+// the slices' escape tables (ESCAPE_BASE2), laid out the same, and after the slices' spread, the escape by height
+// (ESCAPE_BASE3: each cell's light that gets out times its height over the floor, over the light times the height, of
+// the cells marched), for the floor (bandOutFloor). (Four azimuths missed a flame sheet lying across the diagonal: the
+// bonfire's light fell a fifth short on one side of its cyc and a quarter over on the other. Eight, 45 degrees apart,
+// read its middle slices' light toward the far left of its wall, between -x and the diagonal, as much as twice what
+// gets out: the escape falls threefold within those 45 degrees, and the table read straight across them, so the wall
+// there took a quarter more of the fire's light than every glowing cell's own, marched to it through the soot; sixteen
+// bring the table within a twelfth. With rings at -30, 0 and 30 only, read linearly in the sine between them and the
+// poles, the escape from a slice's soot came out short wherever it bends between rings: up toward the wall above a
+// bonfire, where straight up looks along the whole flame column and pulls the reading down, three fifths of the cells'
+// own at 50 to 60 degrees, and just below the level, where it climbs steeply, a fifth short at -20; the rings at -15
+// and 60 bring both within a tenth. Above 60, read toward straight up, a ring at 75 and the caps by the angle bring
+// every slice within two hundredths, where the upper slices were a quarter short; and between 30 and 60, where the
+// lowest slice's escape peaks near 40, a ring at 45 brings it within a hundredth, where it was an eighth short.) A step
+// marches a seventeenth of the directions in turn (ESCAPE_PHASES), seven, and keeps the rest from the steps before: all
+// 58 of the eight azimuths every step added some 1.6 ms. Running, the table is a blend of the last seventeen steps; the
+// share that gets out each way moves with the flames, a seventh from one step to the next about a bonfire, so each way
+// reads about a quarter off the step's own whether a step marches seven or thirteen (over nine steps). Paused, the
+// engine marches all of it for the frame (resumFireNow). (Cells with under ESCAPE_SKIP of their slice's light are left
+// out. Dim and outer, they let more of it out than the rest: left out at a ten-thousandth, the table read a bonfire's
+// lowest slice 5 to 10% low in every direction.)
 const ESCAPE_DIRS = ${ESCAPE_NDIRS}u;
 const ESCAPE_PHASES = ${ESCAPE_PHASES}u;
 const ESCAPE_NRINGS = ${ESCAPE_RINGS.length}u;
+const ESCAPE_AZ = ${ESCAPE_AZ}u;
 const ESCAPE_POLES = ${ESCAPE_POLES}u; // (the entry with straight up, straight down and the mean)
 const ESCAPE_RINGS = array<f32, ${ESCAPE_RINGS.length}>(${ESCAPE_RINGS.map(wf).join(', ')});
 const ESCAPE_SINES = array<f32, ${ESCAPE_RINGS.length}>(${ESCAPE_SINES.map(wf).join(', ')});
@@ -2190,9 +2205,13 @@ const ESCAPE_BASE3 = 3u + ${3 + 2 * ESCAPE_ENTRIES}u * FIRE_BANDS; // (the escap
 fn escapeDir(k: u32) -> vec3<f32> {
   if (k == ESCAPE_DIRS - 2u) { return vec3<f32>(0.0, 1.0, 0.0); }
   if (k == ESCAPE_DIRS - 1u) { return vec3<f32>(0.0, -1.0, 0.0); }
-  let el = radians(ESCAPE_RINGS[k / 8u]);
-  let az = f32(k % 8u) * 0.78539816;
-  return vec3<f32>(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+  let el = radians(ESCAPE_RINGS[k / ESCAPE_AZ]);
+  let dia = f32(k % ESCAPE_AZ) * 4.0 / f32(ESCAPE_AZ);
+  let f = fract(dia);
+  var h = vec2<f32>(1.0 - f, f);
+  for (var q = 0u; q < u32(dia); q++) { h = vec2<f32>(-h.y, h.x); }
+  h = normalize(h) * cos(el);
+  return vec3<f32>(h.x, sin(el), h.y);
 }
 // Where fuel is burning, soot radiates at the flame's temperature, not the cell's. The burning happens in sheets far
 // thinner than a cell, at about 1400 K, and the soot forms in them, while the cell's mean temperature spreads the same
@@ -2502,10 +2521,10 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec
   }
   var marched = 0.0;
   if (li == 0u) {
-    // This step's directions (k = 4 j + phase: component phase of each entry), over the light of the cells marched
-    // (with none, as after a restart, when the last step's sums are another fire's, all of it gets out); then the
-    // mean over the sphere from the whole table: each ring's eight azimuths averaged, weighted by the share of the
-    // sphere it stands for.
+    // This step's directions (k = ESCAPE_PHASES j + phase), over the light of the cells marched (with none, as after a
+    // restart, when the last step's sums are another fire's, all of it gets out); then the mean over the sphere from
+    // the whole table: each ring's sixteen azimuths by the share of the turn each stands for (half the gaps either
+    // side), each ring by the share of the sphere it stands for.
     marched = sB[0].w;
     writeTable(3u + 2u * FIRE_BANDS + ${ESCAPE_ENTRIES}u * u32(band), phase, sP[0], sB[0], marched);
   }
@@ -2554,7 +2573,11 @@ fn writeTable(base: u32, phase: u32, lo: vec4<f32>, hi: vec4<f32>, marched: f32)
   }
   let w = array<f32, ${ESCAPE_RINGS.length + 2}>(${ESCAPE_WEIGHTS.map(wf).join(', ')});
   var mean = w[0] * result[base + ${ESCAPE_POLES}u].y + w[${ESCAPE_RINGS.length + 1}] * result[base + ${ESCAPE_POLES}u].x;
-  for (var r = 0u; r < ${ESCAPE_RINGS.length}u; r++) { mean += w[r + 1u] * 0.125 * dot(result[base + 2u * r] + result[base + 2u * r + 1u], vec4<f32>(1.0)); }
+  let wa = vec4<f32>(${AZ_SHARES.map(wf).join(', ')});
+  for (var r = 0u; r < ${ESCAPE_RINGS.length}u; r++) {
+    let q = result[base + 4u * r] + result[base + 4u * r + 1u] + result[base + 4u * r + 2u] + result[base + 4u * r + 3u];
+    mean += w[r + 1u] * dot(q, wa);
+  }
   result[base + ${ESCAPE_POLES}u].z = mean;
 }
 `
@@ -4088,7 +4111,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
   }
   let lum = ap1Lum(e);
   if (all(c < nCells())) { textureStore(emitOut, c, vec4<f32>(e * 1e-3, sg)); }
-  // This step's quarter of the table, k = 4 j + phase: j 0..3, then 4..6 and the light of the cells marched.
+  // This step's share of the table, k = ESCAPE_PHASES j + phase: j 0..3, then 4..6 and the light of the cells marched.
   let phase = P.dims.w % ESCAPE_PHASES;
   var x0 = vec4<f32>(0.0);
   var x1 = vec4<f32>(0.0);

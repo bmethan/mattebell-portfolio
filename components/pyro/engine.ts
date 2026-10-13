@@ -595,6 +595,7 @@ export class PyroEngine {
   private readingBall = false
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
+  private fireResum = false // (paused: the fire's sums marched afresh before the next frame's light: resumFireNow)
   private metering = false
   private meterEV: number | null = null
   private meterAt = 0
@@ -1195,6 +1196,7 @@ export class PyroEngine {
     if (this.state.env !== prev.env) this.syncEnv()
     // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh (traced too).
     this.stateVersion++
+    if (this.paused) this.fireResum = true
     this.lightDirty = true
     this.needsRender = true
     this.taaCount = 0
@@ -1203,6 +1205,11 @@ export class PyroEngine {
 
   setPaused(paused: boolean) {
     this.paused = paused
+    if (paused) {
+      this.fireResum = true
+      this.lightDirty = true
+      this.needsRender = true
+    }
     if (!paused) this.pt.on = false
     this.acc = 0
     this.kick()
@@ -2043,9 +2050,20 @@ export class PyroEngine {
     this.histIndex = next
   }
 
-  // (Development: the fire's sums again for the frame as it stands, for the probes, which read them at a paused frame;
-  // the escape table's six parts each, the step's own last, the frame's word of the uniforms set for each.)
+  // (Development: resumFireNow, waited on, for the probes, which read the sums at a paused frame.)
   async resumFire() {
+    this.resumFireNow()
+    await this.device.queue.onSubmittedWorkDone()
+  }
+
+  // The fire's sums again for the frame as it stands, every direction of its escape tables marched for it: each step
+  // marches a seventeenth of them (ESCAPE_PHASES), so a paused frame's tables were a blend of the last 0.57 s, and a
+  // bonfire's soot about its flames moves the share that gets out each way by a seventh from one step to the next and a
+  // quarter over the blend; and they march with the shading's albedo and anisotropy (the similarity relation), which a
+  // paused frame can change. (Left as the steps left them, the bonfire's wall took from under half to twice the fire's
+  // light it takes with every direction marched for the frame.) The step's own phase last, the frame's word of the
+  // uniforms set for each.
+  private resumFireNow() {
     const g = this.grids!
     const p = this.pipes!
     const [nx, ny, nz] = g.n
@@ -2063,7 +2081,7 @@ export class PyroEngine {
       this.device.queue.submit([enc.finish()])
     }
     this.device.queue.writeBuffer(this.simBuf, 12, new Uint32Array([this.frame]))
-    await this.device.queue.onSubmittedWorkDone()
+    this.fireResum = false
     this.lightDirty = true
   }
 
@@ -2170,6 +2188,10 @@ export class PyroEngine {
     // The current frame's weight: a running average while nothing changes (paused), a fixed share while simulating.
     const weight = this.taaCount === 0 ? 1 : this.paused ? Math.max(1 / (this.taaCount + 1), 1 / TAA_SETTLE) : TAA_WEIGHT
     this.device.queue.writeBuffer(this.taaBuf, 0, new Float32Array([this.taaCount > 0 ? 1 : 0, weight, 0, 0]))
+    // Paused, the fire's escape tables marched afresh for the frame (after its uniforms, which they read). (Not before
+    // a restart's first step, which reads the sums, the bed's area among them, as the restart left them, empty: summed
+    // then, they changed the whole run.)
+    if (this.fireResum && this.paused && this.fireLit && this.frame > 0) this.resumFireNow()
     const enc = this.device.createCommandEncoder()
     if (this.lightDirty) {
       const pass = enc.beginComputePass()

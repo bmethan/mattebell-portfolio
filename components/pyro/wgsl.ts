@@ -58,6 +58,30 @@ const ESCAPE_WEIGHTS = (() => {
 // seven tenths of the scattered light the path-traced reference gives it, and the wall and smoke beside the fire were
 // 9% dark.) Within a bed's radius of the slice's centre, Beer's law over the share of it crossed. (For the light pass,
 // whose binding is fireSums, and the renderers, fireLight.)
+// The slices' spread geometry (bandSpread, RENDER_LIB), for the renderers (fireLight) and the light pass (fireSums).
+function bandSpreadWgsl(sums: string) {
+  return /* wgsl */ `
+fn bandSpread(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
+  let c = ${sums}[4u + 2u * b].xyz;
+  let m = ${sums}[SPREAD_BASE + b];
+  let mid = 0.5 * (m.x + m.z);
+  let dev = sqrt(max(0.25 * (m.x - m.z) * (m.x - m.z) + m.w * m.w, 0.0));
+  let ang = 0.5 * atan2(2.0 * m.w, m.x - m.z);
+  let e1 = vec3<f32>(cos(ang), 0.0, sin(ang)) * sqrt(max(mid + dev, 0.0) * 3.0);
+  let e2 = vec3<f32>(-sin(ang), 0.0, cos(ang)) * sqrt(max(mid - dev, 0.0) * 3.0);
+  let e3 = vec3<f32>(0.0, min(sqrt(m.y * 3.0), max(c.y - 0.5 * P.grid.x, 0.0)), 0.0);
+  var g = 0.0;
+  for (var k = 0u; k < 6u; k++) {
+    let o = select(select(e3, e2, k / 2u == 1u), e1, k / 2u == 0u) * select(1.0, -1.0, (k & 1u) == 1u);
+    let d = c + o - p;
+    let r2 = dot(d, d) + BAND_R2 / 6.0;
+    g += max(dot(d, n), 0.0) / (sqrt(r2) * r2);
+  }
+  return g / 6.0;
+}
+`
+}
+
 function bandOutWgsl(sums: string) {
   return /* wgsl */ `
 fn escTab(base: u32, k: u32) -> f32 { return ${sums}[base + k / 4u][k % 4u]; }
@@ -2370,6 +2394,29 @@ fn fireIrradiance(w: vec3<f32>, n: vec3<f32>) -> f32 {
   }
   return 0.001 * e;
 }
+${bandSpreadWgsl('fireSums')}
+// The fire's light on the floor at pf, for the light the floor sends up into the smoke, as the floor's own shading
+// takes it (fireOnSurface): each slice spread as its flames are, by the floor's escape (by height), through the soot
+// beyond the slice; in kilolux, as fireIrradiance.
+fn fireOnFloor(pf: vec3<f32>) -> f32 {
+  if (P.fire.x < 0.5) { return 0.0; }
+  let vol = P.grid.x * P.grid.x * P.grid.x;
+  let up = vec3<f32>(0.0, 1.0, 0.0);
+  let rad = max(P.src.w, 0.1);
+  var e = 0.0;
+  for (var b = 0u; b < FIRE_BANDS; b++) {
+    let lum = fireSums[3u + 2u * b].w * vol;
+    if (lum <= 0.0) { continue; }
+    let d = fireSums[4u + 2u * b].xyz - pf;
+    let dist = max(length(d), 1e-6);
+    let outside = max(dist - rad, 0.0);
+    var tauOut = 0.0;
+    for (var i = 0; i < 12; i++) { tauOut += density(pf + d / dist * (f32(i) + 0.5) / 12.0 * outside); }
+    tauOut *= outside / 12.0;
+    e += lum * bandOutFloor(b, pf, up) * bandSpread(b, pf, up) * exp(-tauOut);
+  }
+  return 0.001 * e;
+}
 
 fn depth(w: vec3<f32>, d: vec3<f32>, ds: f32, ball: bool) -> f32 {
   let te = boxHit(w, d, P.origin.xyz, domainHi()).y;
@@ -2423,11 +2470,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   let tauDome = -log(max(tm / 5.0, 1e-6));
   // The bottom layer also holds the floor's light under it, for the light the floor sends up into the smoke: the sun's
-  // share on it (its cosine, through the smoke) and the fire's (kilolux, by the cosine). (The sky's is the layer's dome.)
+  // share on it (its cosine, through the smoke) and the fire's, as the floor's own shading has it (fireOnFloor). (The
+  // sky's is the layer's dome.) (Taken as the slices' point lights by the cosine, the fire's light on the floor under a
+  // bonfire's bed came to a sixth to two thirds of the floor's own shading, and a fifth short further out; with that
+  // and the octaves, the floor's light in a studio bonfire's flames went from a third of the reference's to six
+  // sevenths.)
   var floorLit = vec2<f32>(0.0);
   if (id.y == 0u) {
     let pf = vec3<f32>(w.x, 0.5 * P.grid.x, w.z);
-    floorLit = vec2<f32>(max(R.sunDir.y, 0.0) * exp(-depth(pf, R.sunDir.xyz, 1.5 * P.grid.x, false)), fireIrradiance(pf, vec3<f32>(0.0, 1.0, 0.0)));
+    floorLit = vec2<f32>(max(R.sunDir.y, 0.0) * exp(-depth(pf, R.sunDir.xyz, 1.5 * P.grid.x, false)), fireOnFloor(vec3<f32>(w.x, 0.0, w.z)));
   }
   textureStore(light2Out, vec3<i32>(id), vec4<f32>(tauRim, tauDome, floorLit));
 }
@@ -2629,24 +2680,7 @@ ${bandOutWgsl('fireLight')}
 // Far off, the same as one point at the centre. (One point at the centre left the floor at the edge of a campfire's
 // bed with half its light, the flames leaning to that side. Two points an axis, weighted by the light on each side of
 // the centre, put the lesser side's further out and a tenth too much light there.)
-fn bandSpread(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
-  let c = fireLight[4u + 2u * b].xyz;
-  let m = fireLight[SPREAD_BASE + b];
-  let mid = 0.5 * (m.x + m.z);
-  let dev = sqrt(max(0.25 * (m.x - m.z) * (m.x - m.z) + m.w * m.w, 0.0));
-  let ang = 0.5 * atan2(2.0 * m.w, m.x - m.z);
-  let e1 = vec3<f32>(cos(ang), 0.0, sin(ang)) * sqrt(max(mid + dev, 0.0) * 3.0);
-  let e2 = vec3<f32>(-sin(ang), 0.0, cos(ang)) * sqrt(max(mid - dev, 0.0) * 3.0);
-  let e3 = vec3<f32>(0.0, min(sqrt(m.y * 3.0), max(c.y - 0.5 * P.grid.x, 0.0)), 0.0);
-  var g = 0.0;
-  for (var k = 0u; k < 6u; k++) {
-    let o = select(select(e3, e2, k / 2u == 1u), e1, k / 2u == 0u) * select(1.0, -1.0, (k & 1u) == 1u);
-    let d = c + o - p;
-    let r2 = dot(d, d) + BAND_R2 / 6.0;
-    g += max(dot(d, n), 0.0) / (sqrt(r2) * r2);
-  }
-  return g / 6.0;
-}
+${bandSpreadWgsl('fireLight')}
 @group(0) @binding(11) var blueTex: texture_2d_array<f32>; // spatiotemporal blue noise, a slice a frame
 @group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
@@ -3755,7 +3789,10 @@ fn smokeAround(uvw: vec3<f32>, wm: vec3<f32>, L: vec4<f32>, rd: vec3<f32>, g: f3
     // (On the cyc the floor sees half the sky, and the rest of the cyc's light, CYC_BOUNCE.)
     if (cycOn()) { floorE += R.skyCol.xyz * exp(-F2.y * ch) * -0.5 + cycBounceAt(vec3<f32>(wm.x, 0.0, wm.z), vec3<f32>(0.0, 1.0, 0.0)); }
     let floorL = R.floorCol.xyz * INV_PI * fade * floorE;
-    amb += floorL * (1.0 - domeShare(rd.y, g)) * exp(-tauDown * ch);
+    // (And its light scattered more than once, as the sky's octaves take it, over the lower half of the sphere: split
+    // by order, more than half of the floor's light in a bonfire's flames and the smoke about them comes so, and with
+    // the light scattered once alone the flames had a third of the path-traced reference's floor light.)
+    amb += floorL * ((1.0 - domeShare(rd.y, g)) * exp(-tauDown * ch) + 0.5 * (a * exp(-b * tauDown * ch) + a * a * exp(-b * b * tauDown * ch)));
   }
   return Around(amb, f, tauDown, L2.x);
 }

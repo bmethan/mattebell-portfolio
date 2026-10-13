@@ -10,14 +10,14 @@ import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SO
 // table's mean over the sphere). Between rings the table is read linearly in the sine (a hat function in the sine,
 // whose measure over the sphere is even: each end takes half its span, over 2); toward a pole, linearly in the
 // angle from the pole, as the root of 1 - |sine| (the pole a third, the ring two thirds of its span, over 2).
-const ESCAPE_RINGS = [-30, -15, 0, 30, 60, 75]
+const ESCAPE_RINGS = [-30, -15, 0, 30, 45, 60, 75]
 const ESCAPE_SINES = ESCAPE_RINGS.map(d => Math.sin((d * Math.PI) / 180))
 // The directions (eight a ring, then straight up and straight down), the table's entries (four to an entry, with the
 // mean over the sphere after the directions: up, down and the mean in the last), and the steps a table takes to march.
 const ESCAPE_NDIRS = 8 * ESCAPE_RINGS.length + 2
 const ESCAPE_ENTRIES = Math.ceil((ESCAPE_NDIRS + 1) / 4)
 const ESCAPE_POLES = 2 * ESCAPE_RINGS.length
-export const ESCAPE_PHASES = 8
+export const ESCAPE_PHASES = 9
 // The fire's light and its tables in the sums (FIRE_SUM_TOTAL), vec4 entries: the totals, two a slice, then each
 // slice's escape table, scattered light's table, spread and escape table by height.
 export const FIRE_LIGHT_ENTRIES = 3 + (3 + 3 * ESCAPE_ENTRIES) * FIRE_BANDS
@@ -2169,10 +2169,11 @@ fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
 // a bonfire, where straight up looks along the whole flame column and pulls the reading down, three fifths of the
 // cells' own at 50 to 60 degrees, and just below the level, where it climbs steeply, a fifth short at -20; the rings
 // at -15 and 60 bring both within a tenth. Above 60, read toward straight up, a ring at 75 and the caps by the angle
-// bring every slice within two hundredths, where the upper slices were a quarter short.) A step marches an eighth of the
-// directions in turn (ESCAPE_PHASES), and keeps the rest from the steps before: all of them every step added some
-// 1.6 ms, and the share that gets out changes far more slowly than the flames flicker (each direction is marched again
-// within a quarter of a second). (Cells with under ESCAPE_SKIP of their slice's light are left out. Dim and outer,
+// bring every slice within two hundredths, where the upper slices were a quarter short; and between 30 and 60, where
+// the lowest slice's escape peaks near 40, a ring at 45 brings it within a hundredth, where it was an eighth short.) A
+// step marches a ninth of the directions in turn (ESCAPE_PHASES), seven, and keeps the rest from the steps before: all
+// of them every step added some 1.6 ms, and the share that gets out changes far more slowly than the flames flicker
+// (each direction is marched again within a third of a second). (Cells with under ESCAPE_SKIP of their slice's light are left out. Dim and outer,
 // they let more of it out than the rest: left out at a ten-thousandth, the table read a bonfire's lowest slice 5 to 10%
 // low in every direction.)
 const ESCAPE_DIRS = ${ESCAPE_NDIRS}u;

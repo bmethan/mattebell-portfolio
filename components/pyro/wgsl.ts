@@ -10,7 +10,7 @@ import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SO
 // table's mean over the sphere). Between rings the table is read linearly in the sine (a hat function in the sine,
 // whose measure over the sphere is even: each end takes half its span, over 2); toward a pole, linearly in the
 // angle from the pole, as the root of 1 - |sine| (the pole a third, the ring two thirds of its span, over 2).
-const ESCAPE_RINGS = [-30, -15, 0, 15, 30, 45, 60, 75]
+const ESCAPE_RINGS = [-30, -15, 0, 15, 22.5, 30, 37.5, 45, 60, 75]
 const ESCAPE_SINES = ESCAPE_RINGS.map(d => Math.sin((d * Math.PI) / 180))
 // The directions (sixteen a ring, then straight up and straight down), the table's entries (four to an entry, with the
 // mean over the sphere after the directions: up, down and the mean in the last), and the steps a table takes to march.
@@ -18,15 +18,19 @@ const ESCAPE_AZ = 16
 const ESCAPE_NDIRS = ESCAPE_AZ * ESCAPE_RINGS.length + 2
 const ESCAPE_ENTRIES = Math.ceil((ESCAPE_NDIRS + 1) / 4)
 const ESCAPE_POLES = (ESCAPE_AZ / 4) * ESCAPE_RINGS.length
-export const ESCAPE_PHASES = 19
+export const ESCAPE_PHASES = 24
 // The fire's light and its tables in the sums (FIRE_SUM_TOTAL), vec4 entries: the totals, two a slice, then each
 // slice's escape table, scattered light's table, spread and escape table by height.
 export const FIRE_LIGHT_ENTRIES = 3 + (3 + 3 * ESCAPE_ENTRIES) * FIRE_BANDS
-// The share of the turn each of a quadrant's four azimuths stands for, at the diamond angle's quarters (half the gaps
+// The share of the turn each of a quadrant's azimuths stands for, at even steps of the diamond angle (half the gaps
 // either side), for the table's mean.
 const AZ_SHARES = (() => {
-  const a = [0, 1, 2, 3, 4].map(i => Math.atan2(i / 4, 1 - i / 4))
-  return [0, 1, 2, 3].map(i => ((a[i + 1] - a[i]) / 2 + (i === 0 ? a[1] - a[0] : a[i] - a[i - 1]) / 2) / (2 * Math.PI))
+  const q = ESCAPE_AZ / 4
+  const a = Array.from({ length: q + 1 }, (_, i) => Math.atan2(i / q, 1 - i / q))
+  return Array.from({ length: q }, (_, i) => {
+    const before = i === 0 ? a[1] - a[0] : a[i] - a[i - 1]
+    return ((a[i + 1] - a[i]) / 2 + before / 2) / (2 * Math.PI)
+  })
 })()
 const ESCAPE_WEIGHTS = (() => {
   const m = [-1, ...ESCAPE_SINES, 1]
@@ -2191,14 +2195,17 @@ fn discVis(a: f32, pen: f32, miss: f32) -> f32 {
 // lowest slice's escape peaks near 40, a ring at 45 brings it within a hundredth, where it was an eighth short; and
 // just above the level toward a bonfire's right, where the share its bed's sheet lets out climbs by half again within
 // 25 degrees (0.14 to 0.22), the rings at 0 and 30 read a line across it, a tenth short at 15 to 20, and a ring at 15
-// brings it within 3% at the table's azimuths.) A step marches a nineteenth of the directions in turn (ESCAPE_PHASES),
-// seven, and keeps the rest from the steps before: all 58 of the eight azimuths every step added some 1.6 ms (all of
-// them every step, the rest of the pass done once, would add 1 to 3.5 ms at the Medium resolution). Running, the table
-// is a blend of the last nineteen steps; the share that gets out each way moves with the flames, a seventh from one
-// step to the next about a bonfire, so each way reads about a quarter off the step's own whether a step marches seven
-// or thirteen (over nine steps). Paused, the engine marches all of it for the frame (resumFireNow). (Cells with under
-// ESCAPE_SKIP of their slice's light are left out. Dim and outer, they let more of it out than the rest: left out at a
-// ten-thousandth, the table read a bonfire's lowest slice 5 to 10% low in every direction.)
+// brings it within 3% at the table's azimuths; above that, toward the cyc's wall, read linearly in the sine between 15,
+// 30 and 45 where it bends, the lowest slice's escape came out 2% short of its own march, and the fire's light on the
+// wall's middle a few percent short of every glowing cell's own, and rings at 22.5 and 37.5 bring it within 0.7%.) A
+// step marches a twenty-fourth of the directions in turn (ESCAPE_PHASES), seven, and keeps the rest from the steps
+// before: all 58 of the eight azimuths every step added some 1.6 ms (all of them every step, the rest of the pass done
+// once, would add 1 to 3.5 ms at the Medium resolution). Running, the table is a blend of the last twenty-four steps;
+// the share that gets out each way moves with the flames, a seventh from one step to the next about a bonfire, so each
+// way reads about a quarter off the step's own whether a step marches seven or thirteen (over nine steps). Paused, the
+// engine marches all of it for the frame (resumFireNow). (Cells with under ESCAPE_SKIP of their slice's light are left
+// out. Dim and outer, they let more of it out than the rest: left out at a ten-thousandth, the table read a bonfire's
+// lowest slice 5 to 10% low in every direction.)
 const ESCAPE_DIRS = ${ESCAPE_NDIRS}u;
 const ESCAPE_PHASES = ${ESCAPE_PHASES}u;
 const ESCAPE_NRINGS = ${ESCAPE_RINGS.length}u;
@@ -2582,10 +2589,14 @@ fn writeTable(base: u32, phase: u32, lo: vec4<f32>, hi: vec4<f32>, marched: f32)
   }
   let w = array<f32, ${ESCAPE_RINGS.length + 2}>(${ESCAPE_WEIGHTS.map(wf).join(', ')});
   var mean = w[0] * result[base + ${ESCAPE_POLES}u].y + w[${ESCAPE_RINGS.length + 1}] * result[base + ${ESCAPE_POLES}u].x;
-  let wa = vec4<f32>(${AZ_SHARES.map(wf).join(', ')});
+  var wa = array<f32, ${ESCAPE_AZ / 4}>(${AZ_SHARES.map(wf).join(', ')});
   for (var r = 0u; r < ${ESCAPE_RINGS.length}u; r++) {
-    let q = result[base + 4u * r] + result[base + 4u * r + 1u] + result[base + 4u * r + 2u] + result[base + 4u * r + 3u];
-    mean += w[r + 1u] * dot(q, wa);
+    var ring = 0.0;
+    for (var a = 0u; a < ${ESCAPE_AZ}u; a++) {
+      let k = ${ESCAPE_AZ}u * r + a;
+      ring += wa[a % ${ESCAPE_AZ / 4}u] * result[base + k / 4u][k % 4u];
+    }
+    mean += w[r + 1u] * ring;
   }
   result[base + ${ESCAPE_POLES}u].z = mean;
 }

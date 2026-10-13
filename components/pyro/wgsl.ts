@@ -2783,7 +2783,7 @@ fn ballFire(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: BallMat
     let lout = lum / r2 * bandOut(b, ph);
     seen += lout;
     if (c > 0.0) {
-      let e = lout * smoothstep(0.05, 0.15, dist) * refShadow(ph, l, dist, P.grid.x, sqrt(bed2) / max(dist, 1e-4), skip);
+      let e = lout * smoothstep(0.05, 0.15, dist) * refShadowBand(ph, l, dist, b, skip);
       far += e * c;
       if (m.specW > 0.0) { spec += e * ggxSpec(n, v, l, m.rough, m.f0); }
       if (m.fuzzW > 0.0) { fuzz += e * fuzzLobe(F, v, l, m.fuzzRough); }
@@ -3231,37 +3231,51 @@ fn refMat(what: i32) -> BallMat {
   return BallMat(base, 1.0, rough, 0.04, 0.0, vec3<f32>(0.0), 0.5);
 }
 // How much of a light at distance dist along l reaches p past the set (its balls, their stands and the chart; all but
-// the piece skip, the one p is on), soft over a penumbra that widens with the distance behind each, pen0 + penK x (as
-// for the collision ball): the light's own radius as seen across the piece. A piece smaller than that hides only its
-// share of the light: a ball of radius a, (a / pen)^2 of it; a stand, a strip across it, about 4 a / (pi pen); the chart
-// as a disc of its area. (Ramped to black whatever its size, the set's shadows of the fire on the floor came out two to
-// three times too dark against the path-traced reference: a stand 1.6 cm across, in front of a flame a metre wide.)
-fn sphereVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK: f32) -> f32 {
+// the piece skip, the one p is on), soft over a penumbra that widens with the distance behind each piece (as for the
+// collision ball): the light as seen across the piece, an ellipse with semi-axes pen0 + kA t and pen0 + kB t along the
+// unit vectors uA and uB across the way, t along it. A piece smaller than that hides only its share of the light: a
+// ball of radius a, a^2 / (A B) of it, fading out as the two part (discVis, in the ellipse's frame stretched to a
+// circle of its area); a stand, a strip of the ellipse along the stand, 4 a rho / (pi A B) where rho is the ellipse's
+// radius along it, fading out over its half-width across; the chart as a disc of its area. (Ramped to black whatever
+// its size, the set's shadows of the fire on the floor came out two to three times too dark against the path-traced
+// reference: a stand 1.6 cm across, in front of a flame a metre wide.)
+fn sphereVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, uA: vec3<f32>, kA: f32, uB: vec3<f32>, kB: f32) -> f32 {
   let tb = s.xyz - p;
   let along = dot(tb, l);
   if (along <= 0.0 || along >= dist) { return 1.0; }
-  return discVis(s.w, pen0 + penK * along, length(tb - l * along));
+  let A = pen0 + kA * along;
+  let B = pen0 + kB * along;
+  let pe = sqrt(A * B);
+  let m = tb - l * along;
+  return discVis(s.w, pe, length(vec2<f32>(dot(m, uA) * pe / A, dot(m, uB) * pe / B)));
 }
 // A stand: where the way to the light passes its upright line (seen from above), how far from it, if at a height the
 // stand reaches.
-fn standVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, penK: f32) -> f32 {
+fn standVis(p: vec3<f32>, l: vec3<f32>, dist: f32, s: vec4<f32>, pen0: f32, uA: vec3<f32>, kA: f32, uB: vec3<f32>, kB: f32) -> f32 {
   let a = dot(l.xz, l.xz);
   if (a < 1e-6) { return 1.0; }
   let t = dot(s.xz - p.xz, l.xz) / a;
   let y = p.y + l.y * t;
   if (t <= 0.0 || t >= dist || y < 0.0 || y > s.y - s.w) { return 1.0; }
-  let pen = pen0 + penK * t;
+  let A = pen0 + kA * t;
+  let B = pen0 + kB * t;
+  let along = normalize(vec3<f32>(0.0, 1.0, 0.0) - l * l.y);
+  let across = vec3<f32>(l.z, 0.0, -l.x) / sqrt(a);
+  let ra = dot(along, uA) / A;
+  let rb = dot(along, uB) / B;
+  let rho = inverseSqrt(ra * ra + rb * rb);
+  let wide = length(vec2<f32>(dot(across, uA) * A, dot(across, uB) * B));
   let r = P.refChartO.w;
-  let cover = min(4.0 * r / (3.14159265 * max(pen, 1e-6)), 1.0);
-  return 1.0 - cover * (1.0 - smoothstep(max(r - pen, 0.0), r + pen, length(p.xz + l.xz * t - s.xz)));
+  let cover = min(4.0 * r * rho / (3.14159265 * A * B), 1.0);
+  return 1.0 - cover * (1.0 - smoothstep(max(r - wide, 0.0), r + wide, length(p.xz + l.xz * t - s.xz)));
 }
-fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32, skip: i32) -> f32 {
+fn refShadowE(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, uA: vec3<f32>, kA: f32, uB: vec3<f32>, kB: f32, skip: i32) -> f32 {
   if (!refOn()) { return 1.0; }
   var vis = 1.0;
-  if (skip != 0) { vis *= sphereVis(p, l, dist, P.refGrey, pen0, penK); }
-  if (skip != 1) { vis *= sphereVis(p, l, dist, P.refChrome, pen0, penK); }
-  if (skip != 2) { vis *= standVis(p, l, dist, P.refGrey, pen0, penK); }
-  if (skip != 3) { vis *= standVis(p, l, dist, P.refChrome, pen0, penK); }
+  if (skip != 0) { vis *= sphereVis(p, l, dist, P.refGrey, pen0, uA, kA, uB, kB); }
+  if (skip != 1) { vis *= sphereVis(p, l, dist, P.refChrome, pen0, uA, kA, uB, kB); }
+  if (skip != 2) { vis *= standVis(p, l, dist, P.refGrey, pen0, uA, kA, uB, kB); }
+  if (skip != 3) { vis *= standVis(p, l, dist, P.refChrome, pen0, uA, kA, uB, kB); }
   if (skip == 4) { return vis; }
   // The chart: where the way to the light crosses it, how far inside its edges, against the penumbra there.
   let U = P.refChartU.xyz;
@@ -3277,14 +3291,74 @@ fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32, skip: 
       let a = dot(q, U) / lu;
       let b = dot(q, V) / lv;
       let inside = min(min(a, lu - a), min(b, lv - b));
-      let pen = pen0 + penK * t;
-      // (Its edges for a sharp shadow; for a soft one, a disc of its area, about its centre.)
+      let A = pen0 + kA * t;
+      let B = pen0 + kB * t;
+      let pe = sqrt(A * B);
+      // (Its edges for a sharp shadow; for a soft one, a disc of its area, about its centre, in the ellipse's frame.)
       let aeq = sqrt(lu * lv * 0.31830989);
-      let soft = discVis(aeq, pen, length(vec2<f32>(a - 0.5 * lu, b - 0.5 * lv)));
-      vis *= mix(smoothstep(-pen, pen, -inside), soft, smoothstep(0.5 * aeq, 2.0 * aeq, pen));
+      let m = (U * (0.5 - a / lu) + V * (0.5 - b / lv));
+      let mp = m - l * dot(m, l);
+      let soft = discVis(aeq, pe, length(vec2<f32>(dot(mp, uA) * pe / A, dot(mp, uB) * pe / B)));
+      vis *= mix(smoothstep(-pe, pe, -inside), soft, smoothstep(0.5 * aeq, 2.0 * aeq, pe));
     }
   }
   return vis;
+}
+// A round light, its radius pen0 + penK t across a piece at t.
+fn refShadow(p: vec3<f32>, l: vec3<f32>, dist: f32, pen0: f32, penK: f32, skip: i32) -> f32 {
+  var u = vec3<f32>(l.z, 0.0, -l.x);
+  u = select(vec3<f32>(1.0, 0.0, 0.0), normalize(u), dot(u, u) > 1e-8);
+  return refShadowE(p, l, dist, pen0, u, penK, cross(l, u), penK, skip);
+}
+// The set's bounding sphere (its stands reach the floor).
+fn refBound() -> vec4<f32> {
+  let g = P.refGrey;
+  let k = P.refChrome;
+  let o = P.refChartO.xyz;
+  let u = P.refChartU.xyz;
+  let v = P.refChartV.xyz;
+  var lo = min(min(g.xyz - g.w, k.xyz - k.w), min(min(o, o + u), min(o + v, o + u + v)));
+  let hi = max(max(g.xyz + g.w, k.xyz + k.w), max(max(o, o + u), max(o + v, o + u + v)));
+  lo.y = 0.0;
+  return vec4<f32>(0.5 * (lo + hi), 0.5 * length(hi - lo));
+}
+// Slice b of the fire's light, dist along l from p, past the set: the slice as its light is spread (FIRE_SUM: its
+// variance in x, y and z and its xz covariance, its height no more than keeps it above the floor, as bandSpread takes
+// it), seen across the way to it, as the ellipse of a uniform disc of the same spread, twice the standard deviation
+// along each axis. (Taken as round and as wide as the bed whatever the slice, the set's shadows of the fire came out
+// far wider and shallower than every glowing cell's own way past it: on the floor in front of the set and to its right
+// it hid 2.4% of the fire's light where the cells lose 0.8%, and on the cyc's wall beyond 0.7% where they lose 0.1%, up
+// to 9% at the wall's far right. As the slices' own spread, 1.1% and 0.1%; behind the set, where the balls cut the
+// middle flames' light in narrow streaks, the error over the floor falls by a third.)
+fn refShadowBand(p: vec3<f32>, l: vec3<f32>, dist: f32, b: u32, skip: i32) -> f32 {
+  if (!refOn()) { return 1.0; }
+  let c = fireLight[4u + 2u * b].xyz;
+  let m = fireLight[SPREAD_BASE + b];
+  let hy = min(sqrt(max(m.y, 0.0) * 3.0), max(c.y - 0.5 * P.grid.x, 0.0));
+  let vy = hy * hy / 3.0;
+  // (Most ways to a slice pass nowhere near the set: none of it within the widest penumbra the slice could cast.)
+  let bs = refBound();
+  let tc = clamp(dot(bs.xyz - p, l), 0.0, dist);
+  let k0 = 2.0 * sqrt(max(m.x + vy + m.z, 0.0)) / max(dist, 1e-4);
+  if (length(bs.xyz - p - l * tc) > bs.w + P.grid.x + k0 * (tc + bs.w)) { return 1.0; }
+  var u = vec3<f32>(l.z, 0.0, -l.x);
+  u = select(vec3<f32>(1.0, 0.0, 0.0), normalize(u), dot(u, u) > 1e-8);
+  let v = cross(l, u);
+  let su = vec3<f32>(m.x * u.x + m.w * u.z, vy * u.y, m.w * u.x + m.z * u.z);
+  let sv = vec3<f32>(m.x * v.x + m.w * v.z, vy * v.y, m.w * v.x + m.z * v.z);
+  let cuu = max(dot(u, su), 0.0);
+  let cvv = max(dot(v, sv), 0.0);
+  let cuv = dot(u, sv);
+  let mid = 0.5 * (cuu + cvv);
+  let dev = sqrt(0.25 * (cuu - cvv) * (cuu - cvv) + cuv * cuv);
+  let e1 = vec2<f32>(mid + dev - cvv, cuv);
+  let e2 = vec2<f32>(cuv, mid + dev - cuu);
+  var ev = select(e2, e1, dot(e1, e1) >= dot(e2, e2));
+  ev = select(vec2<f32>(1.0, 0.0), normalize(ev), dot(ev, ev) > 1e-20);
+  let uA = ev.x * u + ev.y * v;
+  let uB = ev.x * v - ev.y * u;
+  let k = 2.0 / max(dist, 1e-4);
+  return refShadowE(p, l, dist, P.grid.x, uA, sqrt(max(mid + dev, 0.0)) * k, uB, sqrt(max(mid - dev, 0.0)) * k, skip);
 }
 
 // A surface's light toward v (cd/m2), with OpenPBR's layering (BallMat): lit by the sun and the rig's rim through the
@@ -3377,7 +3451,7 @@ fn fireOnSurface(pf: vec3<f32>, nf: vec3<f32>) -> f32 {
     if (lum <= 0.0) { continue; }
     let d = fireLight[4u + 2u * b].xyz - pf;
     let dl = length(d);
-    fireLux += lum * bandOutFloor(b, pf, nf) * bandSpread(b, pf, nf) * refShadow(pf, d / max(dl, 1e-4), dl, P.grid.x, max(P.src.w, 0.1) / max(dl, 1e-4), -1);
+    fireLux += lum * bandOutFloor(b, pf, nf) * bandSpread(b, pf, nf) * refShadowBand(pf, d / max(dl, 1e-4), dl, b, -1);
     let dq = fireLight[4u + 2u * b].xyz - q;
     seen += lum * bandOut(b, q) / (dot(dq, dq) + BAND_R2);
   }

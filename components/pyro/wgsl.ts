@@ -100,10 +100,15 @@ fn bandOut(b: u32, p: vec3<f32>) -> f32 {
 // The same for a point p of the floor or the cyc facing n. The floor sees each glowing cell by Lambert's cosine, its
 // height over the distance cubed, so whatever the distance the slice's upper cells weigh more in the light it takes
 // than in the slice's own; and above the bed's soot, they let out more of it. So the floor reads the escape by height
-// (ESCAPE_BASE3), the sweep and the wall the more of it the more they face up; the scattered light, the same by the
-// ratio of the two. (Weighted by the cells' light alone, the escape toward a campfire's floor a metre or more off on
-// the side its flames lean to was 12% under the floor's own for its lowest slice, and 4% for the next, against every
-// glowing cell's light marched through the soot to each point.)
+// (ESCAPE_BASE3); the scattered light, the same by the ratio of the two. (Weighted by the cells' light alone, the escape
+// toward a campfire's floor a metre or more off on the side its flames lean to was 12% under the floor's own for its
+// lowest slice, and 4% for the next, against every glowing cell's light marched through the soot to each point.) Any
+// surface weighs a cell by its distance in front of it along n, the slice's centre's (off) and the cell's height over
+// the centre's times n.y (the cells' spread across n besides their height taken as even about the centre), so its
+// escape is e0 + n.y y (eh - e0) / off, y the centre's height: the floor's by height, the wall's the slice's own, the
+// cyc's sweep between by its own cosine. (Read toward the height table the more the more it faces up instead, the
+// sweep took up to a fifth too much of a bonfire's light half way up it, where its cosine weighs the cells mostly by
+// how far in front of it they stand.)
 fn bandOutFloor(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
   let d = p - ${sums}[4u + 2u * b].xyz;
   let dist = max(length(d), 1e-6);
@@ -115,7 +120,8 @@ fn bandOutFloor(b: u32, p: vec3<f32>, n: vec3<f32>) -> f32 {
   let scat = albedo * (1.0 - mean) / (1.0 - albedo * (1.0 - meanS));
   let e0 = bandEscape(base, d / dist);
   let eh = bandEscape(ESCAPE_BASE3 + ESCAPE_STRIDE * b, d / dist);
-  let r = mix(1.0, clamp(eh / max(e0, 1e-6), 0.5, 2.0), clamp(n.y, 0.0, 1.0));
+  let off = -dot(d, n);
+  let r = select(1.0, clamp(1.0 + n.y * max(${sums}[4u + 2u * b].y, 0.0) * (eh / max(e0, 1e-6) - 1.0) / off, 0.5, 2.0), off > 1e-3);
   let e = clamp((e0 + scat * bandEscape(base2, d / dist)) * r, 1e-6, 1.0);
   let rad = max(P.src.w, 0.1);
   return select(e, pow(e, dist / rad), dist < rad);

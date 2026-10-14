@@ -2183,7 +2183,7 @@ struct RParams {
   sh: array<vec4<f32>, 9>, // its light but the key, as spherical harmonics (rgb, cd/m2 x sr), the floor below
   rimDir: vec4<f32>,   // the softbox rig's rim: toward it, on (0 or 1)
   rimCol: vec4<f32>,   // its illuminance (lux) by colour
-  camera: vec4<f32>,   // the shutter's open time (s, 0 for none); the glare's share of the light
+  camera: vec4<f32>,   // the shutter's open time (s, 0 for none); the glare's share of the light; (w) paused, 0 or 1
 }
 @group(0) @binding(1) var<uniform> R: RParams;
 
@@ -4165,17 +4165,20 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           T *= tf;
         }
       }
-      // Motion blur: the ray's moment within the shutter, one for all its samples (a different one each pixel and
-      // frame, which the accumulation averages), and the gas that was here then, carried back along the flow. A sheet
-      // of soot that moves across the ray covers it for part of the shutter; with a moment for each sample, as this
-      // took them, it dimmed the light behind it at every sample instead, and the moving flames came out a tenth to two
-      // fifths off the path-traced reference's (a moment a path) where they move most. (The velocity in one lookup:
-      // each component lives on its own faces, a quarter cell either way of where this reads it, near enough for a
-      // blur.)
+      // Motion blur: the gas that was here at a moment within the shutter, carried back along the flow. Paused, the
+      // ray's moment, one for all its samples (a different one each pixel and frame, which the accumulation averages):
+      // a sheet of soot that moves across the ray covers it for part of the shutter, as the path-traced reference's
+      // paths (a moment each) find it; with a moment for each sample it dimmed the light behind it at every sample
+      // instead, and the moving flames came out a tenth to two fifths off the reference's where they move most. While
+      // the fire runs, each sample's own moment, stratified along the ray: one moment a ray shifts all the flames the
+      // ray sees at once, a grain clumped a few pixels across that the running accumulation, its history giving way
+      // to the moving flames, kept as speckle all over them (twice the grain of a moment a sample, on the bonfire as
+      // the lab opens; accumulated, the two differ by 2% on average). (The velocity in one lookup: each component
+      // lives on its own faces, a quarter cell either way of where this reads it, near enough for a blur.)
       var wm = w;
       if (R.camera.x > 0.0) {
         let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
-        wm = w - u * shutterTau;
+        wm = w - u * select((fract(jitter + f32(i) * 0.618034) - 0.5) * R.camera.x, shutterTau, R.camera.w > 0.5);
       }
       let uvm = uvwOf(wm);
       let s4 = scalSmooth(uvm);

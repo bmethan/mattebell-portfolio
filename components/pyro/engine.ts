@@ -1934,9 +1934,9 @@ export class PyroEngine {
     r.set([stage, fire ? SOOT_CHROMA[1] : 1, viewIndex(s.view), this.lutReady ? 1 : 0], 56)
     r.set(envData, 60)
     r.set(rim, 100)
-    // The camera: a film camera's shutter at 24 frames a second (180 degrees is open 1/48 s), and the glare's share and
-    // levels.
-    r.set([(s.shutter / 360) / 24, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, 0], 108)
+    // The camera: a film camera's shutter at 24 frames a second (180 degrees is open 1/48 s), the glare's share and
+    // levels, and whether the frame is paused (the motion blur's moments: one a ray paused, one a sample running).
+    r.set([(s.shutter / 360) / 24, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, this.paused ? 1 : 0], 108)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
     // The reference set is the simulation's (a solid in it), but turned on or off it shows at once, paused or not.
     this.device.queue.writeBuffer(this.simBuf, 256, new Float32Array(this.referenceSet(s)))

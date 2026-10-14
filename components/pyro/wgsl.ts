@@ -3875,17 +3875,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 `
 
 // 9e. The fire's light about the flames (FLAME_NEAR), at each point of the light lattice within reach of the flames
-// (each slice's light-weighted centre, three standard deviations of its spread and a bed's radius out; elsewhere
-// nothing is marched: 0.3 ms a frame). The glowing gas's light within a bed's radius, 16 ways spread evenly over the
-// sphere, a cell and a half a step, from each cell's glow and extinction as the fire sums drew them (eight points a
-// cell, its subgrid temperature among them: one read a step), dimmed on the way by absorption alone (in a thick flame
-// of even temperature that tends to its blackbody radiance, as Kirchhoff's law has it, scattering and all); and the
-// rest of the fire's light, the slices' as point lights (with their escape, and the smoke's shadow as the light volume
-// has it), each less the share of its light within the bed's radius of the point (already marched: the share of a
-// Gaussian of the slice's spread within that ball), through the near soot the way it comes. With them, the light's
-// first moment, for the phase (flameSelfLit). (Counting the slices' whole light again on top of the near light lit the
-// low flames at the bonfire's bed a third to two thirds too bright; marched along the axes and the cube's diagonals,
-// four ways lay in the bed's thin hot sheet, and its edges came out two fifths too bright.)
+// (each slice's light-weighted centre, three standard deviations of its spread and a bed's radius out) where the image
+// will read it (a cell glows within three of the point's own two: the image takes this light in glowing gas alone, from
+// the lattice's eight points about it); elsewhere nothing is marched (about 1 ms a frame for the bonfire). The glowing
+// gas's light within a bed's radius, 64 ways spread evenly over the sphere, a cell and a half a step, from each cell's
+// glow and extinction as the fire sums drew them (eight points a cell, its subgrid temperature among them: one read a
+// step), dimmed on the way by absorption alone (in a thick flame of even temperature that tends to its blackbody
+// radiance, as Kirchhoff's law has it, scattering and all); and the rest of the fire's light, the slices' as point
+// lights (with their escape, and the smoke's shadow as the light volume has it), each less the share of its light
+// within the bed's radius of the point (already marched: the share of a Gaussian of the slice's spread within that
+// ball), through the near soot the way it comes. With them, the light's first moment, for the phase (flameSelfLit).
+// (Counting the slices' whole light again on top of the near light lit the low flames at the bonfire's bed a third to
+// two thirds too bright; marched along the axes and the cube's diagonals, four ways lay in the bed's thin hot sheet,
+// and its edges came out two fifths too bright. Sixteen ways, each a sixteenth of the sphere, saw a thin bright layer
+// edgewise by one near-level way only: above the bed it caught the sheet's long grazing path or missed it, by the
+// height, and the flames just above came out two fifths too bright, which in a frame's sum hid the upper flames' tips
+// being too dark.)
 export const FLAME_NEAR = /* wgsl */ `
 ${RENDER_LIB}
 @group(0) @binding(40) var nearOut: texture_storage_3d<rgba16float, write>;
@@ -3902,7 +3907,7 @@ fn ballShare(d: f32, s: f32, l: f32) -> f32 {
   let b = (l + dd) / s;
   return clamp(normCdf(a) - normCdf(-b) - s / (dd * 2.5066283) * (exp(-0.5 * a * a) - exp(-0.5 * b * b)), 0.0, 1.0);
 }
-const NEAR_N = 16u;
+const NEAR_N = 64u;
 const NEAR_STEP = 1.5; // (cells)
 fn nearDir(k: u32) -> vec3<f32> {
   let mu = 1.0 - (f32(k) + 0.5) * 2.0 / f32(NEAR_N);
@@ -3929,6 +3934,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       if (all(abs(w - fireLight[4u + 2u * b].xyz) < 3.0 * sd + rad + P.grid.x)) { near = true; }
     }
   }
+  // (And only where the image will read it: some cell glows within three of the point's own two, the lattice being the
+  // grid's at half resolution.)
+  if (near) {
+    let nc = vec3<i32>(textureDimensions(emitTex));
+    let c0 = 2 * vec3<i32>(id) - 3;
+    var lit = false;
+    for (var z = 0; z < 7 && !lit; z++) {
+      for (var y = 0; y < 7 && !lit; y++) {
+        for (var x = 0; x < 7; x++) {
+          let c = c0 + vec3<i32>(x, y, z);
+          if (any(c < vec3<i32>(0)) || any(c >= nc)) { continue; }
+          let q = textureLoad(emitTex, c, 0);
+          if (max(q.x, max(q.y, q.z)) > 0.0) { lit = true; break; }
+        }
+      }
+    }
+    near = lit;
+  }
   if (near) {
     let ch = chroma() * (1.0 - R.skyCol.w);
     let ds = NEAR_STEP * P.grid.x;
@@ -3936,7 +3959,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let hi = domainHi();
     var l = vec3<f32>(0.0);
     var dip = vec3<f32>(0.0);
-    var tk = array<f32, 16>(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+    var tk: array<f32, NEAR_N>; // (each set as its way is marched)
     for (var k = 0u; k < NEAR_N; k++) {
       let d = nearDir(k);
       let reach = min(rad, max(boxHit(w, d, lo, hi).y, 0.0));

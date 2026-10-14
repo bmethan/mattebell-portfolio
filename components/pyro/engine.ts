@@ -390,6 +390,18 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
   const displayModule = d.createShaderModule({ code: DISPLAY })
   const glareModule = d.createShaderModule({ code: GLARE })
   const compositeModule = d.createShaderModule({ code: PT_COMPOSITE })
+  // The longest compiles are asked for first: the browser compiles a few at a time in the order asked, and the image
+  // pass's alone takes a third of all the compiling, so started last it set the wait (a second more on the bonfire).
+  const renderP = d.createRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: renderModule, entryPoint: 'vs' },
+    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
+    primitive: { topology: 'triangle-list' },
+  })
+  const flameNearP = compute(FLAME_NEAR)
+  const forcesP = compute(FORCES)
+  const floorNearP = compute(FLOOR_NEAR)
+  const lightP = compute(LIGHT)
   const glarePipe = (entryPoint: string, add: boolean) =>
     d.createRenderPipelineAsync({
       layout: 'auto',
@@ -417,7 +429,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(PROJECT_REFLECT),
     compute(VEL_COMBINE),
     compute(CURL),
-    compute(FORCES),
+    forcesP,
     compute(DIVERGENCE),
     compute(SOR),
     compute(PROJECT),
@@ -443,15 +455,10 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(LFM_PULL, { MODE: 2 }),
     compute(LFM_PULL, { MODE: 3 }),
     compute(DIFFUSE),
-    compute(LIGHT),
+    lightP,
     compute(UPRES),
     compute(UPRES_COARSE),
-    d.createRenderPipelineAsync({
-      layout: 'auto',
-      vertex: { module: renderModule, entryPoint: 'vs' },
-      fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
-      primitive: { topology: 'triangle-list' },
-    }),
+    renderP,
     d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: resolveModule, entryPoint: 'vs' },
@@ -475,8 +482,8 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     }),
     compute(CYC_DIRECT),
     compute(CYC_BOUNCE),
-    compute(FLAME_NEAR),
-    compute(FLOOR_NEAR),
+    flameNearP,
+    floorNearP,
   ])
   return { cycDirect, cycBounce, flameNear, floorNear, fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
 }

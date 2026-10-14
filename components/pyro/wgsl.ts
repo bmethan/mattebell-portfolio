@@ -1656,8 +1656,18 @@ fn tileNoise(q: vec3<f32>, period: i32, seed: u32) -> f32 {
   return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
 }
 
-fn fbm(q: vec3<f32>, seed: u32) -> f32 {
-  let v = 0.55 * tileNoise(q * 8.0, 8, seed) + 0.3 * tileNoise(q * 16.0, 16, seed) + 0.15 * tileNoise(q * 32.0, 32, seed);
+// Three octaves, the second and third at twice and four times the frequency, weighted 0.55, 0.3 and 0.15 (added in
+// that order). The loops run to bounds the compiler cannot know (three, always 3), so it keeps one noise in the code
+// rather than nine written out: unrolled, this small pass took some 1.7 s of the solver's start compiling.
+fn fbm(q: vec3<f32>, seed: u32, three: u32) -> f32 {
+  var v = 0.0;
+  var period = 8;
+  var w = 0.55;
+  for (var o = 0u; o < three; o++) {
+    v += w * tileNoise(q * f32(period), period, seed);
+    period *= 2;
+    w = select(0.15, 0.3, o == 0u);
+  }
   return clamp(0.5 + 1.7 * v, 0.0, 1.0);
 }
 
@@ -1666,8 +1676,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let n = textureDimensions(dst);
   if (any(id >= n)) { return; }
   let q = vec3<f32>(id) / vec3<f32>(n);
+  let three = 3u + min(n.x, 0u);
   // Three independent fbms, one per channel.
-  textureStore(dst, vec3<i32>(id), vec4<f32>(fbm(q, 0u), fbm(q, 1u), fbm(q, 2u), 1.0));
+  var c = vec4<f32>(1.0);
+  for (var k = 0u; k < three; k++) { c[k] = fbm(q, k, three); }
+  textureStore(dst, vec3<i32>(id), c);
 }
 `
 

@@ -2692,6 +2692,7 @@ ${bandSpreadWgsl('fireLight')}
 @group(0) @binding(43) var cycDirectMap: texture_2d<f32>; // the light straight onto each point of it (CYC_DIRECT), lux
 @group(0) @binding(44) var flameNear: texture_3d<f32>; // the fire's light about each point of the flames (FLAME_NEAR), k cd/m2
 @group(0) @binding(45) var flameNearDir: texture_3d<f32>; // its luminance's first moment and mean (FLAME_NEAR), k cd/m2
+@group(0) @binding(46) var floorNear: texture_2d<f32>; // the floor's light from the glowing gas within a bed's radius (FLOOR_NEAR), klux, and where it was marched (w)
 fn rimOn() -> bool { return R.rimDir.w > 0.5; }
 // The rim's shadow on a surface point outside the gas: the optical depth where the way to the rim enters the domain.
 fn rimShadow(p: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
@@ -3484,8 +3485,35 @@ fn cycBounceAt(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(cycBounce, samp, cycUv(p, n), 0.0).xyz;
 }
 
-// The fire's light on the floor or the cyc at pf facing nf (lux, of luminance; floorLight says how).
+// The standard normal's distribution function (a tanh fit, within 2e-4).
+fn normCdf(x: f32) -> f32 { return 0.5 * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x))); }
+// The share of an isotropic Gaussian (standard deviation s, its centre d away) within l of a point: the non-central chi
+// distribution's, three degrees of freedom.
+fn ballShare(d: f32, s: f32, l: f32) -> f32 {
+  let dd = max(d, 1e-3);
+  let a = (l - dd) / s;
+  let b = (l + dd) / s;
+  return clamp(normCdf(a) - normCdf(-b) - s / (dd * 2.5066283) * (exp(-0.5 * a * a) - exp(-0.5 * b * b)), 0.0, 1.0);
+}
+// Where the floor's own map of the fire's light close under the flames applies (FLOOR_NEAR): its texture coordinate
+// on the floor (facing up, within the domain's footprint), or -1.
+fn floorNearUv(pf: vec3<f32>, nf: vec3<f32>) -> vec2<f32> {
+  if (nf.y < 0.99 || pf.y > 0.5 * P.grid.x) { return vec2<f32>(-1.0); }
+  let uv = (pf.xz - P.origin.xz) / (vec2<f32>(f32(P.dims.x), f32(P.dims.z)) * P.grid.x);
+  return select(vec2<f32>(-1.0), uv, all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)));
+}
+// Its light there (lux, rgb): the glowing gas's within a bed's radius.
+fn floorNearLight(pf: vec3<f32>, nf: vec3<f32>) -> vec3<f32> {
+  let uv = floorNearUv(pf, nf);
+  if (uv.x < 0.0) { return vec3<f32>(0.0); }
+  return 1000.0 * textureSampleLevel(floorNear, samp, uv, 0.0).xyz;
+}
+// The fire's light on the floor or the cyc at pf facing nf (lux, of luminance; floorLight says how), less, where the
+// floor's map was marched, each slice's share within the bed's radius (that light being the map's).
 fn fireOnSurface(pf: vec3<f32>, nf: vec3<f32>) -> f32 {
+  let uvN = floorNearUv(pf, nf);
+  let nearW = select(0.0, textureSampleLevel(floorNear, samp, max(uvN, vec2<f32>(0.0)), 0.0).w, uvN.x >= 0.0);
+  let radN = max(P.src.w, 0.1);
   var fireLux = 0.0;
   var seen = 0.0;
   let cellVol = P.grid.x * P.grid.x * P.grid.x;
@@ -3502,7 +3530,8 @@ fn fireOnSurface(pf: vec3<f32>, nf: vec3<f32>) -> f32 {
     if (lum <= 0.0) { continue; }
     let d = fireLight[4u + 2u * b].xyz - pf;
     let dl = length(d);
-    fireLux += lum * bandOutFloor(b, pf, nf) * bandSpread(b, pf, nf) * refShadowBand(pf, d / max(dl, 1e-4), dl, b, -1);
+    let sdN = sqrt(max(dot(fireLight[SPREAD_BASE + b].xyz, vec3<f32>(1.0 / 3.0)), P.grid.x * P.grid.x));
+    fireLux += lum * bandOutFloor(b, pf, nf) * bandSpread(b, pf, nf) * refShadowBand(pf, d / max(dl, 1e-4), dl, b, -1) * (1.0 - nearW * ballShare(dl, sdN, radN));
     let dq = fireLight[4u + 2u * b].xyz - q;
     seen += lum * bandOut(b, q) / (dot(dq, dq) + BAND_R2);
   }
@@ -3548,7 +3577,7 @@ fn surfaceDirect(pf: vec3<f32>, nf: vec3<f32>, ch: vec3<f32>, fireColour: vec3<f
   // there is taken toward q itself, as the light volume takes it: for the bottom band, a few centimetres up, the floor
   // and the point a cell above it lie either side of level, where its light gets out fastest-changing, and the floor
   // lost a tenth.)
-  let fireE = fireColour * fireOnSurface(pf, nf);
+  let fireE = fireColour * fireOnSurface(pf, nf) + floorNearLight(pf, nf);
   // The sky on a surface facing nf: the flat sky's open half (all of it on the floor; on the cyc, its open quarter, the
   // rest being the cyc), or the environment.
   var skyShare = 0.5 + 0.5 * nf.y;
@@ -3897,16 +3926,6 @@ ${RENDER_LIB}
 @group(0) @binding(41) var emitTex: texture_3d<f32>;
 @group(0) @binding(42) var nearDirOut: texture_storage_3d<rgba16float, write>;
 
-// The standard normal's distribution function (a tanh fit, within 2e-4).
-fn normCdf(x: f32) -> f32 { return 0.5 * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x))); }
-// The share of an isotropic Gaussian (standard deviation s, its centre d away) within l of a point: the non-central chi
-// distribution's, three degrees of freedom.
-fn ballShare(d: f32, s: f32, l: f32) -> f32 {
-  let dd = max(d, 1e-3);
-  let a = (l - dd) / s;
-  let b = (l + dd) / s;
-  return clamp(normCdf(a) - normCdf(-b) - s / (dd * 2.5066283) * (exp(-0.5 * a * a) - exp(-0.5 * b * b)), 0.0, 1.0);
-}
 const NEAR_N = 64u;
 const NEAR_STEP = 1.5; // (cells)
 fn nearDir(k: u32) -> vec3<f32> {
@@ -4006,6 +4025,62 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   textureStore(nearOut, vec3<i32>(id), out);
   textureStore(nearDirOut, vec3<i32>(id), mom);
+}
+`
+
+// 9f. The fire's light on the floor close under the flames (FLOOR_NEAR), at the grid's resolution, wherever the floor
+// is within reach of the flames (as for FLAME_NEAR): the glowing gas within a bed's radius, 32 ways weighted by
+// Lambert's cosine, a cell a step, dimmed by absorption alone, as FLAME_NEAR's (in for the light the soot scatters
+// onto it too); fireOnSurface takes each slice's light from beyond that radius on top. (With the slices alone, as
+// point lights spread as their flames are, the floor right under a campfire's bed, where the glowing gas a few
+// centimetres up fills most of its sky, took a quarter to a third of the light marched through the gas to it, and
+// half the reference's floor light over the frame: the flames' own glow, seen through to the floor, looked 2% dim.
+// 0.1 to 0.3 ms a frame.)
+export const FLOOR_NEAR = /* wgsl */ `
+${RENDER_LIB}
+@group(0) @binding(41) var emitTex: texture_3d<f32>;
+@group(0) @binding(47) var floorOut: texture_storage_2d<rgba16float, write>;
+const FLOOR_N = 32u;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= u32(P.dims.x) || id.y >= u32(P.dims.z)) { return; }
+  let lo = P.origin.xyz;
+  let hi = domainHi();
+  let pf = vec3<f32>(lo.x + (f32(id.x) + 0.5) * P.grid.x, 1e-3, lo.z + (f32(id.y) + 0.5) * P.grid.x);
+  let rad = max(P.src.w, 0.1);
+  var near = false;
+  if (R.fire.x > 0.5) {
+    for (var b = 0u; b < FIRE_BANDS; b++) {
+      if (fireLight[3u + 2u * b].w <= 0.0) { continue; }
+      let sd = sqrt(max(fireLight[SPREAD_BASE + b].xyz, vec3<f32>(0.0)));
+      if (all(abs(pf - fireLight[4u + 2u * b].xyz) < 3.0 * sd + rad + P.grid.x)) { near = true; }
+    }
+  }
+  var fl = vec4<f32>(0.0);
+  if (near) {
+    let ds = P.grid.x;
+    let ch = chroma() * (1.0 - R.skyCol.w);
+    var e = vec3<f32>(0.0);
+    for (var k = 0u; k < FLOOR_N; k++) {
+      let u = (f32(k) + 0.5) / f32(FLOOR_N);
+      let sn = sqrt(u);
+      let phi = 2.39996323 * f32(k);
+      let d = vec3<f32>(sn * cos(phi), sqrt(1.0 - u), sn * sin(phi));
+      let reach = min(rad, max(boxHit(pf, d, lo, hi).y, 0.0));
+      var tr = vec3<f32>(1.0);
+      for (var i = 0; i < 128; i++) {
+        let t = (f32(i) + 0.5) * ds;
+        if (t > reach) { break; }
+        let q = textureSampleLevel(emitTex, samp, uvwOf(pf + d * t), 0.0);
+        let a = exp(-q.w * ch * ds);
+        e += tr * q.xyz * ds * select((vec3<f32>(1.0) - a) / max(-log(a), vec3<f32>(1e-6)), vec3<f32>(1.0), a > vec3<f32>(0.9999));
+        tr *= a;
+      }
+    }
+    fl = vec4<f32>(e * 3.14159265 / f32(FLOOR_N), 1.0);
+  }
+  textureStore(floorOut, vec2<i32>(id.xy), fl);
 }
 `
 

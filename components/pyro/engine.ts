@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -236,6 +236,7 @@ interface Pipes {
   cycDirect: GPUComputePipeline
   cycBounce: GPUComputePipeline
   flameNear: GPUComputePipeline
+  floorNear: GPUComputePipeline
   render: GPURenderPipeline
   resolve: GPURenderPipeline
   display: GPURenderPipeline
@@ -321,6 +322,7 @@ interface Grids {
   emit: GPUTexture // each cell's glow and flame light per metre (FIRE_SUM, for FLAME_NEAR)
   flameNear: GPUTexture // the fire's light about each point of the flames (FLAME_NEAR)
   flameNearDir: GPUTexture // its first moment (FLAME_NEAR)
+  floorNear: GPUTexture // the floor's light from the glowing gas within a bed's radius (FLOOR_NEAR)
   nearDims: Vec3
   bg: {
     advectVel: GPUBindGroup // semi-Lagrangian, straight to the advected texture
@@ -356,6 +358,7 @@ interface Grids {
     cycDirect: GPUBindGroup
     cycBounce: [GPUBindGroup, GPUBindGroup] // (the first to the second, then back)
     flameNear: GPUBindGroup
+    floorNear: GPUBindGroup
     render: GPUBindGroup
   }
 }
@@ -398,7 +401,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       },
       primitive: { topology: 'triangle-list' },
     })
-  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite, cycDirect, cycBounce, flameNear] = await Promise.all([
+  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite, cycDirect, cycBounce, flameNear, floorNear] = await Promise.all([
     compute(FIRE_SUM),
     compute(FIRE_SUM_TOTAL),
     compute(NOISE_GEN),
@@ -473,8 +476,9 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
     compute(CYC_DIRECT),
     compute(CYC_BOUNCE),
     compute(FLAME_NEAR),
+    compute(FLOOR_NEAR),
   ])
-  return { cycDirect, cycBounce, flameNear, fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
+  return { cycDirect, cycBounce, flameNear, floorNear, fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
 }
 
 export function prewarmPyro() {
@@ -856,6 +860,7 @@ export class PyroEngine {
     const nearDims: Vec3 = lightDims
     const flameNear = tex(nearDims)
     const flameNearDir = tex(nearDims)
+    const floorNear = d.createTexture({ size: [n[0], n[2]], format: 'rgba16float', usage: T.TEXTURE_BINDING | T.STORAGE_BINDING })
     const v = (t: GPUTexture) => t.createView()
     const group = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[]) =>
       d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: resources.map((resource, binding) => ({ binding, resource })) })
@@ -1046,7 +1051,7 @@ export class PyroEngine {
     const s = this.sampler
     this.grids = {
       n,
-      textures: [...vel, ...scal, ...detA, ...detB, curl, light, cycDirect, ...cycBounce, emit, flameNear, flameNearDir, flame, nut, vortA, vortB, vortC, psiCurl, ...ring, ...ringC, ...u0, delta, lm, le],
+      textures: [...vel, ...scal, ...detA, ...detB, curl, light, cycDirect, ...cycBounce, emit, flameNear, flameNearDir, floorNear, flame, nut, vortA, vortB, vortC, psiCurl, ...ring, ...ringC, ...u0, delta, lm, le],
       buffers,
       levels,
       vel,
@@ -1072,6 +1077,7 @@ export class PyroEngine {
       emit,
       flameNear,
       flameNearDir,
+      floorNear,
       nearDims,
       bg: {
         advectVel: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[3])]),
@@ -1139,6 +1145,15 @@ export class PyroEngine {
             { binding: 42, resource: v(flameNearDir) },
           ],
         }),
+        floorNear: d.createBindGroup({
+          layout: p.floorNear.getBindGroupLayout(0),
+          entries: [
+            ...[P, R, s].map((resource, binding) => ({ binding, resource })),
+            { binding: 10, resource: { buffer: fireLight } },
+            { binding: 41, resource: v(emit) },
+            { binding: 47, resource: v(floorNear) },
+          ],
+        }),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
         light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2), this.dummy3d.createView()]),
         cycDirect: d.createBindGroup({
@@ -1149,6 +1164,7 @@ export class PyroEngine {
             { binding: 10, resource: { buffer: fireLight } },
             { binding: 34, resource: v(light2) },
             { binding: 40, resource: v(cycDirect) },
+            { binding: 46, resource: v(floorNear) },
           ],
         }),
         cycBounce: [0, 1].map(k =>
@@ -1162,7 +1178,7 @@ export class PyroEngine {
             ],
           }),
         ) as [GPUBindGroup, GPUBindGroup],
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }, { binding: 43, resource: v(cycDirect) }, { binding: 44, resource: v(flameNear) }, { binding: 45, resource: v(flameNearDir) }]),
+        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }, { binding: 43, resource: v(cycDirect) }, { binding: 44, resource: v(flameNear) }, { binding: 45, resource: v(flameNearDir) }, { binding: 46, resource: v(floorNear) }]),
       },
     }
     this.resetSkin()
@@ -2126,6 +2142,7 @@ export class PyroEngine {
           { binding: 43, resource: v(g.cycDirect) },
           { binding: 44, resource: v(g.flameNear) },
           { binding: 45, resource: v(g.flameNearDir) },
+          { binding: 46, resource: v(g.floorNear) },
         ],
       })
       // (The light volume shadows the same smoke, averaged over each coarse cell.)
@@ -2201,6 +2218,9 @@ export class PyroEngine {
       pass.setPipeline(p.flameNear)
       pass.setBindGroup(0, g.bg.flameNear)
       pass.dispatchWorkgroups(Math.ceil(g.nearDims[0] / 4), Math.ceil(g.nearDims[1] / 4), Math.ceil(g.nearDims[2] / 4))
+      pass.setPipeline(p.floorNear)
+      pass.setBindGroup(0, g.bg.floorNear)
+      pass.dispatchWorkgroups(Math.ceil(g.n[0] / 8), Math.ceil(g.n[2] / 8))
       if (this.state.background === 'gray' || this.state.background === 'charcoal') {
         const cg: [number, number] = [Math.ceil(CYC_MAP.w / 8), Math.ceil(CYC_MAP.h / 8)]
         pass.setPipeline(p.cycDirect)
@@ -2759,6 +2779,7 @@ export class PyroEngine {
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
     timed('light', one(p.light, this.upresActive() && this.upres ? this.upres.light : g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
     timed('flameNear', one(p.flameNear, g.bg.flameNear, [Math.ceil(g.nearDims[0] / 4), Math.ceil(g.nearDims[1] / 4), Math.ceil(g.nearDims[2] / 4)]))
+    timed('floorNear', one(p.floorNear, g.bg.floorNear, [Math.ceil(g.n[0] / 8), Math.ceil(g.n[2] / 8), 1]))
     timed('cyc', pass => {
       const cg: [number, number, number] = [Math.ceil(CYC_MAP.w / 8), Math.ceil(CYC_MAP.h / 8), 1]
       one(p.cycDirect, g.bg.cycDirect, cg)(pass)

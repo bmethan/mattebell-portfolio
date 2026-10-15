@@ -51,7 +51,6 @@ try {
         let flamedAt = null
         let at644 = null
         let reached36 = null
-        const T0 = 293
         // Wood seconds per step of the gas.
         const perStep = speed / 30
         const readEvery = Math.max(1, Math.round(10 / perStep))

@@ -241,6 +241,20 @@ struct Params {
 // The solids: the collision ball, a sphere, and the on-set reference when it stands. A cell (or a face) is solid when
 // its centre is inside one. The ball's faces move with it; the set's stand still.
 fn inBall(w: vec3<f32>) -> bool { return P.ball.w > 0.0 && distance(w, P.ball.xyz) < P.ball.w; }
+// Where the gas at a point traced back from a cell came from, the collision ball being solid (g in cells). Traced back
+// into the ball, or to within a cell of its surface, the gas came in fact from just outside it: a cell out along the
+// radius, so that interpolating there touches no cell inside the ball. (The ball's cells hold no gas, zeros, the air;
+// sampled, they let cold clean air stream off the ball wherever the flow leaves its surface: over the top of a ball
+// held in a fire, a wake 700 C cooler than the flames there without it.)
+fn clearOfBall(g: vec3<f32>) -> vec3<f32> {
+  if (P.ball.w <= 0.0) { return g; }
+  let d = P.origin.xyz + g * P.grid.x - P.ball.xyz;
+  let l = length(d);
+  let reach = P.ball.w + P.grid.x;
+  if (l >= reach) { return g; }
+  let dir = select(vec3<f32>(0.0, 1.0, 0.0), d / l, l > 1e-6);
+  return (P.ball.xyz + dir * reach - P.origin.xyz) / P.grid.x;
+}
 ${setSolid('P')}
 fn solidAt(w: vec3<f32>) -> bool { return inBall(w) || inSet(w, P.grid.x); }
 fn cellSolid(c: vec3<i32>) -> bool { return solidAt(P.origin.xyz + (vec3<f32>(c) + 0.5) * P.grid.x); }
@@ -1601,7 +1615,7 @@ override DIR: f32 = 1.0;
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let c = vec3<i32>(id);
   if (any(c >= nCells())) { return; }
-  let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, DIR);
+  let g = clearOfBall(backtrace(vel, samp, vec3<f32>(id) + 0.5, DIR));
   var o = vec4<f32>(0.0);
   if (inDomain(g)) { o = scalAt(src, samp, g); }
   textureStore(dst, c, o);
@@ -1831,19 +1845,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (any(c >= n)) { return; }
   let i = cellIndex(c);
   var phi = vec4<f32>(0.0);
-  let x1 = xCurr[i];
-  if (x1.w > 0.5 && inDomain(x1.xyz)) {
-    let one = scalAt(phiCurr, samp, x1.xyz) + scalAt(dCurr, samp, x1.xyz);
+  let x1w = xCurr[i];
+  let x1 = clearOfBall(x1w.xyz);
+  if (x1w.w > 0.5 && inDomain(x1)) {
+    let one = scalAt(phiCurr, samp, x1) + scalAt(dCurr, samp, x1);
     phi = one;
     if (B.x > 0.5) {
-      let x2 = xPrevAt(x1.xyz);
-      if (x2.w > 0.99 && inDomain(x2.xyz)) {
-        phi = 0.5 * (scalAt(phiPrev, samp, x2.xyz) + scalAt(dPrev, samp, x2.xyz)) + 0.5 * scalAt(phiCurr, samp, x1.xyz) + scalAt(dCurr, samp, x1.xyz);
+      let x2w = xPrevAt(x1w.xyz);
+      let x2 = clearOfBall(x2w.xyz);
+      if (x2w.w > 0.99 && inDomain(x2)) {
+        phi = 0.5 * (scalAt(phiPrev, samp, x2) + scalAt(dPrev, samp, x2)) + 0.5 * scalAt(phiCurr, samp, x1) + scalAt(dCurr, samp, x1);
       }
     }
   }
   // Clamped to the values one step's backtrace would interpolate between.
-  let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0);
+  let g = clearOfBall(backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0));
   if (inDomain(g)) {
     let b = vec3<i32>(floor(clamp(g - 0.5, vec3<f32>(0.0), vec3<f32>(n - 1))));
     var lo = vec4<f32>(1e9);
@@ -2492,7 +2508,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let mac = P.stirR.w > 0.5;
   let fire = P.fire.x > 0.5;
   if (mac || fire) {
-    let g = backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0);
+    let g = clearOfBall(backtrace(vel, samp, vec3<f32>(id) + 0.5, 1.0));
     if (inDomain(g)) {
       let p = clamp(g - 0.5, vec3<f32>(0.0), nF() - 1.0);
       let b = vec3<i32>(floor(p));

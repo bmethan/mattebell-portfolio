@@ -2035,13 +2035,14 @@ ${CHAR_CRACKS}
 // The cells' wood, char, water and ash, layer by layer: x the share of its wood left, y its char, z the share of its
 // water left, w its ash (y and w in kg per kg of the cell's wood as made).
 @group(0) @binding(9) var<storage, read_write> cells: array<vec4<f32>>;
-// Each column's state, this step's and the next's (as the temperatures): the deepest layer heat has reached and the
-// surface's temperature (K); then the wood's density there against its mean, the share of the column under cracks, and
+// Each column's state, this step's and the next's (as the temperatures): the deepest layer heat has reached, the
+// surface's temperature (K) and how much of the surface below it is alight (for its flame's heat); then the wood's density there against its mean, the share of the column under cracks, and
 // 1 once it has been set up.
 @group(0) @binding(10) var<storage, read_write> cols: array<vec4<f32>>;
 const WOOD_LAYERS = ${WOOD_LAYERS}u;
 const WOOD_CELLS = ${WOOD_CELLS}u;
 const GRADED = 9u;
+const IMPLICIT = 16u; // the cells worked implicitly, from the surface
 const DEEP = 30u;
 const DZ0 = 0.0005;
 const GROW = 1.3;
@@ -2107,7 +2108,7 @@ var<private> colDens: f32;
 var<private> colRad: f32; // the grain's factor on the wood's conductivity through the column, and along the surface
 var<private> colLat: f32;
 var<private> colCrack: f32; // the share of the column's char split by cracks
-var<private> colNb: array<u32, 4>; // the columns beside it
+var<private> colNb: vec4<u32>; // the columns beside it
 var<private> colSide: f32; // 1 / its area at the surface as made, for the heat from beside it
 var<private> colOx: f32; // the char burning off the surface this step, kg per m2 of the surface as made
 var<private> sumFuel: f32;
@@ -2139,12 +2140,10 @@ fn cellStep(k: u32, surface: bool) -> Cell {
   let mid = (r - layerTop(k, r) - 0.5 * h) / r;
   let rHalf = 0.5 * phi * h * res / (mid * mid);
   // From the four columns beside it (an empty cell, at 0, passes nothing).
-  var side = 0.0;
-  for (var j = 0u; j < 4u; j++) {
-    let tn = temps[colRead + k * SKIN_TEXELS + colNb[j]];
-    if (tn > 1.0) { side += tn - t; }
-  }
-  side *= (fc * kChar(t) + (1.0 - fc) * kWood(t) * colDens * colLat) * phi * h * colSide;
+  let at = colRead + k * SKIN_TEXELS;
+  let tn = vec4<f32>(temps[at + colNb.x], temps[at + colNb.y], temps[at + colNb.z], temps[at + colNb.w]);
+  let side = dot(select(vec4<f32>(0.0), tn - t, tn > vec4<f32>(1.0)), vec4<f32>(1.0))
+    * (fc * kChar(t) + (1.0 - fc) * kWood(t) * colDens * colLat) * phi * h * colSide;
   var c1 = m.y + CHAR_YIELD * dWood;
   var a1 = m.w;
   if (surface && colOx > 0.0) {
@@ -2203,7 +2202,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   colLat = 1.0 + 0.23 * (1.0 - along);
   // (Cracks open once the char is a millimetre or two deep.)
   colCrack = cB.y * smoothstep(0.8, 2.5, prev.z);
-  colNb = array<u32, 4>(texelNear(face, i32(ti) - 1, i32(tj)), texelNear(face, i32(ti) + 1, i32(tj)), texelNear(face, i32(ti), i32(tj) - 1), texelNear(face, i32(ti), i32(tj) + 1));
+  colNb = vec4<u32>(texelNear(face, i32(ti) - 1, i32(tj)), texelNear(face, i32(ti) + 1, i32(tj)), texelNear(face, i32(ti), i32(tj) - 1), texelNear(face, i32(ti), i32(tj) + 1));
+  // (A random number for this column this step, for the sums along the surface below.)
+  let jitter = hash3(vec3<i32>(i32(t), i32(P.forces.y / dt + 0.5), 7));
   let sN = 2.0 / f32(SKIN_N);
   let u = tan(((f32(ti) + 0.5) * sN - 1.0) * 0.78539816);
   let v = tan(((f32(tj) + 0.5) * sN - 1.0) * 0.78539816);
@@ -2233,6 +2234,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // What reaches the surface (W/m2, by an emissivity of 1, besides convection and the char's burning).
   var qIn = 0.0;
+  var belowOut = 0.0;
   var tGas = T_AMB;
   var hConv = H_CONV;
   var o2 = 1.0;
@@ -2293,19 +2295,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // The ball's own flame along its surface: a layer too thin for the grid, it heats the wood above a burning patch,
     // which is how fire climbs a surface. A wall flame's heat flux grows with the burning height beneath it, to about
     // 25 kW/m2 once some 9 cm of the surface below is alight (measured averages run 15 to 20, the usual assumption 25
-    // to 30): a small new patch cannot keep thick wood burning without outside heat, a tall one can. Down the surface,
-    // in steps of 1.1 cm, the texel there and those either side.
+    // to 30): a small new patch cannot keep thick wood burning without outside heat, a tall one can. Down the surface
+    // in steps of 1.1 cm, a texel to either side at random each step, averaged over the last few steps.
     var below = 0.0;
     let stepA = 0.011 / r;
-    let sideA = 1.5707963 / f32(SKIN_N);
+    let e = east * ((2.0 * jitter - 1.0) * 1.5707963 / f32(SKIN_N));
     for (var k = 1; k <= 8; k++) {
       let a = f32(k) * stepA;
       if (th0 + a > 3.1415927) { break; }
-      let d = n * cos(a) + down * sin(a);
-      var row = 0.0;
-      for (var e = -1; e <= 1; e++) { row = max(row, smoothstep(0.0015, 0.0025, skin[texelOf(normalize(d + east * (f32(e) * sideA)))].y)); }
-      below += row / 8.0;
+      below += smoothstep(0.0015, 0.0025, skin[texelOf(normalize(n * cos(a) + down * sin(a) + e))].y) / 8.0;
     }
+    below = mix(cA.z, below, 0.5);
+    belowOut = below;
     // The flame flickers, a pattern rising over the surface at a couple of hertz, so the front advances in fingers.
     let flicker = 0.5 + fbm(n * 5.0 + vec3<f32>(0.0, -2.0 * P.grid.z, 0.0));
     qIn = qGas + qFire + 25000.0 * below * flicker;
@@ -2322,32 +2323,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // How deep to work: a layer past the deepest heat has reached here or beside it.
   var reach = u32(cA.x);
-  for (var j = 0u; j < 4u; j++) { reach = max(reach, u32(cols[(par * SKIN_TEXELS + colNb[j]) * 2u].x)); }
+  let nbAt = par * SKIN_TEXELS;
+  reach = max(max(reach, u32(cols[(nbAt + colNb.x) * 2u].x)), max(u32(cols[(nbAt + colNb.y) * 2u].x), max(u32(cols[(nbAt + colNb.z) * 2u].x), u32(cols[(nbAt + colNb.w) * 2u].x))));
   reach = min(max(reach, s + 2u), WOOD_LAYERS - 1u);
 
-  // Down the column, then back up (the Thomas algorithm).
-  var cp: array<f32, WOOD_LAYERS>;
-  var dp: array<f32, WOOD_LAYERS>;
+  // The top IMPLICIT cells (or as many as heat has reached) implicitly: down the column, then back up (the Thomas
+  // algorithm). Any below, 2 to 10 mm deep where heat moves slowly, explicitly. On the way, the char's temperature
+  // halfway down it and at its base: in the deepest cells that start above them.
+  let last = min(reach, s + IMPLICIT - 1u);
+  let worn = layerTop(s, r) + (1.0 - fill) * hs;
+  var cp: array<f32, IMPLICIT>;
+  var dp: array<f32, IMPLICIT>;
   var cur = cellStep(s, true);
+  var below = cur;
   let gs = 1.0 / cur.rHalf;
   let gEff = gs * areaS * lam / (areaS * lam + gs);
   var gUp = 0.0;
   var cpUp = 0.0;
   var dpUp = 0.0;
-  for (var k = s; k <= reach; k++) {
+  for (var k = s; k <= last; k++) {
     var gDn = 0.0;
-    var next = cur;
-    if (k < reach) {
-      next = cellStep(k + 1u, false);
-      gDn = 1.0 / (cur.rHalf + next.rHalf);
-    }
-    var b = cur.c / dt + gUp + gDn;
+    var b = cur.c / dt + gUp;
     var d = cur.rhs;
     if (k == s) {
       b += gEff;
       d += gEff * q0 / lam;
     }
-    if (k == reach && k + 1u < WOOD_LAYERS) {
+    if (k < reach) {
+      below = cellStep(k + 1u, false);
+      let g = 1.0 / (cur.rHalf + below.rHalf);
+      if (k < last) { gDn = g; } else { d += g * below.t; }
+      b += g;
+    } else if (k + 1u < WOOD_LAYERS) {
       // (The cell below, which heat has not reached, as fresh wood at its temperature.)
       let tb = temps[colRead + (k + 1u) * SKIN_TEXELS + t];
       let hb = layerThick(k + 1u, r);
@@ -2357,24 +2364,56 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       d += gb * tb;
     }
     let m = b + gUp * cpUp;
-    cp[k] = -gDn / m;
-    dp[k] = (d + gUp * dpUp) / m;
-    cpUp = cp[k];
-    dpUp = dp[k];
+    cp[k - s] = -gDn / m;
+    dp[k - s] = (d + gUp * dpUp) / m;
+    cpUp = cp[k - s];
+    dpUp = dp[k - s];
     gUp = gDn;
-    cur = next;
+    if (k < last) { cur = below; }
   }
-  var tn = dp[reach];
+  var tMid = 0.0;
+  var tBase = 0.0;
+  var tn = dp[last - s];
   var warm = s;
-  var k = reach;
+  var k = last;
   loop {
     temps[write + k * SKIN_TEXELS + t] = tn;
-    if (warm == s && tn > T_AMB + 0.05) { warm = k; }
+    if (warm == s && tn > T_AMB + 0.5) { warm = k; }
+    let start = select(layerTop(k, r) - worn, 0.0, k == s);
+    if (tMid == 0.0 && start <= 0.5 * sumChar) { tMid = tn; }
+    if (tBase == 0.0 && start <= sumChar) { tBase = tn; }
     if (k == s) { break; }
     k--;
-    tn = dp[k] - cp[k] * tn;
+    tn = dp[k - s] - cp[k - s] * tn;
   }
-  let ts = (areaS * q0 + gs * tn) / (areaS * lam + gs);
+  let tTop = tn;
+  // The cells below, explicitly, from this step's start.
+  if (last < reach) {
+    var above = cur;
+    cur = below;
+    for (var j = last + 1u; j <= reach; j++) {
+      var flow = (above.t - cur.t) / (above.rHalf + cur.rHalf);
+      var next = cur;
+      if (j < reach) {
+        next = cellStep(j + 1u, false);
+        flow += (next.t - cur.t) / (cur.rHalf + next.rHalf);
+      } else if (j + 1u < WOOD_LAYERS) {
+        let tb = temps[colRead + (j + 1u) * SKIN_TEXELS + t];
+        let hb = layerThick(j + 1u, r);
+        let mb = (r - layerTop(j + 1u, r) - 0.5 * hb) / r;
+        flow += (tb - cur.t) / (cur.rHalf + 0.5 * hb / (kWood(tb) * colDens * colRad * mb * mb));
+      }
+      let tj = (cur.rhs + flow) * dt / cur.c;
+      temps[write + j * SKIN_TEXELS + t] = tj;
+      if (tj > T_AMB + 0.5) { warm = j; }
+      let start = layerTop(j, r) - worn;
+      if (start <= 0.5 * sumChar) { tMid = tj; }
+      if (start <= sumChar) { tBase = tj; }
+      above = cur;
+      cur = next;
+    }
+  }
+  let ts = (areaS * q0 + gs * tTop) / (areaS * lam + gs);
   // A surface cell burned to nothing but ash passes its ash (and any char left) to the cell beneath, and empties.
   var top = s;
   let mTop = cells[s * SKIN_TEXELS + t];
@@ -2388,31 +2427,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     top = s + 1u;
   }
   let wear = layerTop(top, r) + (1.0 - fillOf(cells[top * SKIN_TEXELS + t])) * layerThick(top, r);
-  // The char's temperature halfway down it and at its base (in the cells there).
-  var tMid = 0.0;
-  var tBase = ts;
-  var depth = 0.0;
-  for (var j = top; j <= reach; j++) {
-    let hj = layerThick(j, r) * select(1.0, fillOf(cells[j * SKIN_TEXELS + t]), j == top);
-    let tj = temps[write + j * SKIN_TEXELS + t];
-    if (tMid == 0.0 && depth + hj >= 0.5 * sumChar) { tMid = tj; }
-    tBase = tj;
-    if (depth + hj >= sumChar) { break; }
-    depth += hj;
-  }
-  if (tMid == 0.0) { tMid = tBase; }
 
   // The volatiles burn as they flow up the surface, so the flame at a texel carries all the fuel that came off below
   // it, per metre of width (the circles of latitude narrow toward the poles): down the surface to the bottom in steps.
+  // (Eight points each step, set at random along the way and averaged over the last few steps: the sum feeds only the
+  // drawn flames, and changes slowly.)
   var sheet = 0.0;
-  let dth = (3.1415927 - th0) / 32.0;
-  for (var j = 0; j < 32; j++) {
-    let a = (f32(j) + 0.5) * dth;
+  let dth = (3.1415927 - th0) / 8.0;
+  for (var j = 0; j < 8; j++) {
+    let a = (f32(j) + jitter) * dth;
     sheet += burning(skin[texelOf(normalize(n * cos(a) + down * sin(a)))].y) * sin(th0 + a);
   }
+  sheet = mix(sheetOut[t].x, sheet * r * dth / max(sin(th0), 0.15), 0.3);
   skinOut[t] = vec4<f32>(ts, sumFuel, 1000.0 * sumChar, 1.0 - exp(-sumAsh / (areaS * ASH_COVER)));
-  sheetOut[t] = vec4<f32>(sheet * r * dth / max(sin(th0), 0.15), 1000.0 * wear, tMid, tBase);
-  cols[cWrite] = vec4<f32>(f32(max(u32(cA.x), min(warm + 1u, WOOD_LAYERS - 1u))), ts, 0.0, 0.0);
+  sheetOut[t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
+  cols[cWrite] = vec4<f32>(f32(max(u32(cA.x), min(warm + 1u, WOOD_LAYERS - 1u))), ts, belowOut, 0.0);
   cols[cWrite + 1u] = cB;
 }
 `

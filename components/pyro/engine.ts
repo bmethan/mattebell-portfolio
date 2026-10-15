@@ -13,6 +13,8 @@ import { BACKDROP_H, BACKDROP_W, environmentLight, shBasis, type EnvLight } from
 import { kelvinToACEScg } from '../lookdev/color'
 
 export const SIM_DT = 1 / 30
+// The wooden ball's wood steps once every this many steps of the gas (BALL_HEAT).
+const WOOD_EVERY = 2
 const MAX_STEPS_PER_FRAME = 2
 const MAX_IN_FLIGHT = 2 // frames of GPU work queued at once: enough to keep the GPU busy, too few to stall the page
 const SOR_OMEGA = 1.7
@@ -615,6 +617,7 @@ export class PyroEngine {
   // radiant flux; -1: the standard furnace fire).
   private woodParity = 0
   private woodClock = 0
+  private woodPhase = -1
   woodSpeed = 1
   woodTest = 0
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
@@ -1507,8 +1510,9 @@ export class PyroEngine {
     const bimNow = this.bimocqOn()
     if (bimNow) this.bimocqBegin(enc)
     this.bimocqWas = bimNow
-    // The wooden ball heats (or cools) first, so this step's fire takes in its volatiles.
-    if (this.ballBurning()) {
+    // The wooden ball heats (or cools) first, so this step's fire takes in its volatiles: every WOOD_EVERY steps, a
+    // step that long (its surface's thinnest cell takes a second or two to answer, and its solve is implicit).
+    if (this.ballBurning() && this.woodDue()) {
       const skinPass = enc.beginComputePass()
       skinPass.setPipeline(p.ballHeat)
       skinPass.setBindGroup(0, g.bg.ballHeat)
@@ -1850,7 +1854,7 @@ export class PyroEngine {
     // Each upres layer resets when the simulation clock crosses its period (layer B half a period later).
     const t0 = this.simTime / DETAIL_PERIOD
     const t1 = (this.simTime + SIM_DT) / DETAIL_PERIOD
-    f.set([Math.floor(t1) > Math.floor(t0) ? 1 : 0, Math.floor(t1 + 0.5) > Math.floor(t0 + 0.5) ? 1 : 0, this.woodSpeed, this.woodTest], 44)
+    f.set([Math.floor(t1) > Math.floor(t0) ? 1 : 0, Math.floor(t1 + 0.5) > Math.floor(t0 + 0.5) ? 1 : 0, WOOD_EVERY * this.woodSpeed, this.woodTest], 44)
     // A fire bed gives off fuel at the rate that releases the chosen heat. Fuel and air mix (and so burn) in
     // sqrt(2 dx / g), the buoyant mixing time FDS uses at a cell's scale. The bed's nominal area (a disc, thinned by
     // the source noise) spreads the fuel until the area is measured.
@@ -2605,15 +2609,21 @@ export class PyroEngine {
     this.device.queue.submit([enc.finish()])
     this.woodParity = 0
     this.woodClock = 0
+    this.woodPhase = -1
     this.ballStatus = null
     this.needsRender = true
     this.taaCount = 0
   }
 
-  // After each step of the wood: its halves trade places, and its clock runs on.
+  // Whether the wood steps with this step of the gas (every WOOD_EVERY), and after it does: its halves trade places,
+  // and its clock runs on.
+  private woodDue() {
+    this.woodPhase = (this.woodPhase + 1) % WOOD_EVERY
+    return this.woodPhase === 0
+  }
   private woodStepped() {
     this.woodParity = 1 - this.woodParity
-    this.woodClock += SIM_DT * this.woodSpeed
+    this.woodClock += SIM_DT * WOOD_EVERY * this.woodSpeed
   }
 
   // Swaps the charred ball for a fresh one.

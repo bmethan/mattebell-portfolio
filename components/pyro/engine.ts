@@ -13,6 +13,9 @@ import { kelvinToACEScg } from '../lookdev/color'
 
 export const SIM_DT = 1 / 30
 const MAX_STEPS_PER_FRAME = 2
+// The fire's head start before its first frame (see preroll), simulated seconds, and the steps sent at a time.
+const HEAD_START_S = 3
+const PREROLL_BATCH = 3
 const MAX_IN_FLIGHT = 2 // frames of GPU work queued at once: enough to keep the GPU busy, too few to stall the page
 const SOR_OMEGA = 1.7
 // Multigrid: Gauss-Seidel sweeps before and after each coarse correction, and on the coarsest level (over-relaxed
@@ -247,6 +250,11 @@ interface Pipes {
   upresCoarse: GPUComputePipeline
   ptComposite: GPURenderPipeline
 }
+// The pipelines only drawing needs (the light volume, the flames' and the floor's near light, the cyc's maps, the image
+// pass and what follows it), and the solver's: everything else.
+type FrameKey = 'light' | 'cycDirect' | 'cycBounce' | 'flameNear' | 'floorNear' | 'render' | 'resolve' | 'display' | 'glareFirst' | 'glareDown' | 'glareUp' | 'ptComposite'
+type FramePipes = Pick<Pipes, FrameKey>
+type SolverPipes = Omit<Pipes, FrameKey>
 
 // One multigrid level: its cells, and bind groups for smoothing (by colour), the residual, restriction into the
 // next coarser level, and prolongation from it.
@@ -354,13 +362,18 @@ interface Grids {
     advDetail: GPUBindGroup
     fireSum: GPUBindGroup
     fireTotal: GPUBindGroup
-    light: GPUBindGroup
-    cycDirect: GPUBindGroup
-    cycBounce: [GPUBindGroup, GPUBindGroup] // (the first to the second, then back)
-    flameNear: GPUBindGroup
-    floorNear: GPUBindGroup
-    render: GPUBindGroup
   }
+  // The frame's bind groups, made once its pipelines are (frameGroups).
+  frame: FrameGroups | null
+  frameGroups: (p: FramePipes) => FrameGroups
+}
+interface FrameGroups {
+  light: GPUBindGroup
+  cycDirect: GPUBindGroup
+  cycBounce: [GPUBindGroup, GPUBindGroup] // (the first to the second, then back)
+  flameNear: GPUBindGroup
+  floorNear: GPUBindGroup
+  render: GPUBindGroup
 }
 
 // The device and the compiled pipelines can be made ahead of time (prewarmPyro), while the page rests on the Lab:
@@ -388,7 +401,7 @@ async function requestDevice(): Promise<{ adapter: GPUAdapter; device: GPUDevice
   return { adapter, device }
 }
 
-async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pipes> {
+async function compilePipes(d: GPUDevice, format: GPUTextureFormat, onSolver?: (p: SolverPipes) => void): Promise<Pipes> {
   const compute = (code: string, constants?: Record<string, number>) =>
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
@@ -419,79 +432,94 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
       },
       primitive: { topology: 'triangle-list' },
     })
-  const [fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull1, lfmPull2, lfmPull3, diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite, cycDirect, cycBounce, flameNear, floorNear] = await Promise.all([
-    compute(FIRE_SUM),
-    compute(FIRE_SUM_TOTAL),
-    compute(NOISE_GEN),
-    compute(CURL_GEN),
-    compute(ADVECT_DETAIL),
-    compute(MG_SMOOTH),
-    compute(MG_RESIDUAL),
-    compute(MG_RESTRICT),
-    compute(MG_PROLONG),
-    compute(ADVECT_VEL, { DIR: 1 }),
-    compute(ADVECT_VEL, { DIR: -1 }),
-    compute(ADVECT_VEL, { DIR: 0.5 }),
-    compute(PROJECT_REFLECT),
-    compute(VEL_COMBINE),
-    compute(CURL),
-    forcesP,
-    compute(DIVERGENCE),
-    compute(SOR),
-    compute(PROJECT),
-    compute(ADVECT_SCAL, { DIR: 1 }),
-    compute(ADVECT_SCAL, { DIR: -1 }),
-    compute(COMBINE),
-    compute(CONSERVE_SPREAD),
-    compute(CONSERVE_RATIO),
-    compute(BALL_HEAT),
-    compute(VORT_BEFORE),
-    compute(IVOCK_TARGET),
-    compute(IVOCK_CURL),
-    compute(IVOCK_SMOOTH),
-    compute(IVOCK_APPLY),
-    compute(BIMOCQ_MAPS),
-    compute(BIMOCQ_RECON),
-    compute(BIMOCQ_ACCUM),
-    compute(ADVECT_VEL, { DIR: 2 }),
-    compute(LFM_CELLVEL),
-    compute(LFM_MARCH_FWD),
-    compute(LFM_MARCH_BWD),
-    compute(LFM_PULL, { MODE: 1 }),
-    compute(LFM_PULL, { MODE: 2 }),
-    compute(LFM_PULL, { MODE: 3 }),
-    compute(DIFFUSE),
-    lightP,
-    compute(UPRES),
-    compute(UPRES_COARSE),
-    renderP,
-    d.createRenderPipelineAsync({
+  // (Asked for in the order they always were; the solver's are handed over as soon as they are all ready, about 1.4 s
+  // after the request on an integrated GPU, the image pass's own taking some 4.5 s.)
+  const solverP: Pending<SolverPipes> = {
+    fireSum: compute(FIRE_SUM),
+    fireTotal: compute(FIRE_SUM_TOTAL),
+    noiseGen: compute(NOISE_GEN),
+    curlGen: compute(CURL_GEN),
+    advDetail: compute(ADVECT_DETAIL),
+    mgSmooth: compute(MG_SMOOTH),
+    mgResidual: compute(MG_RESIDUAL),
+    mgRestrict: compute(MG_RESTRICT),
+    mgProlong: compute(MG_PROLONG),
+    advectVel: compute(ADVECT_VEL, { DIR: 1 }),
+    advectVelBack: compute(ADVECT_VEL, { DIR: -1 }),
+    advectVelHalf: compute(ADVECT_VEL, { DIR: 0.5 }),
+    projectReflect: compute(PROJECT_REFLECT),
+    velCombine: compute(VEL_COMBINE),
+    curl: compute(CURL),
+    forces: forcesP,
+    divergence: compute(DIVERGENCE),
+    sor: compute(SOR),
+    project: compute(PROJECT),
+    advFwd: compute(ADVECT_SCAL, { DIR: 1 }),
+    advBwd: compute(ADVECT_SCAL, { DIR: -1 }),
+    combine: compute(COMBINE),
+    conserveSpread: compute(CONSERVE_SPREAD),
+    conserveRatio: compute(CONSERVE_RATIO),
+    ballHeat: compute(BALL_HEAT),
+    vortBefore: compute(VORT_BEFORE),
+    ivockTarget: compute(IVOCK_TARGET),
+    ivockCurl: compute(IVOCK_CURL),
+    ivockSmooth: compute(IVOCK_SMOOTH),
+    ivockApply: compute(IVOCK_APPLY),
+    bimocqMaps: compute(BIMOCQ_MAPS),
+    bimocqRecon: compute(BIMOCQ_RECON),
+    bimocqAccum: compute(BIMOCQ_ACCUM),
+    advectVelDouble: compute(ADVECT_VEL, { DIR: 2 }),
+    lfmCellVel: compute(LFM_CELLVEL),
+    lfmMarchFwd: compute(LFM_MARCH_FWD),
+    lfmMarchBwd: compute(LFM_MARCH_BWD),
+    lfmPull: Promise.all([compute(LFM_PULL, { MODE: 1 }), compute(LFM_PULL, { MODE: 2 }), compute(LFM_PULL, { MODE: 3 })]),
+    diffuse: compute(DIFFUSE),
+    upres: compute(UPRES),
+    upresCoarse: compute(UPRES_COARSE),
+  }
+  const frameP: Pending<FramePipes> = {
+    light: lightP,
+    render: renderP,
+    resolve: d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: resolveModule, entryPoint: 'vs' },
       fragment: { module: resolveModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
     }),
-    d.createRenderPipelineAsync({
+    display: d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: displayModule, entryPoint: 'vs' },
       fragment: { module: displayModule, entryPoint: 'fs', targets: [{ format }] },
       primitive: { topology: 'triangle-list' },
     }),
-    glarePipe('fsDownFirst', false),
-    glarePipe('fsDown', false),
-    glarePipe('fsUp', true),
-    d.createRenderPipelineAsync({
+    glareFirst: glarePipe('fsDownFirst', false),
+    glareDown: glarePipe('fsDown', false),
+    glareUp: glarePipe('fsUp', true),
+    ptComposite: d.createRenderPipelineAsync({
       layout: 'auto',
       vertex: { module: compositeModule, entryPoint: 'vs' },
       fragment: { module: compositeModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
     }),
-    compute(CYC_DIRECT),
-    compute(CYC_BOUNCE),
-    flameNearP,
-    floorNearP,
-  ])
-  return { cycDirect, cycBounce, flameNear, floorNear, fireSum, fireTotal, noiseGen, curlGen, advDetail, mgSmooth, mgResidual, mgRestrict, mgProlong, advectVel, advectVelBack, advectVelHalf, projectReflect, velCombine, curl, forces, divergence, sor, project, advFwd, advBwd, combine, conserveSpread, conserveRatio, ballHeat, vortBefore, ivockTarget, ivockCurl, ivockSmooth, ivockApply, bimocqMaps, bimocqRecon, bimocqAccum, advectVelDouble, lfmCellVel, lfmMarchFwd, lfmMarchBwd, lfmPull: [lfmPull1, lfmPull2, lfmPull3], diffuse, light, upres, upresCoarse, render, resolve, display, glareFirst, glareDown, glareUp, ptComposite }
+    cycDirect: compute(CYC_DIRECT),
+    cycBounce: compute(CYC_BOUNCE),
+    flameNear: flameNearP,
+    floorNear: floorNearP,
+  }
+  const frame = settle(frameP)
+  // (A failure among the frame's surfaces below, after the solver's; caught here too, so it is not reported early.)
+  frame.catch(() => {})
+  const solver = await settle(solverP)
+  onSolver?.(solver)
+  return { ...solver, ...(await frame) }
+}
+
+// An object of promises, settled into an object of their values.
+type Pending<T> = { [K in keyof T]: Promise<T[K]> }
+async function settle<T>(o: Pending<T>): Promise<T> {
+  const keys = Object.keys(o) as (keyof T)[]
+  const values = await Promise.all(keys.map(k => o[k]))
+  return Object.fromEntries(keys.map((k, i) => [k, values[i]])) as T
 }
 
 export function prewarmPyro() {
@@ -655,6 +683,8 @@ export class PyroEngine {
   private glareSampler: GPUSampler
   private noiseSampler: GPUSampler
   private pipes: Pipes | null = null
+  private solver: SolverPipes | null = null // (the solver's alone, before the image pass's are ready; then all of them)
+  private prerolled: Promise<void> = Promise.resolve()
   private grids: Grids | null = null
   private disposed = false
   private lost = false
@@ -791,11 +821,52 @@ export class PyroEngine {
     this.whenReady = this.build(prebuilt)
   }
 
-  // Compiles every pipeline in the background, then makes the grids.
+  // Compiles every pipeline in the background. The grids and the solver start as soon as the solver's own pipelines are
+  // ready, and the fire runs on (preroll) while the image pass's compile; its first frame is drawn once both are done.
   private async build(prebuilt: Pipes | null) {
-    const pipes = prebuilt ?? (await compilePipes(this.device, this.format))
+    const pipes = prebuilt ?? (await compilePipes(this.device, this.format, solver => this.startSolver(solver)))
     if (this.disposed) return false
+    if (!this.solver) this.startSolver(pipes)
+    await this.prerolled
+    if (this.disposed) return false
+    // (Only now, so the frame loop, which waits for them, cannot start beside the head start.)
     this.pipes = pipes
+    this.solver = pipes
+    // (A resolution chosen meanwhile: its grids, from the start. Otherwise the frame's bind groups over these.)
+    if (this.grids!.n.join() !== RESOLUTIONS[this.state.resolution].dims.join()) this.makeGrids()
+    else this.grids!.frame = this.grids!.frameGroups(pipes)
+    this.layoutCamera()
+    this.needsRender = true
+    this.kick()
+    return true
+  }
+
+  // The fire run on to HEAD_START_S before its first frame, nothing drawn, while the image pass's pipelines compile (or,
+  // with every pipeline made ahead, at once). A fire grows from its ignition for its first two seconds or so, a puff of
+  // smoke rising off a low flame; the first frame a visitor sees is the fire as it burns. A few steps at a time, as
+  // fast as the GPU takes them: about two simulated seconds a second on an integrated GPU, the image pass's compile
+  // leaving some three seconds. (Not for smoke with its upres grid, whose pass needs the image pass's layout.)
+  private async preroll() {
+    if (this.upresActive()) return
+    // (Some of the step's kernels read the image pass's uniforms: the fire's light is summed as it is drawn.)
+    this.writeRender()
+    while (!this.disposed && this.simTime < HEAD_START_S - 1e-6) {
+      for (let i = 0; i < PREROLL_BATCH; i++) this.step()
+      await this.device.queue.onSubmittedWorkDone()
+    }
+    if (this.disposed) return
+    // The meter starts from the fire as it now burns, and the simulation's rate is judged from the first frame.
+    await this.readFire()
+    this.meterEV = null
+    this.stepTimes = []
+    this.steadySince = performance.now()
+  }
+
+  // The solver's pipelines ready: the detail noise, the grids, and the head start.
+  private startSolver(solver: SolverPipes) {
+    if (this.disposed) return
+    this.solver = solver
+    const pipes = solver
     // The detail noise, made once, and the upres pass's turbulence from it.
     const enc = this.device.createCommandEncoder()
     const pass = enc.beginComputePass()
@@ -819,16 +890,13 @@ export class PyroEngine {
     pass.end()
     this.device.queue.submit([enc.finish()])
     this.makeGrids()
-    this.layoutCamera()
-    this.needsRender = true
-    this.kick()
-    return true
+    this.prerolled = this.preroll()
   }
 
   // The grids for the current resolution, zeroed, and every bind group over them.
   private makeGrids() {
     const d = this.device
-    const p = this.pipes!
+    const p = this.solver!
     this.grids?.textures.forEach(t => t.destroy())
     this.upres?.tex.forEach(t => t.destroy())
     this.upres?.coarse.destroy()
@@ -1063,6 +1131,53 @@ export class PyroEngine {
     const P = { buffer: this.simBuf }
     const R = { buffer: this.renderBuf }
     const s = this.sampler
+    // The frame's bind groups, made when its pipelines are (with the grids, or once the image pass has compiled).
+    const frameGroups = (p: FramePipes): FrameGroups => ({
+      flameNear: d.createBindGroup({
+        layout: p.flameNear.getBindGroupLayout(0),
+        entries: [
+          ...[P, R, s].map((resource, binding) => ({ binding, resource })),
+          { binding: 4, resource: v(light) },
+          { binding: 10, resource: { buffer: fireLight } },
+          { binding: 40, resource: v(flameNear) },
+          { binding: 41, resource: v(emit) },
+          { binding: 42, resource: v(flameNearDir) },
+        ],
+      }),
+      floorNear: d.createBindGroup({
+        layout: p.floorNear.getBindGroupLayout(0),
+        entries: [
+          ...[P, R, s].map((resource, binding) => ({ binding, resource })),
+          { binding: 10, resource: { buffer: fireLight } },
+          { binding: 41, resource: v(emit) },
+          { binding: 47, resource: v(floorNear) },
+        ],
+      }),
+      light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2), this.dummy3d.createView()]),
+      cycDirect: d.createBindGroup({
+        layout: p.cycDirect.getBindGroupLayout(0),
+        entries: [
+          ...[P, R, s].map((resource, binding) => ({ binding, resource })),
+          { binding: 4, resource: v(light) },
+          { binding: 10, resource: { buffer: fireLight } },
+          { binding: 34, resource: v(light2) },
+          { binding: 40, resource: v(cycDirect) },
+          { binding: 46, resource: v(floorNear) },
+        ],
+      }),
+      cycBounce: [0, 1].map(k =>
+        d.createBindGroup({
+          layout: p.cycBounce.getBindGroupLayout(0),
+          entries: [
+            ...[P, R, s, v(scal[0])].map((resource, binding) => ({ binding, resource })),
+            { binding: 39, resource: v(cycBounce[k]) },
+            { binding: 40, resource: v(cycBounce[1 - k]) },
+            { binding: 41, resource: v(cycDirect) },
+          ],
+        }),
+      ) as [GPUBindGroup, GPUBindGroup],
+      render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }, { binding: 43, resource: v(cycDirect) }, { binding: 44, resource: v(flameNear) }, { binding: 45, resource: v(flameNearDir) }, { binding: 46, resource: v(floorNear) }]),
+    })
     this.grids = {
       n,
       textures: [...vel, ...scal, ...detA, ...detB, curl, light, cycDirect, ...cycBounce, emit, flameNear, flameNearDir, floorNear, flame, nut, vortA, vortB, vortC, psiCurl, ...ring, ...ringC, ...u0, delta, lm, le],
@@ -1093,6 +1208,8 @@ export class PyroEngine {
       flameNearDir,
       floorNear,
       nearDims,
+      frame: this.pipes ? frameGroups(this.pipes) : null,
+      frameGroups,
       bg: {
         advectVel: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[3])]),
         advectVelFwd: group(p.advectVel, [P, s, v(vel[0]), v(vel[0]), v(vel[1])]),
@@ -1148,51 +1265,7 @@ export class PyroEngine {
             { binding: 42, resource: v(emit) },
           ],
         }),
-        flameNear: d.createBindGroup({
-          layout: p.flameNear.getBindGroupLayout(0),
-          entries: [
-            ...[P, R, s].map((resource, binding) => ({ binding, resource })),
-            { binding: 4, resource: v(light) },
-            { binding: 10, resource: { buffer: fireLight } },
-            { binding: 40, resource: v(flameNear) },
-            { binding: 41, resource: v(emit) },
-            { binding: 42, resource: v(flameNearDir) },
-          ],
-        }),
-        floorNear: d.createBindGroup({
-          layout: p.floorNear.getBindGroupLayout(0),
-          entries: [
-            ...[P, R, s].map((resource, binding) => ({ binding, resource })),
-            { binding: 10, resource: { buffer: fireLight } },
-            { binding: 41, resource: v(emit) },
-            { binding: 47, resource: v(floorNear) },
-          ],
-        }),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
-        light: group(p.light, [P, R, s, v(scal[0]), v(light), { buffer: fireLight }, v(light2), this.dummy3d.createView()]),
-        cycDirect: d.createBindGroup({
-          layout: p.cycDirect.getBindGroupLayout(0),
-          entries: [
-            ...[P, R, s].map((resource, binding) => ({ binding, resource })),
-            { binding: 4, resource: v(light) },
-            { binding: 10, resource: { buffer: fireLight } },
-            { binding: 34, resource: v(light2) },
-            { binding: 40, resource: v(cycDirect) },
-            { binding: 46, resource: v(floorNear) },
-          ],
-        }),
-        cycBounce: [0, 1].map(k =>
-          d.createBindGroup({
-            layout: p.cycBounce.getBindGroupLayout(0),
-            entries: [
-              ...[P, R, s, v(scal[0])].map((resource, binding) => ({ binding, resource })),
-              { binding: 39, resource: v(cycBounce[k]) },
-              { binding: 40, resource: v(cycBounce[1 - k]) },
-              { binding: 41, resource: v(cycDirect) },
-            ],
-          }),
-        ) as [GPUBindGroup, GPUBindGroup],
-        render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }, { binding: 43, resource: v(cycDirect) }, { binding: 44, resource: v(flameNear) }, { binding: 45, resource: v(flameNearDir) }, { binding: 46, resource: v(floorNear) }]),
       },
     }
     this.resetSkin()
@@ -1485,7 +1558,7 @@ export class PyroEngine {
 
   private step() {
     const g = this.grids!
-    const p = this.pipes!
+    const p = this.solver!
     this.writeSim()
     const enc = this.device.createCommandEncoder()
     // BiMocq2 starts afresh when it has just been switched on, or on a new grid.
@@ -1625,7 +1698,7 @@ export class PyroEngine {
   // The pressure solve: multigrid V-cycles (default) or red-black SOR sweeps, both warm started from the last step.
   private solvePressure(pass: GPUComputePassEncoder) {
     const g = this.grids!
-    const p = this.pipes!
+    const p = this.solver!
     const [nx, ny, nz] = g.n
     const dispatch = (pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => {
       pass.setPipeline(pipe)
@@ -1646,7 +1719,7 @@ export class PyroEngine {
   // Multigrid V-cycles over the levels.
   private mgCycles(pass: GPUComputePassEncoder, count: number) {
     const g = this.grids!
-    const p = this.pipes!
+    const p = this.solver!
     const dispatch = (pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => {
       pass.setPipeline(pipe)
       pass.setBindGroup(0, bg)
@@ -1710,7 +1783,7 @@ export class PyroEngine {
   private bimocqAfter(enc: GPUCommandEncoder, cc: Vec3) {
     const g = this.grids!
     const b = g.bimocq
-    const p = this.pipes!
+    const p = this.solver!
     const [nx, ny, nz] = g.n
     const bytes = nx * ny * nz * 16
     const pass = enc.beginComputePass()
@@ -1754,7 +1827,7 @@ export class PyroEngine {
     const g = this.grids!
     const [nx, ny, nz] = g.n
     const pass = enc.beginComputePass()
-    run(pass, this.pipes!.lfmMarchFwd, g.lfm.marchFwd[this.lfmStep], cv)
+    run(pass, this.solver!.lfmMarchFwd, g.lfm.marchFwd[this.lfmStep], cv)
     pass.end()
     enc.copyTextureToTexture({ texture: g.lfm.u0[1] }, { texture: g.lfm.u0[0] }, [nx + 1, ny + 1, nz + 1])
   }
@@ -1764,7 +1837,7 @@ export class PyroEngine {
   // the result is the velocity, and the next cycle's start.
   private lfmReinit(enc: GPUCommandEncoder, run: (pass: GPUComputePassEncoder, pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => void, cv: Vec3, cc: Vec3) {
     const g = this.grids!
-    const p = this.pipes!
+    const p = this.solver!
     const L = g.lfm
     const [nx, ny, nz] = g.n
     const bytes = nx * ny * nz * 4
@@ -1790,7 +1863,7 @@ export class PyroEngine {
   // potentials; their curl added.
   private ivock(pass: GPUComputePassEncoder, run: (pass: GPUComputePassEncoder, pipe: GPUComputePipeline, bg: GPUBindGroup, wg: Vec3) => void, cv: Vec3, cc: Vec3) {
     const g = this.grids!
-    const p = this.pipes!
+    const p = this.solver!
     run(pass, p.vortBefore, g.bg.vortBefore, cc)
     run(pass, p.advFwd, g.bg.vortAdvect, cc)
     if (this.velScheme() === 'mac') run(pass, p.advBwd, g.bg.vortBack, cc)
@@ -2099,7 +2172,7 @@ export class PyroEngine {
   // uniforms set for each.
   private resumFireNow() {
     const g = this.grids!
-    const p = this.pipes!
+    const p = this.solver!
     const [nx, ny, nz] = g.n
     for (let k = 1; k <= ESCAPE_PHASES; k++) {
       this.device.queue.writeBuffer(this.simBuf, 12, new Uint32Array([this.frame + k]))
@@ -2212,6 +2285,7 @@ export class PyroEngine {
     const screen = this.canvasTexture()
     if (!screen) return
     const g = this.grids!
+    const f = g.frame!
     const p = this.pipes!
     this.needsRender = false
     this.writeRender()
@@ -2231,22 +2305,22 @@ export class PyroEngine {
     if (this.lightDirty) {
       const pass = enc.beginComputePass()
       pass.setPipeline(p.light)
-      pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.light : g.bg.light)
+      pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.light : f.light)
       pass.dispatchWorkgroups(Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4))
       pass.setPipeline(p.flameNear)
-      pass.setBindGroup(0, g.bg.flameNear)
+      pass.setBindGroup(0, f.flameNear)
       pass.dispatchWorkgroups(Math.ceil(g.nearDims[0] / 4), Math.ceil(g.nearDims[1] / 4), Math.ceil(g.nearDims[2] / 4))
       pass.setPipeline(p.floorNear)
-      pass.setBindGroup(0, g.bg.floorNear)
+      pass.setBindGroup(0, f.floorNear)
       pass.dispatchWorkgroups(Math.ceil(g.n[0] / 8), Math.ceil(g.n[2] / 8))
       if (this.state.background === 'gray' || this.state.background === 'charcoal') {
         const cg: [number, number] = [Math.ceil(CYC_MAP.w / 8), Math.ceil(CYC_MAP.h / 8)]
         pass.setPipeline(p.cycDirect)
-        pass.setBindGroup(0, g.bg.cycDirect)
+        pass.setBindGroup(0, f.cycDirect)
         pass.dispatchWorkgroups(...cg)
         pass.setPipeline(p.cycBounce)
         for (const k of [0, 1]) {
-          pass.setBindGroup(0, g.bg.cycBounce[k])
+          pass.setBindGroup(0, f.cycBounce[k])
           pass.dispatchWorkgroups(...cg)
         }
       }
@@ -2257,7 +2331,7 @@ export class PyroEngine {
       colorAttachments: [{ view: t.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
     })
     pass.setPipeline(p.render)
-    pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.render : g.bg.render)
+    pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.render : f.render)
     pass.draw(3)
     pass.end()
     this.post(enc, screen, t)
@@ -2795,14 +2869,14 @@ export class PyroEngine {
       one(p.fireTotal, g.bg.fireTotal, [1 + FIRE_BANDS, 1, 1])(pass)
     })
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
-    timed('light', one(p.light, this.upresActive() && this.upres ? this.upres.light : g.bg.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
-    timed('flameNear', one(p.flameNear, g.bg.flameNear, [Math.ceil(g.nearDims[0] / 4), Math.ceil(g.nearDims[1] / 4), Math.ceil(g.nearDims[2] / 4)]))
-    timed('floorNear', one(p.floorNear, g.bg.floorNear, [Math.ceil(g.n[0] / 8), Math.ceil(g.n[2] / 8), 1]))
+    timed('light', one(p.light, this.upresActive() && this.upres ? this.upres.light : g.frame!.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
+    timed('flameNear', one(p.flameNear, g.frame!.flameNear, [Math.ceil(g.nearDims[0] / 4), Math.ceil(g.nearDims[1] / 4), Math.ceil(g.nearDims[2] / 4)]))
+    timed('floorNear', one(p.floorNear, g.frame!.floorNear, [Math.ceil(g.n[0] / 8), Math.ceil(g.n[2] / 8), 1]))
     timed('cyc', pass => {
       const cg: [number, number, number] = [Math.ceil(CYC_MAP.w / 8), Math.ceil(CYC_MAP.h / 8), 1]
-      one(p.cycDirect, g.bg.cycDirect, cg)(pass)
-      one(p.cycBounce, g.bg.cycBounce[0], cg)(pass)
-      one(p.cycBounce, g.bg.cycBounce[1], cg)(pass)
+      one(p.cycDirect, g.frame!.cycDirect, cg)(pass)
+      one(p.cycBounce, g.frame!.cycBounce[0], cg)(pass)
+      one(p.cycBounce, g.frame!.cycBounce[1], cg)(pass)
     })
     const k = labels.length
     labels.push('render')
@@ -2812,7 +2886,7 @@ export class PyroEngine {
       timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 },
     })
     rp.setPipeline(p.render)
-    rp.setBindGroup(0, g.bg.render)
+    rp.setBindGroup(0, g.frame!.render)
     rp.draw(3)
     rp.end()
     labels.push('accumulate')

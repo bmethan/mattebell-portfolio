@@ -373,6 +373,12 @@ interface Warm {
   lost: boolean
 }
 let warm: Promise<Warm | null> | null = null
+// Set once an engine has started: from then on there is nothing to make ahead. (The Lab's timer, armed while the page
+// rests on it, could fire after a click on Pyro had started an engine, which takes warm and compiles its own when there
+// is none: a second warm-up then compiled every pipeline again on a second device, alongside the engine's, and the
+// two shared the browser's compiling threads. A visitor who clicked Pyro half a second after reaching the Lab waited
+// 11.8 s for the solver, its image pass taking 8 to 11 s to compile instead of about 3.5.)
+let engineStarted = false
 
 async function requestDevice(): Promise<{ adapter: GPUAdapter; device: GPUDevice } | null> {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
@@ -489,7 +495,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat): Promise<Pip
 }
 
 export function prewarmPyro() {
-  if (warm || typeof navigator === 'undefined' || !navigator.gpu) return
+  if (warm || engineStarted || typeof navigator === 'undefined' || !navigator.gpu) return
   warm = (async () => {
     try {
       const got = await requestDevice()
@@ -534,6 +540,7 @@ export class PyroEngine {
       // device the other destroys when it is thrown away.
       const pending = warm
       warm = null
+      engineStarted = true
       const ahead = pending ? await pending : null
       const got = ahead && !ahead.lost ? ahead : await requestDevice()
       if (!got) {

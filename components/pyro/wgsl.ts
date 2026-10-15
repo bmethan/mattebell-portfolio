@@ -4119,8 +4119,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let ro = R.camPos.xyz;
   let frame = R.camRight.w;
   let jitter = jitterAt(fc.xy, frame);
-  // The ray's moment within the shutter (the motion blur): blue noise of its own, apart from the march's offset, so
-  // where the flow along the ray matches the step the two do not land every pixel on the same points.
+  // The ray's moment within the shutter (the motion blur, in a paused frame only: the engine opens no shutter while
+  // the fire runs): blue noise of its own, apart from the march's offset, so where the flow along the ray matches the
+  // step the two do not land every pixel on the same points.
   let shutterTau = (jitterAt(fc.xy + vec2<f32>(32.0, 32.0), frame) - 0.5) * R.camera.x;
 
   // The stage under and behind the fire: the floor's plane, or the cyc (and the normal where the ray meets it).
@@ -4187,20 +4188,19 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           T *= tf;
         }
       }
-      // Motion blur: the gas that was here at a moment within the shutter, carried back along the flow. Paused, the
-      // ray's moment, one for all its samples (a different one each pixel and frame, which the accumulation averages):
+      // Motion blur (paused): the gas that was here at the ray's moment within the shutter, carried back along the
+      // flow, one moment for all its samples (a different one each pixel and frame, which the accumulation averages):
       // a sheet of soot that moves across the ray covers it for part of the shutter, as the path-traced reference's
       // paths (a moment each) find it; with a moment for each sample it dimmed the light behind it at every sample
-      // instead, and the moving flames came out a tenth to two fifths off the reference's where they move most. While
-      // the fire runs, each sample's own moment, stratified along the ray: one moment a ray shifts all the flames the
-      // ray sees at once, a grain clumped a few pixels across that the running accumulation, its history giving way
-      // to the moving flames, kept as speckle all over them (twice the grain of a moment a sample, on the bonfire as
-      // the lab opens; accumulated, the two differ by 2% on average). (The velocity in one lookup: each component
-      // lives on its own faces, a quarter cell either way of where this reads it, near enough for a blur.)
+      // instead, and the moving flames came out a tenth to two fifths off the reference's where they move most.
+      // (While the fire runs there is none: a moment a ray there left a grain clumped a few pixels across, and a moment
+      // a sample a finer one, both kept by the running accumulation as its history gives way to the moving flames.)
+      // (The velocity in one lookup: each component lives on its own faces, a quarter cell either way of where this
+      // reads it, near enough for a blur.)
       var wm = w;
       if (R.camera.x > 0.0) {
         let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
-        wm = w - u * select((fract(jitter + f32(i) * 0.618034) - 0.5) * R.camera.x, shutterTau, R.camera.w > 0.5);
+        wm = w - u * shutterTau;
       }
       let uvm = uvwOf(wm);
       let s4 = scalSmooth(uvm);

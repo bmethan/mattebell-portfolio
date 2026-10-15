@@ -1949,8 +1949,12 @@ export class PyroEngine {
     r.set(envData, 60)
     r.set(rim, 100)
     // The camera: a film camera's shutter at 24 frames a second (180 degrees is open 1/48 s), the glare's share and
-    // levels, and whether the frame is paused (the motion blur's moments: one a ray paused, one a sample running).
-    r.set([(s.shutter / 360) / 24, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, this.paused ? 1 : 0], 108)
+    // levels, and whether the frame is paused. The motion blur only paused, a moment of the shutter a ray, which the
+    // paused frame's accumulation converges over. While the fire runs, the few frames the history holds of a moment are
+    // too few to average the shutter over: at a moment a sample, the largest share of the moving flames' grain (the
+    // running bonfire on an integrated GPU, at its half render scale: 0.0075 with it, 0.0047 without; the subgrid
+    // temperature's share 0.0006).
+    r.set([this.paused ? (s.shutter / 360) / 24 : 0, s.glare, this.targets?.glareViews.length ?? GLARE_LEVELS, this.paused ? 1 : 0], 108)
     this.device.queue.writeBuffer(this.renderBuf, 0, r)
     // The reference set is the simulation's (a solid in it), but turned on or off it shows at once, paused or not.
     this.device.queue.writeBuffer(this.simBuf, 256, new Float32Array(this.referenceSet(s)))

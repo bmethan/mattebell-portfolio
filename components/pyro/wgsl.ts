@@ -2067,13 +2067,14 @@ fn t4(t: f32) -> f32 { let t2 = t * t; return t2 * t2; }
 // early wood, and the whole ball varies a little from patch to patch: where it is lighter its surface heats faster and
 // catches sooner, so the burning front climbs raggedly, along the grain, rather than in a level line (Scots pine's late
 // wood is some 1.41 times its rings' mean density and its early wood 0.77; Fernandes et al. 2017). Each column takes the
-// density where it meets the surface, its conductivity in proportion (as wood's is; Wood Handbook ch. 4).
+// density where it meets the surface, its conductivity in proportion (as wood's is; Wood Handbook ch. 4), scaled to a
+// mean of 1 over the ball (0.98 unscaled, over its columns).
 fn woodDensity(n: vec3<f32>) -> f32 {
   let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
   let wave = textureSampleLevel(noiseTex, noiseSamp, n * 0.3 + 0.5, 0.0).x - 0.5;
   let ring = fract(length(n - dot(n, axis) * axis) * 16.0 + 0.6 * wave);
   let late = smoothstep(0.5, 0.8, ring) * (1.0 - smoothstep(0.85, 1.0, ring));
-  return mix(0.77, 1.41, late) * (0.85 + 0.3 * fbm(n * 3.0 + 11.0));
+  return mix(0.77, 1.41, late) * (0.85 + 0.3 * fbm(n * 3.0 + 11.0)) / 0.98;
 }
 fn burning(m: f32) -> f32 { return m * smoothstep(0.0015, 0.0025, m); }
 // The layers, by depth below the surface as the ball was made (m): GRADED of them from DZ0 thick, each GROW times the
@@ -2114,10 +2115,13 @@ var<private> colOx: f32; // the char burning off the surface this step, kg per m
 var<private> sumFuel: f32;
 var<private> sumChar: f32;
 var<private> sumAsh: f32;
-struct Cell { t: f32, c: f32, rHalf: f32, rhs: f32 }
+struct Cell { t: f32, c: f32, rHalf: f32, rhs: f32, side: f32 }
 // One cell's step, per square metre of the surface as made: its water and wood react at its temperature, and the
 // heat that takes and the heat coming in from beside it go into its balance; its heat capacity, and its half of the
-// resistance to the cells above and below it.
+// resistance to the cells above and below it. The heat from beside it is taken between its neighbours' temperatures at
+// the step's start and its own at the step's end (side, the conductance to them, goes with its heat capacity), which is
+// stable at any step: deep in, the columns narrow, and with the time-lapse's long steps heat from beside a cell taken
+// wholly at the step's start ran away there.
 fn cellStep(k: u32, surface: bool) -> Cell {
   let idx = k * SKIN_TEXELS + colT;
   let t = clamp(temps[colRead + idx], 250.0, 2500.0);
@@ -2142,8 +2146,9 @@ fn cellStep(k: u32, surface: bool) -> Cell {
   // From the four columns beside it (an empty cell, at 0, passes nothing).
   let at = colRead + k * SKIN_TEXELS;
   let tn = vec4<f32>(temps[at + colNb.x], temps[at + colNb.y], temps[at + colNb.z], temps[at + colNb.w]);
-  let side = dot(select(vec4<f32>(0.0), tn - t, tn > vec4<f32>(1.0)), vec4<f32>(1.0))
-    * (fc * kChar(t) + (1.0 - fc) * kWood(t) * colDens * colLat) * phi * h * colSide;
+  let open = select(vec4<f32>(0.0), vec4<f32>(1.0), tn > vec4<f32>(1.0));
+  let g = (fc * kChar(t) + (1.0 - fc) * kWood(t) * colDens * colLat) * phi * h * colSide;
+  let side = g * dot(open, vec4<f32>(1.0));
   var c1 = m.y + CHAR_YIELD * dWood;
   var a1 = m.w;
   if (surface && colOx > 0.0) {
@@ -2155,7 +2160,7 @@ fn cellStep(k: u32, surface: bool) -> Cell {
   sumFuel += m0 * (1.0 - CHAR_YIELD) * dWood / dt;
   sumChar += min(c1 / CHAR_YIELD, 1.0 - w1) * h;
   sumAsh += a1 * m0;
-  return Cell(t, heat, rHalf, heat / dt * t + side - m0 * (dWood * H_PYRO + dWater * MOISTURE * L_EVAP) / dt);
+  return Cell(t, heat, rHalf, heat / dt * t + g * dot(open, tn) - m0 * (dWood * H_PYRO + dWater * MOISTURE * L_EVAP) / dt, side);
 }
 fn fillOf(m: vec4<f32>) -> f32 { return min(m.x + m.y / CHAR_YIELD, 1.0); }
 
@@ -2239,11 +2244,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var hConv = H_CONV;
   var o2 = 1.0;
   var eps = mix(0.9, 0.838, smoothstep(0.0, 0.3, prev.z));
-  if (P.detail.w > 0.0) {
-    // (Development: a radiant flux of P.detail.w W/m2 on the whole ball in still air, as a cone calorimeter heats a
-    // sample; its own flame takes the oxygen once the wood gives off enough to burn.)
-    qIn = P.detail.w + SIGMA * t4(T_AMB);
-    o2 = select(1.0, 0.0, prev.y > 0.0025);
+  if (P.detail.w > 0.0 || P.detail.w <= -10.0) {
+    // (Development: a radiant flux of |P.detail.w| W/m2 on the whole ball in still air, as a cone calorimeter heats a
+    // sample: positive, the sample flaming (its flame takes the oxygen); negative, with its flame out, the char in air.)
+    qIn = abs(P.detail.w) + SIGMA * t4(T_AMB);
+    o2 = select(1.0, 0.0, P.detail.w > 0.0);
   } else if (P.detail.w < 0.0) {
     // (Development: the standard fire of fire-resistance furnaces, ISO 834, P.forces.y seconds in; convection 25
     // W/(m2 K) and the surface's emissivity 0.8, as Eurocode 1 takes them, and some 6% oxygen.)
@@ -2313,9 +2318,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     tGas = T_AMB + near.rise;
     o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
   }
-  // The char burning where it is bare, at last step's surface temperature.
+  // The char burning where it is bare, at last step's surface temperature: at the measured rate (measured in a cone
+  // calorimeter's still air, so with the oxygen reaching it there), but no faster than oxygen reaches the surface.
+  // Oxygen reaches it as heat does (the analogy of heat and mass transfer: h / cp kg per m2 a second, times its mass
+  // fraction), and burns half its mass of carbon (between carbon dioxide's 0.375 and carbon monoxide's 0.75): in still
+  // air, about a gram per m2 a second, which is what the measurement levels off at above 600 C, and what holds char in
+  // a furnace's hot gas, with its few percent of oxygen, to a burning its chemistry alone would run several times
+  // faster.
   let tsPrev = cA.y;
-  let burnRate = 0.248 * exp(-39784.0 / (RG * tsPrev)) * pow(o2, 0.68) * smoothstep(0.05, 0.3, prev.z);
+  let byRate = 0.248 * exp(-39784.0 / (RG * tsPrev)) * pow(o2, 0.68);
+  let byOxygen = hConv / 1200.0 * Y_O2_AIR * o2 * 0.5;
+  let burnRate = min(byRate, byOxygen) * smoothstep(0.05, 0.3, prev.z);
   colOx = burnRate * areaS * dt;
   // The surface's balance, its own radiation linearised about last step's temperature: q0 - lam Ts.
   let lam = hConv + 4.0 * eps * SIGMA * tsPrev * tsPrev * tsPrev;
@@ -2343,7 +2356,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var dpUp = 0.0;
   for (var k = s; k <= last; k++) {
     var gDn = 0.0;
-    var b = cur.c / dt + gUp;
+    var b = cur.c / dt + cur.side + gUp;
     var d = cur.rhs;
     if (k == s) {
       b += gEff;
@@ -2387,23 +2400,32 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     tn = dp[k - s] - cp[k - s] * tn;
   }
   let tTop = tn;
-  // The cells below, explicitly, from this step's start.
+  // The cells below, one by one down the column: each between the new temperature of the cell above it and the
+  // step's start's of the cell below, its own at the step's end (stable at any step, as the time-lapse needs).
   if (last < reach) {
     var above = cur;
+    var tAbove = dp[last - s];
     cur = below;
     for (var j = last + 1u; j <= reach; j++) {
-      var flow = (above.t - cur.t) / (above.rHalf + cur.rHalf);
+      let gA = 1.0 / (above.rHalf + cur.rHalf);
+      var flow = gA * tAbove;
+      var gSum = gA;
       var next = cur;
       if (j < reach) {
         next = cellStep(j + 1u, false);
-        flow += (next.t - cur.t) / (cur.rHalf + next.rHalf);
+        let gB = 1.0 / (cur.rHalf + next.rHalf);
+        flow += gB * next.t;
+        gSum += gB;
       } else if (j + 1u < WOOD_LAYERS) {
         let tb = temps[colRead + (j + 1u) * SKIN_TEXELS + t];
         let hb = layerThick(j + 1u, r);
         let mb = (r - layerTop(j + 1u, r) - 0.5 * hb) / r;
-        flow += (tb - cur.t) / (cur.rHalf + 0.5 * hb / (kWood(tb) * colDens * colRad * mb * mb));
+        let gB = 1.0 / (cur.rHalf + 0.5 * hb / (kWood(tb) * colDens * colRad * mb * mb));
+        flow += gB * tb;
+        gSum += gB;
       }
-      let tj = (cur.rhs + flow) * dt / cur.c;
+      let tj = (cur.rhs + flow) / (cur.c / dt + cur.side + gSum);
+      tAbove = tj;
       temps[write + j * SKIN_TEXELS + t] = tj;
       if (tj > T_AMB + 0.5) { warm = j; }
       let start = layerTop(j, r) - worn;
@@ -3408,8 +3430,10 @@ fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> vec3<f32> {
   let ring = fract(length(lp - dot(lp, axis) * axis) * 16.0 + 0.6 * wave);
   let late = smoothstep(0.5, 0.8, ring) * (1.0 - smoothstep(0.85, 1.0, ring));
   var a = mix(vec3<f32>(0.62, 0.45, 0.27), vec3<f32>(0.53, 0.36, 0.2), late);
-  a = mix(a, vec3<f32>(0.16, 0.07, 0.03), smoothstep(0.0, 0.1, sk.z));
-  a = mix(a, vec3<f32>(0.035, 0.03, 0.028), smoothstep(0.1, 0.7, sk.z));
+  // (The char's depth is the converted wood's, summed through the cells: a hundredth of a millimetre is the surface's
+  // thinnest cell a fiftieth converted, which browns wood, and it is black once that cell is most of the way to char.)
+  a = mix(a, vec3<f32>(0.16, 0.07, 0.03), smoothstep(0.0, 0.02, sk.z));
+  a = mix(a, vec3<f32>(0.035, 0.03, 0.028), smoothstep(0.03, 0.4, sk.z));
   let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
   return REC709_TO_AP1 * mix(a, vec3<f32>(0.42, 0.41, 0.39), sk.w * mix(0.55, 1.0, plates) * (1.0 - crack));
 }
@@ -3432,7 +3456,7 @@ struct BallMat {
   fuzzRough: f32,
 }
 fn ballMat(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> BallMat {
-  let charred = smoothstep(0.1, 0.7, sk.z);
+  let charred = smoothstep(0.03, 0.4, sk.z);
   let ior = mix(1.5, 1.9, charred);
   let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
   let ash = sk.w * mix(0.55, 1.0, plates) * (1.0 - crack);

@@ -2677,15 +2677,16 @@ export class PyroEngine {
 
   // Development: one column of the wooden ball's wood, the one under the surface facing dir (from the ball's centre):
   // each cell's depth below the surface as made (mm), thickness (mm), temperature (K), wood left, char, water left and
-  // ash; and the skin there (surface temperature K, volatiles kg/m2/s, char depth mm, ash cover) and the rest of the
-  // surface (fuel flow up it, wear mm, char halfway down and at its base K).
+  // ash; the skin there (surface temperature K, volatiles kg/m2/s, char depth mm, ash cover), the rest of the surface
+  // (fuel flow up it, wear mm, char halfway down and at its base K), and the column's grain (its wood's density against
+  // the mean) and the share of it under cracks.
   async readWood(dir: Vec3 = [0, 0, 1]) {
     if (!this.grids) return null
     const g = this.grids
     const d = this.device
     const t = skinTexel(dir)
     const half = this.woodParity
-    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 48, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
     for (let k = 0; k < WOOD_LAYERS; k++) {
       enc.copyBufferToBuffer(g.woodTemps, (half * WOOD_CELLS + k * SKIN_TEXELS + t) * 4, read, k * 4, 4)
@@ -2693,6 +2694,7 @@ export class PyroEngine {
     }
     enc.copyBufferToBuffer(g.skin, t * 16, read, WOOD_LAYERS * 20, 16)
     enc.copyBufferToBuffer(g.ballSheet, t * 16, read, WOOD_LAYERS * 20 + 16, 16)
+    enc.copyBufferToBuffer(g.woodCols, ((half * SKIN_TEXELS + t) * 2 + 1) * 16, read, WOOD_LAYERS * 20 + 32, 16)
     d.queue.submit([enc.finish()])
     await read.mapAsync(GPUMapMode.READ)
     const a = new Float32Array(read.getMappedRange().slice(0))
@@ -2705,6 +2707,8 @@ export class PyroEngine {
       clock: this.woodClock,
       skin: Array.from(a.slice(WOOD_LAYERS * 5, WOOD_LAYERS * 5 + 4)),
       sheet: Array.from(a.slice(WOOD_LAYERS * 5 + 4, WOOD_LAYERS * 5 + 8)),
+      density: a[WOOD_LAYERS * 5 + 8],
+      cracks: a[WOOD_LAYERS * 5 + 9],
       cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
     }
   }

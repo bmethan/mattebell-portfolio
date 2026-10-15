@@ -2869,6 +2869,82 @@ export class PyroEngine {
 
   // Development probe: the scalar fields (soot, temperature, reaction, flame) up the vertical line through the source.
   // For validation: run exactly `steps` simulation steps now (whether or not paused), then wait for the GPU.
+  // For the device check: the values the frame and the light textures could not hold. Over the current frame and each
+  // light texture, the texels holding a value that is not finite (infinity or NaN: a store past half floats' ceiling on
+  // a GPU that does not clamp it, or a division gone wrong) and those held at the ceiling (65504), read by their bits so
+  // no shader compiler can fold the test away.
+  private checkPipes: { p2: GPUComputePipeline; p3: GPUComputePipeline } | null = null
+  async checkValues(): Promise<{ frame: number; textures: number; ceiling: number; where: string[] } | null> {
+    const g = this.grids
+    const t = this.targets
+    if (!g || !t) return null
+    const d = this.device
+    const code = (three: boolean) => `
+@group(0) @binding(0) var tex: ${three ? 'texture_3d<f32>' : 'texture_2d<f32>'};
+@group(0) @binding(1) var<storage, read_write> count: array<atomic<u32>, 2>;
+@compute @workgroup_size(${three ? '4, 4, 4' : '8, 8'})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let n = textureDimensions(tex);
+  if (any(${three ? 'id' : 'id.xy'} >= n)) { return; }
+  let v = textureLoad(tex, ${three ? 'vec3<i32>(id)' : 'vec2<i32>(id.xy)'}, 0);
+  var bad = false;
+  var high = false;
+  for (var c = 0u; c < 4u; c++) {
+    let b = bitcast<u32>(v[c]);
+    if ((b & 0x7f800000u) == 0x7f800000u) { bad = true; } else if (abs(v[c]) >= 65504.0) { high = true; }
+  }
+  if (bad) { atomicAdd(&count[0], 1u); }
+  if (high) { atomicAdd(&count[1], 1u); }
+}`
+    if (!this.checkPipes) {
+      const make = (three: boolean) => d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code: code(three) }), entryPoint: 'main' } })
+      this.checkPipes = { p2: await make(false), p3: await make(true) }
+    }
+    const list: [string, GPUTexture][] = [
+      ['frame', t.hdr],
+      ['emitted light', g.emit],
+      ["flames' near light", g.flameNear],
+      ['its direction', g.flameNearDir],
+      ["floor's near light", g.floorNear],
+      ['light volume', g.light],
+      ['light volume (rim, dome, floor)', g.light2],
+      ["cyc's direct light", g.cycDirect],
+      ["cyc's bounce", g.cycBounce[0]],
+    ]
+    const STRIDE = 256 // (storage bindings start at multiples of 256)
+    const counts = d.createBuffer({ size: STRIDE * list.length, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const read = d.createBuffer({ size: STRIDE * list.length, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    const pass = enc.beginComputePass()
+    list.forEach(([, tex], i) => {
+      const three = tex.dimension === '3d'
+      const pipe = three ? this.checkPipes!.p3 : this.checkPipes!.p2
+      pass.setPipeline(pipe)
+      pass.setBindGroup(0, d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: tex.createView() }, { binding: 1, resource: { buffer: counts, offset: STRIDE * i, size: 8 } }] }))
+      if (three) pass.dispatchWorkgroups(Math.ceil(tex.width / 4), Math.ceil(tex.height / 4), Math.ceil(tex.depthOrArrayLayers / 4))
+      else pass.dispatchWorkgroups(Math.ceil(tex.width / 8), Math.ceil(tex.height / 8))
+    })
+    pass.end()
+    enc.copyBufferToBuffer(counts, 0, read, 0, STRIDE * list.length)
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const u = new Uint32Array(read.getMappedRange().slice(0))
+    read.unmap()
+    read.destroy()
+    counts.destroy()
+    let textures = 0
+    let ceiling = 0
+    const where: string[] = []
+    list.forEach(([name], i) => {
+      const bad = u[(STRIDE / 4) * i]
+      const high = u[(STRIDE / 4) * i + 1]
+      if (i > 0) textures += bad
+      ceiling += high
+      if (bad) where.push(`${name} ${bad}`)
+    })
+    return { frame: u[0], textures, ceiling, where }
+  }
+
   async advance(steps: number): Promise<number> {
     if (!this.grids) return 0
     for (let i = 0; i < steps; i++) this.step()

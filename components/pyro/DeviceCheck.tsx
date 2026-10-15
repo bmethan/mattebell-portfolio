@@ -2,8 +2,10 @@
 
 // The lab's device check, shown only with ?check in the address: it runs each starting point for a few seconds, then
 // a smoke source on leapfrog flow maps and the wooden ball held in the fire, and writes a report to copy: the device,
-// what its GPU adapter offers, the steps and frames a second each case managed, and any WebGPU errors. For testing
-// the lab on phones, tablets and other computers; visitors never see it.
+// what its GPU adapter offers, the steps and frames a second each case managed, any WebGPU errors, and any values the
+// frame or the light textures could not hold (not finite, or held at half floats' ceiling: an iPad once drew an oil
+// fire's base teal from one, with no error to show for it). For testing the lab on phones, tablets and other
+// computers; visitors never see it.
 import { useState, type RefObject } from 'react'
 import type { PyroEngine, PyroStatus } from './engine'
 import { PRESETS, PYRO_DEFAULTS, type PyroState } from './params'
@@ -50,6 +52,7 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
       if (s) steps.push(s.stepsPerSec)
     }
     counting = false
+    const v = await e.checkValues().catch(() => null)
     const wall = (performance.now() - t0) / 1000
     steps.sort((a, b) => a - b)
     const s = statusRef.current
@@ -59,6 +62,7 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
       scale: s ? s.renderScale.toFixed(2) : '?',
       resolution: s ? `${s.resolution}${s.autoStepped ? ' (stepped down)' : ''}` : '?',
       errors: e.gpuErrors.length - errors0,
+      values: v,
     }
   }
 
@@ -78,20 +82,27 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
       lines.push(`Adapter: ${e.adapterName}`)
       lines.push(`Features: ${e.adapterFeatures.join(', ') || 'none listed'}`)
       lines.push(`Limits: ${Object.entries(e.adapterLimits).map(([k, v]) => `${k.replace(/^max/, '')} ${v}`).join(', ')}`)
-      lines.push('', 'Case | resolution | steps/s | frames/s | render scale | errors')
+      lines.push('', 'Case | resolution | steps/s | frames/s | render scale | errors | not finite (frame, light) | held at 65504')
       // Centred, clear of the sticky header, with the progress line below it in view.
       frameRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
       const cases: { name: string; state: Partial<PyroState> }[] = [
         ...PRESETS.map(p => ({ name: p.label, state: p.state })),
         { name: 'Smoke plume, flow maps', state: { ...PRESETS.find(p => p.id === 'plume')!.state, velocity: 'lfm' } },
       ]
+      let notFinite = 0
+      const badWhere = new Set<string>()
       for (const [i, c] of cases.entries()) {
         setProgress(`${i + 1} of ${cases.length + 1}: ${c.name}`)
         applyPreset({ ball: false, velocity: PYRO_DEFAULTS.velocity, ...c.state })
         ensureRunning()
         await sleep(WARM_S * 1000)
         const m = await measure(e)
-        lines.push(`${c.name} | ${m.resolution} | ${m.steps} | ${m.fps} | ${m.scale} | ${m.errors}`)
+        const v = m.values
+        if (v) {
+          notFinite += v.frame + v.textures
+          v.where.forEach(w => badWhere.add(`${c.name}: ${w}`))
+        }
+        lines.push(`${c.name} | ${m.resolution} | ${m.steps} | ${m.fps} | ${m.scale} | ${m.errors} | ${v ? `${v.frame}, ${v.textures}` : '?'} | ${v ? v.ceiling : '?'}`)
       }
       // The wooden ball held in the bonfire's flames until 12 simulated seconds (it catches at 6 to 8).
       setProgress(`${cases.length + 1} of ${cases.length + 1}: the wooden ball in the bonfire`)
@@ -110,6 +121,7 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
           : `Burning ball: no reading by ${(s?.simTime ?? 0).toFixed(1)} s`,
       )
       lines.push(`WebGPU errors in all: ${e.gpuErrors.length}${e.gpuErrors.length ? `; first: ${e.gpuErrors[0]}` : ''}`)
+      lines.push(`Values not finite in all: ${notFinite}${badWhere.size ? ` (${[...badWhere].slice(0, 6).join('; ')})` : ''}`)
     } finally {
       setProgress('')
       setReport(lines.join('\n'))

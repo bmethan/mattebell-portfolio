@@ -517,7 +517,7 @@ export default function PyroLab() {
         {mode === 'live' && shown && !calloutGone && !tracing && pyro.sourceType === 'fire' && pyro.ballBurns && (
           <div className="lab-callout" role="note">
             <p>
-              <b>New</b>The ball is wood. Hold it in the flames and it scorches, chars and catches fire.
+              <b>New</b>The ball is wood.<span className="lab-callout-more"> Hold it in the flames and it scorches, chars and catches fire.</span>
             </p>
             <div className="lab-callout-actions">
               <Pill on={false} onClick={tryBall}>

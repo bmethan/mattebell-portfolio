@@ -201,6 +201,15 @@ fn inSet(w: vec3<f32>, h: f32) -> bool {
 }`
 
 export const SIM_COMMON = /* wgsl */ `
+// Half floats top out at 65504. Past it, a value stored into a half-float texture becomes infinity on Apple's GPUs
+// (Metal) and the largest half on Direct3D, so every store of light into one is held to it (half16), and the light the
+// fire emits is kept at EMIT_SCALE (cd/m2 per m), well under it: the oil fire's brightest cells reached 85,000 in
+// thousandths. (Unclamped, an oil fire on an iPad drew its burning base teal: red, the largest share of the flames'
+// light, became infinite in the flames' own light pass.) The cyc's maps stay in lux, held to the ceiling as Direct3D
+// always held them: the floor right under a bonfire's bed takes some 580,000, which in full spread over the map's
+// coarse texels lit the wall and the smoke before it a few percent over the path-traced reference.
+const EMIT_SCALE = 1e-5;
+fn half16(v: vec4<f32>) -> vec4<f32> { return clamp(v, vec4<f32>(-65504.0), vec4<f32>(65504.0)); }
 struct Params {
   dims: vec4<u32>,      // nx, ny, nz, frame
   grid: vec4<f32>,      // dx (m), dt (s), time (s), whether the velocity is advected with MacCormack (0 or 1)
@@ -2469,7 +2478,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // Every cell gets its depths, smoke or not: the floor's shadow and sky lookups land in empty cells too.
   let tauSun = depth(w, R.sunDir.xyz, 1.5 * P.grid.x, false);
   let tauUp = depth(w, vec3<f32>(0.0, 1.0, 0.0), 2.0 * P.grid.x, false);
-  textureStore(lightOut, vec3<i32>(id), vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w, vec3<f32>(0.0))));
+  textureStore(lightOut, vec3<i32>(id), half16(vec4<f32>(tauSun, tauUp, occ, fireIrradiance(w, vec3<f32>(0.0)))));
   var tauRim = 0.0;
   if (R.rimDir.w > 0.5) { tauRim = depth(w, R.rimDir.xyz, 1.5 * P.grid.x, false); }
   // The sky's light through the smoke: the dome's mean transmittance (straight up and four ways at 30 degrees), kept as
@@ -2493,7 +2502,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let pf = vec3<f32>(w.x, 0.5 * P.grid.x, w.z);
     floorLit = vec2<f32>(max(R.sunDir.y, 0.0) * exp(-depth(pf, R.sunDir.xyz, 1.5 * P.grid.x, false)), fireOnFloor(vec3<f32>(w.x, 0.0, w.z)));
   }
-  textureStore(light2Out, vec3<i32>(id), vec4<f32>(tauRim, tauDome, floorLit));
+  textureStore(light2Out, vec3<i32>(id), half16(vec4<f32>(tauRim, tauDome, floorLit)));
 }
 `
 
@@ -3866,7 +3875,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let fireColour = select(vec3<f32>(0.0), fireLight[0].xyz / max(fireLight[0].w, 1e-12), fireLight[0].w > 0.0);
     e = surfaceDirect(pn[0], pn[1], chroma(), fireColour);
   }
-  textureStore(directOut, vec2<i32>(id.xy), vec4<f32>(e, 0.0));
+  textureStore(directOut, vec2<i32>(id.xy), half16(vec4<f32>(e, 0.0)));
 }
 `
 
@@ -3912,7 +3921,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     e *= R.floorCol.xyz / 32.0;
   }
-  textureStore(bounceOut, vec2<i32>(id.xy), vec4<f32>(e, 0.0));
+  textureStore(bounceOut, vec2<i32>(id.xy), half16(vec4<f32>(e, 0.0)));
 }
 `
 
@@ -4002,7 +4011,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (t > reach) { break; }
         let q = textureSampleLevel(emitTex, samp, uvwOf(w + d * t), 0.0);
         let a = exp(-q.w * ch * ds);
-        lk += tr * q.xyz * ds * select((vec3<f32>(1.0) - a) / max(-log(a), vec3<f32>(1e-6)), vec3<f32>(1.0), a > vec3<f32>(0.9999));
+        lk += tr * q.xyz * (1e-3 / EMIT_SCALE) * ds * select((vec3<f32>(1.0) - a) / max(-log(a), vec3<f32>(1e-6)), vec3<f32>(1.0), a > vec3<f32>(0.9999));
         tr *= a;
       }
       l += lk;
@@ -4036,8 +4045,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     out = vec4<f32>(l / f32(NEAR_N) + fireColour * far * INV_4PI * 1e-3, 1.0);
     mom = vec4<f32>(dip / f32(NEAR_N) + dfar * shade * ap1Lum(fireColour) * INV_4PI * 1e-3, ap1Lum(out.xyz));
   }
-  textureStore(nearOut, vec3<i32>(id), out);
-  textureStore(nearDirOut, vec3<i32>(id), mom);
+  textureStore(nearOut, vec3<i32>(id), half16(out));
+  textureStore(nearDirOut, vec3<i32>(id), half16(mom));
 }
 `
 
@@ -4087,13 +4096,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (t > reach) { break; }
         let q = textureSampleLevel(emitTex, samp, uvwOf(pf + d * t), 0.0);
         let a = exp(-q.w * ch * ds);
-        e += tr * q.xyz * ds * select((vec3<f32>(1.0) - a) / max(-log(a), vec3<f32>(1e-6)), vec3<f32>(1.0), a > vec3<f32>(0.9999));
+        e += tr * q.xyz * (1e-3 / EMIT_SCALE) * ds * select((vec3<f32>(1.0) - a) / max(-log(a), vec3<f32>(1e-6)), vec3<f32>(1.0), a > vec3<f32>(0.9999));
         tr *= a;
       }
     }
     fl = vec4<f32>(e * 3.14159265 / f32(FLOOR_N), 1.0);
   }
-  textureStore(floorOut, vec2<i32>(id.xy), fl);
+  textureStore(floorOut, vec2<i32>(id.xy), half16(fl));
 }
 `
 
@@ -4285,7 +4294,7 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   }
 
   // Exposed (as a fraction of the luminance the camera maps to white), for the accumulation pass.
-  return vec4<f32>(col * R.camUp.w, 1.0);
+  return half16(vec4<f32>(col * R.camUp.w, 1.0));
 }
 `
 
@@ -4297,7 +4306,7 @@ export const FIRE_SUM = /* wgsl */ `
 ${RENDER_LIB}
 @group(0) @binding(40) var<storage, read_write> partial: array<vec4<f32>>;
 @group(0) @binding(41) var<storage, read> hrr: array<f32>;
-@group(0) @binding(42) var emitOut: texture_storage_3d<rgba16float, write>; // each cell's glow and flame light per metre as drawn (k cd/m2 per m), and its extinction (1/m): FLAME_NEAR
+@group(0) @binding(42) var emitOut: texture_storage_3d<rgba16float, write>; // each cell's glow and flame light per metre as drawn (cd/m2 per m, times EMIT_SCALE), and its extinction (1/m): FLAME_NEAR
 var<workgroup> sumE: array<vec4<f32>, 64>;
 var<workgroup> sumP: array<vec4<f32>, 64>;
 var<workgroup> sumB: array<vec4<f32>, 64>;
@@ -4355,7 +4364,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     b = vec4<f32>(bed, hrr[cellIndex(c)] * vol, 0.0, 0.0);
   }
   let lum = ap1Lum(e);
-  if (all(c < nCells())) { textureStore(emitOut, c, vec4<f32>(e * 1e-3, sg)); }
+  if (all(c < nCells())) { textureStore(emitOut, c, half16(vec4<f32>(e * EMIT_SCALE, sg))); }
   // This step's share of the table, k = ESCAPE_PHASES j + phase: j 0..3, then 4..6 and the light of the cells marched.
   let phase = P.dims.w % ESCAPE_PHASES;
   var x0 = vec4<f32>(0.0);
@@ -4926,7 +4935,7 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let p = vec2<i32>(fc.xy);
   if (fc.x < W.x) { return textureLoad(live, p, 0); }
-  return vec4<f32>(textureLoad(traced, p, 0).xyz, 1.0);
+  return vec4<f32>(min(textureLoad(traced, p, 0).xyz, vec3<f32>(65504.0)), 1.0); // (held to half floats' ceiling, as half16)
 }
 `
 

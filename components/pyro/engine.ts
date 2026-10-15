@@ -1,11 +1,12 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_N, SKIN_TEXELS, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR, WOOD_CELLS, WOOD_LAYERS } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
 import { writeVdb, type VdbGrid } from './vdb'
+import { skinSolidAngles, skinTexel, woodLayers } from './wood'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 import { REC709_TO_AP1, ap1Luminance, loadAcesLutGPU, mat3Apply, viewIndex } from '../lab/viewTransforms'
 import { BACKDROP_H, BACKDROP_W, environmentLight, shBasis, type EnvLight } from './environment'
@@ -269,9 +270,14 @@ interface Grids {
   hrr: GPUBuffer // heat release rate per cell, W/m3
   ratio: GPUBuffer // a fire's mass-keeping ratios (readable for development checks)
   spread: GPUBuffer // a fire's mass keeping: the volume over which each cell's gas was spread (fixed point)
-  skin: GPUBuffer // the wooden ball's skin (SKIN_W x SKIN_H texels, four floats each), and its next step
+  skin: GPUBuffer // the wooden ball's skin (SKIN_TEXELS texels, four floats each), and its next step
   skinNext: GPUBuffer
-  ballSheet: GPUBuffer // the fuel flowing up the burning ball's surface, per skin texel
+  ballSheet: GPUBuffer // the rest of the burning ball's surface, per skin texel (four floats: the fuel flowing up it, ...)
+  // The wood beneath the skin (BALL_HEAT): its cells' temperatures (this step's and the next's), their wood, char,
+  // water and ash, and each column's state (this step's and the next's).
+  woodTemps: GPUBuffer
+  woodCells: GPUBuffer
+  woodCols: GPUBuffer
   flame: GPUTexture // a fire's heat release rate per cell (MW/m3), for the renderer
   // IVOCK: the three components of the vector potential, each with its own finest multigrid level.
   // BiMocq2: the maps (the backward one's current level, ping-ponged; its previous level; the forward one,
@@ -604,6 +610,13 @@ export class PyroEngine {
   private lfmStep = 0
   private lfmWas = false
   private readingBall = false
+  // The wood (BALL_HEAT): which half of its temperatures holds this step's, its clock (s), how many times faster than the
+  // gas it runs (1 live), and, for development tests, the exposure it takes instead of the fire's (0: the fire; W/m2 of
+  // radiant flux; -1: the standard furnace fire).
+  private woodParity = 0
+  private woodClock = 0
+  woodSpeed = 1
+  woodTest = 0
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
   private fireResum = false // (paused: the fire's sums marched afresh before the next frame's light: resumFireNow)
@@ -1037,12 +1050,17 @@ export class PyroEngine {
     const spread = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
     const ratio = d.createBuffer({ size: cells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     buffers.push(fireLight, hrr, spread, ratio)
-    // The wooden ball's skin, fresh wood at the air's temperature, and the buffer its heating step writes.
-    const skinBytes = SKIN_W * SKIN_H * 16
+    // The wooden ball's skin, fresh wood at the air's temperature, and the buffer its heating step writes; and the wood
+    // beneath it (some 24 MB), cleared on a new ball (resetSkin).
+    const skinBytes = SKIN_TEXELS * 16
     const skin = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
     const skinNext = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
-    const ballSheet = d.createBuffer({ size: SKIN_W * SKIN_H * 4, usage: GPUBufferUsage.STORAGE })
-    buffers.push(skin, skinNext, ballSheet)
+    const ballSheet = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
+    const woodUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    const woodTemps = d.createBuffer({ size: 2 * WOOD_CELLS * 4, usage: woodUsage })
+    const woodCells = d.createBuffer({ size: WOOD_CELLS * 16, usage: woodUsage })
+    const woodCols = d.createBuffer({ size: 2 * SKIN_TEXELS * 32, usage: woodUsage })
+    buffers.push(skin, skinNext, ballSheet, woodTemps, woodCells, woodCols)
     // The kernels that read the skin (binding 31: the ball's volatiles feed the fire, and the renderer draws it).
     const withSkin = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[], extra: GPUBindGroupEntry[] = []) =>
       d.createBindGroup({
@@ -1070,6 +1088,9 @@ export class PyroEngine {
       skin,
       skinNext,
       ballSheet,
+      woodTemps,
+      woodCells,
+      woodCols,
       flame,
       bimocq,
       ivockRhs,
@@ -1124,7 +1145,7 @@ export class PyroEngine {
         combine: withSkin(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }, v(flame)]),
         conserveSpread: group(p.conserveSpread, [P, s, v(vel[0]), { buffer: spread }]),
         conserveRatio: withSkin(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
-        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler]),
+        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: d.createBindGroup({
@@ -1215,7 +1236,8 @@ export class PyroEngine {
       this.makeGrids()
       this.layoutCamera()
     }
-    if ((this.state.ball && !prev.ball) || (this.state.ballBurns && !prev.ballBurns)) this.resetSkin()
+    // (A ball of another size is a new ball: its cells are laid out by its radius.)
+    if ((this.state.ball && !prev.ball) || (this.state.ballBurns && !prev.ballBurns) || this.state.ballRadius !== prev.ballRadius) this.resetSkin()
     if (this.state.env !== prev.env) this.syncEnv()
     // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh (traced too).
     this.stateVersion++
@@ -1485,14 +1507,15 @@ export class PyroEngine {
     const bimNow = this.bimocqOn()
     if (bimNow) this.bimocqBegin(enc)
     this.bimocqWas = bimNow
-    // The wooden ball's skin heats (or cools) first, so this step's fire takes in its volatiles.
+    // The wooden ball heats (or cools) first, so this step's fire takes in its volatiles.
     if (this.ballBurning()) {
       const skinPass = enc.beginComputePass()
       skinPass.setPipeline(p.ballHeat)
       skinPass.setBindGroup(0, g.bg.ballHeat)
-      skinPass.dispatchWorkgroups(SKIN_W / 8, SKIN_H / 8, 1)
+      skinPass.dispatchWorkgroups(SKIN_TEXELS / 64)
       skinPass.end()
-      enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_W * SKIN_H * 16)
+      enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_TEXELS * 16)
+      this.woodStepped()
     }
     const [nx, ny, nz] = g.n
     const cv: Vec3 = [Math.ceil((nx + 1) / 4), Math.ceil((ny + 1) / 4), Math.ceil((nz + 1) / 4)]
@@ -1813,7 +1836,7 @@ export class PyroEngine {
     // Buoyancy: g (T - T_ambient) / T_ambient per kelvin of temperature rise, times the control (1 = physical).
     // Turbulence: m/s2 for a smoke source; for a fire, the turbulence model (physics.ts) times the control.
     const turb = s.sourceType === 'fire' ? s.turbulence * fireTurbulence(s.heatRelease, s.turbScale) : s.turbulence
-    f.set([(s.buoyancy * G) / T_AMBIENT, 0, s.vorticity, turb], 16)
+    f.set([(s.buoyancy * G) / T_AMBIENT, this.woodClock, s.vorticity, turb], 16)
     f.set([s.turbScale, s.wind, 0, 0.05], 20)
     f.set([s.cooling, s.dissipation, SOR_OMEGA, SPEED_LIMIT], 24)
     const st = this.stir
@@ -1827,14 +1850,14 @@ export class PyroEngine {
     // Each upres layer resets when the simulation clock crosses its period (layer B half a period later).
     const t0 = this.simTime / DETAIL_PERIOD
     const t1 = (this.simTime + SIM_DT) / DETAIL_PERIOD
-    f.set([Math.floor(t1) > Math.floor(t0) ? 1 : 0, Math.floor(t1 + 0.5) > Math.floor(t0 + 0.5) ? 1 : 0, 0, 0], 44)
+    f.set([Math.floor(t1) > Math.floor(t0) ? 1 : 0, Math.floor(t1 + 0.5) > Math.floor(t0 + 0.5) ? 1 : 0, this.woodSpeed, this.woodTest], 44)
     // A fire bed gives off fuel at the rate that releases the chosen heat. Fuel and air mix (and so burn) in
     // sqrt(2 dx / g), the buoyant mixing time FDS uses at a cell's scale. The bed's nominal area (a disc, thinned by
     // the source noise) spreads the fuel until the area is measured.
     const fire = s.sourceType === 'fire'
     f.set([fire ? 1 : 0, fire ? (s.heatRelease * 1000) / FUEL.heatPerFuel : 0, s.sootYield, s.radiantFraction], 48)
     const bed = Math.PI * s.srcRadius ** 2 * (1 - 0.5 * s.srcNoise)
-    f.set([s.expansion, Math.sqrt((2 * dx) / G), bed, 0], 52)
+    f.set([s.expansion, Math.sqrt((2 * dx) / G), bed, this.woodParity], 52)
     // The collision ball, easing to rest once the visitor lets go.
     if (performance.now() - this.ballDragAt > 120) this.ballVel = this.ballVel.map(v => v * 0.6) as Vec3
     const radius = s.ball ? s.ballRadius : 0
@@ -2569,15 +2592,28 @@ export class PyroEngine {
       .catch(err => console.warn(`Pyro environment ${env} unavailable`, err))
   }
 
-  // A fresh wooden ball: unburned, at the air's temperature.
+  // A fresh wooden ball: unburned, at the air's temperature. (Its cells are set up on its first step, BALL_HEAT, from
+  // their columns cleared here.)
   private resetSkin() {
     if (!this.grids) return
-    const fresh = new Float32Array(SKIN_W * SKIN_H * 4)
-    for (let i = 0; i < SKIN_W * SKIN_H; i++) fresh.set([T_AMBIENT, T_AMBIENT, 0, 0], i * 4)
-    this.device.queue.writeBuffer(this.grids.skin, 0, fresh)
+    const g = this.grids
+    const fresh = new Float32Array(SKIN_TEXELS * 4)
+    for (let i = 0; i < SKIN_TEXELS; i++) fresh.set([T_AMBIENT, 0, 0, 0], i * 4)
+    this.device.queue.writeBuffer(g.skin, 0, fresh)
+    const enc = this.device.createCommandEncoder()
+    for (const b of [g.ballSheet, g.woodTemps, g.woodCells, g.woodCols]) enc.clearBuffer(b)
+    this.device.queue.submit([enc.finish()])
+    this.woodParity = 0
+    this.woodClock = 0
     this.ballStatus = null
     this.needsRender = true
     this.taaCount = 0
+  }
+
+  // After each step of the wood: its halves trade places, and its clock runs on.
+  private woodStepped() {
+    this.woodParity = 1 - this.woodParity
+    this.woodClock += SIM_DT * this.woodSpeed
   }
 
   // Swaps the charred ball for a fresh one.
@@ -2587,7 +2623,8 @@ export class PyroEngine {
     this.report(true)
   }
 
-  // The wooden ball's state for the HUD, as the solver works it out (see charRate and ballFuelFlux in wgsl.ts).
+  // The wooden ball's state for the HUD, as the solver works it out (BALL_HEAT and ballFuelFlux in wgsl.ts): its hottest
+  // surface, the power its volatiles burn at once they come off fast enough, and how much of it is charred.
   private async readBall() {
     if (this.readingBall || !this.grids || !this.ballBurning()) {
       if (!this.ballBurning()) this.ballStatus = null
@@ -2595,7 +2632,7 @@ export class PyroEngine {
     }
     this.readingBall = true
     const d = this.device
-    const bytes = SKIN_W * SKIN_H * 16
+    const bytes = SKIN_TEXELS * 16
     const read = d.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
     enc.copyBufferToBuffer(this.grids.skin, 0, read, 0, bytes)
@@ -2612,24 +2649,54 @@ export class PyroEngine {
         const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1)
         return t * t * (3 - 2 * t)
       }
-      for (let j = 0; j < SKIN_H; j++) {
-        const texel = r * r * Math.sin((Math.PI * (j + 0.5)) / SKIN_H) * (Math.PI / SKIN_H) * ((2 * Math.PI) / SKIN_W)
-        for (let i = 0; i < SKIN_W; i++) {
-          const k = (j * SKIN_W + i) * 4
-          const [t1, t2, char] = [a[k], a[k + 1], a[k + 2]]
-          hottest = Math.max(hottest, t1)
-          const front = t1 + (t2 - t1) * Math.min(Math.max(char / 4, 0), 1)
-          const m = 500 * (1 - 0.16) * Math.min(9.5 * Math.exp(-8230 / Math.max(front, 300)), 6e-5)
-          fuel += m * smooth(0.0015, 0.0025, m) * texel
-          if (char > 0.3) charredArea += texel
-          area += texel
-        }
+      const solid = skinSolidAngles()
+      for (let i = 0; i < SKIN_TEXELS; i++) {
+        const k = i * 4
+        const texel = r * r * solid[i % (SKIN_N * SKIN_N)]
+        hottest = Math.max(hottest, a[k])
+        fuel += a[k + 1] * smooth(0.0015, 0.0025, a[k + 1]) * texel
+        if (a[k + 2] > 0.3) charredArea += texel
+        area += texel
       }
       read.unmap()
       if (this.ballBurning()) this.ballStatus = { surfaceK: hottest, burningKW: (fuel * FUEL.heatPerFuel) / 1000, charred: charredArea / area }
     } catch {}
     read.destroy()
     this.readingBall = false
+  }
+
+  // Development: one column of the wooden ball's wood, the one under the surface facing dir (from the ball's centre):
+  // each cell's depth below the surface as made (mm), thickness (mm), temperature (K), wood left, char, water left and
+  // ash; and the skin there (surface temperature K, volatiles kg/m2/s, char depth mm, ash cover) and the rest of the
+  // surface (fuel flow up it, wear mm, char halfway down and at its base K).
+  async readWood(dir: Vec3 = [0, 0, 1]) {
+    if (!this.grids) return null
+    const g = this.grids
+    const d = this.device
+    const t = skinTexel(dir)
+    const half = this.woodParity
+    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    for (let k = 0; k < WOOD_LAYERS; k++) {
+      enc.copyBufferToBuffer(g.woodTemps, (half * WOOD_CELLS + k * SKIN_TEXELS + t) * 4, read, k * 4, 4)
+      enc.copyBufferToBuffer(g.woodCells, (k * SKIN_TEXELS + t) * 16, read, WOOD_LAYERS * 4 + k * 16, 16)
+    }
+    enc.copyBufferToBuffer(g.skin, t * 16, read, WOOD_LAYERS * 20, 16)
+    enc.copyBufferToBuffer(g.ballSheet, t * 16, read, WOOD_LAYERS * 20 + 16, 16)
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const a = new Float32Array(read.getMappedRange().slice(0))
+    read.unmap()
+    read.destroy()
+    const r = this.state.ballRadius
+    const layers = woodLayers(r)
+    return {
+      texel: t,
+      clock: this.woodClock,
+      skin: Array.from(a.slice(WOOD_LAYERS * 5, WOOD_LAYERS * 5 + 4)),
+      sheet: Array.from(a.slice(WOOD_LAYERS * 5 + 4, WOOD_LAYERS * 5 + 8)),
+      cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
+    }
   }
 
   private report(force: boolean) {
@@ -2689,8 +2756,9 @@ export class PyroEngine {
     const scheme = this.velScheme()
     const solveLabel = this.state.pressure === 'sor' ? `sor x${this.state.pressureIters}` : `multigrid x${this.state.vcycles}`
     if (this.ballBurning()) {
-      timed('ballHeat', one(p.ballHeat, g.bg.ballHeat, [SKIN_W / 8, SKIN_H / 8, 1]))
-      enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_W * SKIN_H * 16)
+      timed('ballHeat', one(p.ballHeat, g.bg.ballHeat, [SKIN_TEXELS / 64, 1, 1]))
+      enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_TEXELS * 16)
+      this.woodStepped()
     }
     if (scheme === 'lfm') {
       timed('advectVel', one(p.advectVelDouble, g.lfm.advect[0], cv))

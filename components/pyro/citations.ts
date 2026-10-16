@@ -371,6 +371,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1016/j.biombioe.2005.06.005',
   },
   {
+    id: 'misra-wood-ash',
+    group: 'Burning ball',
+    authors: 'Mahendra K. Misra, Kenneth W. Ragland, Andrew J. Baker',
+    title: 'Wood ash composition as a function of furnace temperature',
+    venue: 'Biomass and Bioenergy 4(2), what wood’s ash is left as',
+    year: '1993',
+    url: 'https://doi.org/10.1016/0961-9534(93)90032-Y',
+  },
+  {
     id: 'de-ris-orloff',
     group: 'Burning ball',
     authors: 'J. L. De Ris, L. Orloff',

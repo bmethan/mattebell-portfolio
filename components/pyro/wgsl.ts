@@ -2166,9 +2166,13 @@ const ASH_YIELD = 0.004;
 const H_PYRO = 1.4e5; // J per kg of wood broken down
 const L_EVAP = 2.26e6;
 const FISSURE = 0.0015; // m, a crack's width in the char
-// The ash on the surface (kg/m2) that covers most of it: a layer some 10 micrometres deep, a few of its fine particles
-// thick (an estimate).
-const ASH_COVER = 0.002;
+// The ash on the surface (kg/m2) that covers most of it (1 - 1/e). Its grains, taken as some 10 micrometres across (an
+// estimate: the finest of the ash, the potassium salts that vaporise, leaves with the gas as a fume) and as dense as
+// calcite (2700 kg/m3; calcium is most of pine's ash, left as its carbonate, or where hotter its oxide; Werkelin and
+// colleagues 2005, Misra, Ragland and Baker 1993), cover m 1.5 / (rho d) of the surface at random, so 18 g/m2
+// covers most of it: the ash of some 9 mm of the wood burned away. (Taken before as 2 g/m2, the ash covered the char
+// before it had cracked, and the charred ball read as pale wood.)
+const ASH_COVER = 0.018;
 const SIGMA = 5.670374e-8;
 const RG = 8.314;
 const H_CONV = 10.0;
@@ -2723,15 +2727,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // The volatiles burn as they flow up the surface, so the flame at a texel carries all the fuel that came off below
   // it, per metre of width (the circles of latitude narrow toward the poles): down the surface to the bottom in steps.
-  // (Eight points each step, set at random along the way and averaged over the last few steps: the sum feeds only the
-  // drawn flames, and changes slowly.)
+  // The flame's layer, a centimetre or more thick, mixes the fuel from a band of the surface about as wide as it is
+  // thick, so the sum takes in a band 2 cm wide. (Eight points each step, set at random along the way and across the
+  // band, averaged over the last several steps: the sum feeds only the drawn flames, and changes slowly. Summed down a
+  // single line of texels, it varied from one line to the next, and so did the drawn flames' thickness.)
   var sheet = 0.0;
   let dth = (3.1415927 - th0) / 8.0;
   for (var j = 0; j < 8; j++) {
     let a = (f32(j) + jitter) * dth;
-    sheet += burning(skin[texelOf(normalize(n * cos(a) + down * sin(a)))].y) * sin(th0 + a);
+    let across = east * ((fract(5.3 * jitter + 0.618034 * f32(j)) - 0.5) * 0.02 / r);
+    sheet += burning(skin[texelOf(normalize(n * cos(a) + down * sin(a) + across))].y) * sin(th0 + a);
   }
-  sheet = mix(sheetOut[2u * t].x, sheet * r * dth / max(sin(th0), 0.15), 0.3);
+  sheet = mix(sheetOut[2u * t].x, sheet * r * dth / max(sin(th0), 0.15), 0.15);
   skinOut[t] = vec4<f32>(ts, sumFuel, 1000.0 * sumChar, 1.0 - exp(-sumAsh / (areaS * ASH_COVER)));
   sheetOut[2u * t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
   sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), uRel, hConv, tcNew);
@@ -3013,15 +3020,43 @@ fn edgeFade(uvw: vec3<f32>) -> f32 {
   return smoothstep(0.0, 0.05, ex) * smoothstep(0.0, 0.2, ez) * (1.0 - smoothstep(0.8, 1.0, uvw.y));
 }
 fn uvwOf(w: vec3<f32>) -> vec3<f32> { return (w - P.origin.xyz) / (vec3<f32>(P.dims.xyz) * P.grid.x); }
-// Where a ray (unit direction) first meets the collision ball, or 1e9.
+// How far a point is outside the collision ball as it has worn (wornRadius; negative inside).
+fn ballGap(w: vec3<f32>) -> f32 {
+  let d = w - P.ball.xyz;
+  let l = max(length(d), 1e-6);
+  return l - wornRadius(d / l);
+}
+// Where a ray (unit direction) first meets the collision ball, or 1e9: the ball as it has worn, as the gas sees it. On
+// from where the ray meets the ball as made, in eight steps across it to the first point inside the worn ball, then
+// halving the step onto its surface five times, and the rest of the way as the gap closes. (Drawn as made, with its
+// maps slid in along the line of sight to where the wood had worn back to, the ball's maps smeared where a line of
+// sight grazes it, toward its rim, most where it had worn most.) A ray from inside it meets none of it. (One loop, to a
+// bound the compiler cannot know: written out, the steps and halvings slowed the image pass's compile.)
 fn ballHit(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
   if (P.ball.w <= 0.0) { return 1e9; }
   let oc = ro - P.ball.xyz;
   let b = dot(oc, rd);
   let h = b * b - (dot(oc, oc) - P.ball.w * P.ball.w);
   if (h < 0.0) { return 1e9; }
-  let t = -b - sqrt(h);
-  return select(1e9, t, t > 0.0);
+  let t0 = -b - sqrt(h);
+  if (dot(abs(P.wear1.xyz) + abs(P.wear2.xyz) + abs(P.wear3.xyz), vec3<f32>(1.0)) <= 0.0) { return select(1e9, t0, t0 > 0.0); }
+  var a = max(t0, 0.0);
+  var fa = ballGap(ro + rd * a);
+  if (fa <= 0.0) { return select(1e9, a, t0 > 0.0); }
+  let dt = (-b + sqrt(h) - a) / 8.0;
+  var e = a;
+  var fe = fa;
+  var halved = 0u;
+  let steps = 13u + min(P.dims.x, 0u);
+  for (var i = 0u; i < steps; i++) {
+    let m = select(a + dt, 0.5 * (a + e), halved > 0u);
+    let fm = ballGap(ro + rd * m);
+    if (fm > 0.0) { a = m; fa = fm; } else { e = m; fe = fm; }
+    if (fe <= 0.0) { halved++; }
+    if (halved > 5u || (halved == 0u && i >= 7u)) { break; }
+  }
+  if (halved == 0u) { return 1e9; }
+  return a + (e - a) * fa / max(fa - fe, 1e-9);
 }
 const BALL_ALBEDO = 0.45;
 // How much sunlight the collision ball lets past to a point: 0 in its shadow, with a soft edge a few millimetres wide
@@ -3617,23 +3652,26 @@ fn flameLayer(s: f32) -> f32 { return 0.008 + 0.022 * smoothstep(0.0, 1.0, s); }
 fn flameSoot(s: f32) -> f32 { return 3.0 * smoothstep(0.05, 0.5, s); }
 fn ballFlame(w: vec3<f32>) -> vec2<f32> {
   if (!ballBurns()) { return vec2<f32>(0.0); }
-  let r = P.ball.w;
   let rel = w - P.ball.xyz;
   let dist = length(rel);
-  let d = dist - r;
+  let d = dist - wornRadius(rel / max(dist, 1e-6));
   if (d < 0.0 || d > BALL_FLAME_REACH) { return vec2<f32>(0.0); }
   var out = vec2<f32>(0.0);
-  // The layer along the surface: licks some 4 cm across and 20 cm long, rising over it at 2 m/s.
+  // The layer along the surface: licks some 4 cm across and 20 cm long, rising over it at 2 m/s. (The noise has eight
+  // features across its texture, so a lick 4 cm across takes 1 / (8 x 0.04) = 3.1 of the texture a metre. Taken as
+  // one, they were drawn 5 mm across, and finer, rising at 0.4 m/s: the flames over the surface read as fine streaks,
+  // like a texture smeared upward.)
   let s1 = sheetAt(rel / dist);
   let thick = flameLayer(s1);
   if (s1 > 0.0 && d < thick) {
-    let q = vec3<f32>(w.x * 25.0, w.y * 5.0 - R.size.z * 2.0, w.z * 25.0);
+    let q = vec3<f32>(w.x * 3.125, (w.y - R.size.z * 2.0) * 0.625, w.z * 3.125);
     let lick = smoothstep(0.5, 0.75, textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x);
     out = vec2<f32>(flameSoot(s1) * lick * (1.0 - smoothstep(0.5, 1.0, d / thick)), 1400.0 - 100.0 * d / thick);
   }
   // The tongues: over the top the flows from every side meet and leave the surface together, rising as a plume that
   // narrows as it climbs (noise stretched upward and rising at 1.6 m/s, thinning toward the tips). Below the top they
-  // stay in the layer above, clinging.
+  // stay in the layer above, clinging. (Over the top as it has worn.)
+  let r = wornRadius(vec3<f32>(0.0, 1.0, 0.0));
   let rho = length(rel.xz);
   let cap = 0.8 * r;
   if (rel.y > 0.0 && rho < cap) {
@@ -3657,13 +3695,13 @@ fn ballFlame(w: vec3<f32>) -> vec2<f32> {
 // Against the collision ball, a weight that fades the gas out within a cell or two of its true surface.
 fn offBallStairs(w: vec3<f32>) -> f32 {
   if (P.ball.w <= 0.0) { return 1.0; }
-  return smoothstep(0.3, 1.8, (distance(w, P.ball.xyz) - P.ball.w) / P.grid.x);
+  return smoothstep(0.3, 1.8, ballGap(w) / P.grid.x);
 }
 // How near a burning ball's surface w is, as a weight that keeps the solver's smeared shell of flame from glowing
 // there (the drawn flames above take its place).
 fn offBallShell(w: vec3<f32>) -> f32 {
   if (!ballBurns()) { return 1.0; }
-  return smoothstep(1.0, 3.0, (distance(w, P.ball.xyz) - P.ball.w) / P.grid.x);
+  return smoothstep(1.0, 3.0, ballGap(w) / P.grid.x);
 }
 
 // The wooden ball's surface. Its grain: a turned pine ball, growth rings around a tilted axis, wavy, the early wood
@@ -3818,21 +3856,27 @@ fn charGlow(sk: vec4<f32>, bs: vec4<f32>, c: CrackHit, crackT: f32) -> vec3<f32>
   // (The crack's share of the pixel.)
   return mix(face, e / (e + (1.0 - e) * c.slot) * planck(max(t, 1.0)), c.cover);
 }
-// The burning ball's surface where a line of sight along rd meets the ball as made, at p0: on to where the wood has worn
-// back to (the wear varies slowly over the surface, so its maps are read once, there), and there the material, the
-// shading normal and the glow, down a crack if the line of sight goes into one, as far as the crack takes its pixel
-// (pixel, the pixel's angle in radians; 0 to take the line of sight as it comes, as the path tracer, averaging many,
-// does). The light from outside reaches a crack's walls only as far as they see out.
+// The worn ball's surface normal where the outward direction n meets it: the wear's fit (wornRadius) leans it toward
+// where the ball has worn more.
+fn wornNormal(n: vec3<f32>) -> vec3<f32> {
+  let r = P.ball.w;
+  let w = dot(P.wear1.xyz, n) + dot(P.wear2.xyz, n * n) + dot(P.wear3.xyz, n * n.yzx);
+  if (w <= 0.0 || w >= 0.9 * r) { return n; }
+  let c = P.wear3.xyz;
+  let g = P.wear1.xyz + 2.0 * P.wear2.xyz * n + vec3<f32>(c.x * n.y + c.z * n.z, c.x * n.x + c.y * n.z, c.y * n.y + c.z * n.x);
+  return normalize(n + (g - n * dot(g, n)) / (r - w));
+}
+// The burning ball's surface where a line of sight along rd meets it, as it has worn, at p: the material, the shading
+// normal and the glow, down a crack if the line of sight goes into one, as far as the crack takes its pixel (pixel, the
+// pixel's angle in radians; 0 to take the line of sight as it comes, as the path tracer, averaging many, does). The
+// light from outside reaches a crack's walls only as far as they see out. (The wear's finer pattern, the grain's
+// relief and the like, mostly within a millimetre or two of the fit, is drawn in its maps and not in the surface's
+// shape.)
 struct WoodHit { p: vec3<f32>, nb: vec3<f32>, m: BallMat, n: vec3<f32>, glow: vec3<f32> }
-fn woodAt(p0: vec3<f32>, rd: vec3<f32>, pixel: f32) -> WoodHit {
-  var nb = normalize(p0 - P.ball.xyz);
-  var p = p0;
-  let maps = ballMapsAt(nb);
-  let worn = 0.001 * maps.sheet.y;
-  if (worn > 1e-5) {
-    p += rd * worn / max(-dot(rd, nb), 0.25);
-    nb = normalize(p - P.ball.xyz);
-  }
+fn woodAt(p: vec3<f32>, rd: vec3<f32>, pixel: f32) -> WoodHit {
+  let dir = normalize(p - P.ball.xyz);
+  let nb = wornNormal(dir);
+  let maps = ballMapsAt(dir);
   let lp = (p - P.ball.xyz) / P.ball.w;
   let sk = maps.skin;
   let c = crackHit(lp, nb, rd, sk, pixel * distance(p, R.camPos.xyz) / max(-dot(rd, nb), 0.25));

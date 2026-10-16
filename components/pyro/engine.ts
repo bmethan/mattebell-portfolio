@@ -6,7 +6,7 @@ import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
 import { writeVdb, type VdbGrid } from './vdb'
-import { skinSolidAngles, skinTexel, woodLayers } from './wood'
+import { fitWear, skinSolidAngles, skinTexel, woodLayers } from './wood'
 import { DOMAIN_WIDTH, PYRO_DEFAULTS, RESOLUTIONS, RESOLUTION_ORDER, type PyroResolution, type PyroState } from './params'
 import { REC709_TO_AP1, ap1Luminance, loadAcesLutGPU, mat3Apply, viewIndex } from '../lab/viewTransforms'
 import { BACKDROP_H, BACKDROP_W, environmentLight, shBasis, type EnvLight } from './environment'
@@ -51,6 +51,7 @@ const AUTO_RES_TO_S = 6
 const AUTO_RES_MIN_RATE = 18
 const MAX_RENDER_PIXELS = 900_000
 const STATUS_MS = 250
+const NO_WEAR = new Float32Array(12) // (the grey ball's: wornRadius's fit, all zero)
 const STIR_RADIUS = 0.3 // m
 const DETAIL_PERIOD = 1 // s of simulation between resets of each upres layer (half a period apart); the plume stretches them fast
 const NOISE_SIZE = 64 // texels along each side of the tileable detail noise
@@ -583,7 +584,7 @@ export class PyroEngine {
   private simBuf: GPUBuffer
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
-  private simData = new ArrayBuffer(336)
+  private simData = new ArrayBuffer(384)
   private renderData = new Float32Array(112)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
@@ -620,6 +621,11 @@ export class PyroEngine {
   private woodPhase = -1
   woodSpeed = 1
   woodTest = 0
+  // The wood's wear as the gas sees it (wornRadius; fitWear), fitted afresh from the wear map every fourth time the
+  // ball is read back, about once a second (the wear moves a millimetre in a minute or two).
+  private wear: Float32Array = new Float32Array(12)
+  private wearReads = 0
+  private balls = 0 // (fresh balls so far, so that a wear read back from the last is not fitted to this one)
   // Auto exposure: the fire's luminous intensity (cd, read back a few times a second) and the metered EV, eased.
   private fireCd = 0
   private fireResum = false // (paused: the fire's sums marched afresh before the next frame's light: resumFireNow)
@@ -764,7 +770,7 @@ export class PyroEngine {
       })
       .catch(() => {})
     this.taaBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
-    this.ballBuf = d.createBuffer({ size: 112, usage: U.UNIFORM | U.COPY_DST })
+    this.ballBuf = d.createBuffer({ size: 160, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.envTex = d.createTexture({ size: [BACKDROP_W, BACKDROP_H], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
@@ -1869,8 +1875,11 @@ export class PyroEngine {
     f.set([...this.ballVel, s.ball && s.ballBurns ? 1 : 0], 60)
     const set = this.referenceSet(s)
     f.set(set, 64)
+    // The wooden ball as it has worn back (the grey ball keeps its shape).
+    const wear = s.ball && s.ballBurns ? this.wear : NO_WEAR
+    f.set(wear, 84)
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
-    this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx, ...set]))
+    this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx, ...set, ...wear]))
   }
 
   private writeRender() {
@@ -2610,6 +2619,8 @@ export class PyroEngine {
     this.woodParity = 0
     this.woodClock = 0
     this.woodPhase = -1
+    this.wear = new Float32Array(12)
+    this.balls++
     this.ballStatus = null
     this.needsRender = true
     this.taaCount = 0
@@ -2646,8 +2657,20 @@ export class PyroEngine {
     const read = d.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
     enc.copyBufferToBuffer(this.grids.skin, 0, read, 0, bytes)
+    // (And now and then the rest of the surface, for its wear: two vec4s to a texel, the wear in mm the first's y.)
+    const sheet = this.wearReads++ % 4 === 0 ? d.createBuffer({ size: 2 * bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }) : null
+    const ball = this.balls
+    if (sheet) enc.copyBufferToBuffer(this.grids.ballSheet, 0, sheet, 0, 2 * bytes)
     d.queue.submit([enc.finish()])
     try {
+      if (sheet) {
+        await sheet.mapAsync(GPUMapMode.READ)
+        const b = new Float32Array(sheet.getMappedRange())
+        const worn = new Float32Array(SKIN_TEXELS)
+        for (let i = 0; i < SKIN_TEXELS; i++) worn[i] = b[8 * i + 1] * 0.001
+        sheet.unmap()
+        if (this.ballBurning() && ball === this.balls) this.wear = fitWear(worn)
+      }
       await read.mapAsync(GPUMapMode.READ)
       const a = new Float32Array(read.getMappedRange())
       const r = this.state.ballRadius
@@ -2672,15 +2695,16 @@ export class PyroEngine {
       if (this.ballBurning()) this.ballStatus = { surfaceK: hottest, burningKW: (fuel * FUEL.heatPerFuel) / 1000, charred: charredArea / area }
     } catch {}
     read.destroy()
+    sheet?.destroy()
     this.readingBall = false
   }
 
   // Development: one column of the wooden ball's wood, the one under the surface facing dir (from the ball's centre):
   // each cell's depth below the surface as made (mm), thickness (mm), temperature (K), wood left, char, water left and
   // ash; the skin there (surface temperature K, volatiles kg/m2/s, char depth mm, ash cover), the rest of the surface
-  // (fuel flow up it, wear mm, char halfway down and at its base K), the column's grain (its wood's density against the
-  // mean), the share of it under cracks, the soot on it (kg/m2) and how much of it is covered, and how much the fire's
-  // flame lies against it.
+  // (fuel flow up it, wear mm, char halfway down and at its base K), the column's patch of the grain (its wood's density
+  // against the mean, before the rings), the share of it under cracks, the soot on it (kg/m2) and how much of it is
+  // covered, how much the fire's flame lies against it, and the wear's fit as the gas sees it (fitWear).
   async readWood(dir: Vec3 = [0, 0, 1]) {
     if (!this.grids) return null
     const g = this.grids
@@ -2714,6 +2738,7 @@ export class PyroEngine {
       soot: a[WOOD_LAYERS * 5 + 10],
       flameAgainst: a[WOOD_LAYERS * 5 + 11],
       sootCover: a[WOOD_LAYERS * 5 + 12],
+      wearFit: Array.from(this.wear),
       cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
     }
   }

@@ -616,6 +616,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1002/fam.810160406',
   },
   {
+    id: 'white-tran',
+    group: 'Validation',
+    authors: 'Robert H. White, Hao C. Tran',
+    title: 'Charring Rate of Wood Exposed to a Constant Heat Flux',
+    venue: 'Wood & Fire Safety, 3rd International Conference, the char depth over time, t = m x^a, at 15 to 50 kW/m²',
+    year: '1996',
+    url: 'https://research.fs.usda.gov/download/treesearch/5978.pdf',
+  },
+  {
     id: 'janssens-white',
     group: 'Validation',
     authors: 'Marc L. Janssens, Robert H. White',

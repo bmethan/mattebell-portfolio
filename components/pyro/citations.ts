@@ -380,6 +380,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1016/0961-9534(93)90032-Y',
   },
   {
+    id: 'baroudi-char-cracks',
+    group: 'Burning ball',
+    authors: 'Djebar Baroudi, Andrea Ferrantelli, Kai Yuan Li, Simo Hostikka',
+    title: 'A thermomechanical explanation for the topology of crack patterns observed on the surface of charred wood and particle fibreboard',
+    venue: 'Combustion and Flame 182, why char cracks across the grain',
+    year: '2017',
+    url: 'https://doi.org/10.1016/j.combustflame.2017.04.017',
+  },
+  {
     id: 'de-ris-orloff',
     group: 'Burning ball',
     authors: 'J. L. De Ris, L. Orloff',

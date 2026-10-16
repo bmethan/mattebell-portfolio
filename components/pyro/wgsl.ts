@@ -2047,32 +2047,58 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 `
 
 // The char's crazing, which the renderer draws and down which the wood's cells take heat: cells of about 2.5 cm (as
-// wood's char crazes) over the ball, a Voronoi pattern in lp, the point over the ball's radius. crackLine is 1 along a
-// crack and 0 off it.
+// wood's char crazes) over the ball, by the direction n from its centre (so that as the ball wears its cracks stay
+// where its columns have them). Charred wood cracks first across its grain, in lines roughly evenly spaced, where its
+// stiffness along the grain resists the hot surface layer's swelling (a buckling of that layer; Baroudi, Ferrantelli,
+// Li and Hostikka 2017, who found fibreboard, as stiff one way as another, cracking in polygons instead), and then
+// along it, into blocks. So the pattern is Voronoi's, squeezed 1.8 times along the grain (the axis the renderer's rings
+// turn about), so that most cracks run across it, and the cracks across it are the wider; where the grain meets the
+// surface, the end grain, the cells are as wide one way as the other. Its edges are bent by gradient noise (Perlin's,
+// the noise texture's) some 3 cm across, and roughened by more a few millimetres across, so that they wander as cracks
+// do rather than run straight from corner to corner; and each crack has a width of its own, from a hairline to twice
+// the mean. crackEdge returns how far n is from the nearest crack (0 on it, in the pattern's units) and that crack's
+// width over the mean; crackLine is 1 along a crack and 0 off it.
 const CHAR_CRACKS = /* wgsl */ `
 fn hash33(p: vec3<f32>) -> vec3<f32> {
   let q = vec3<f32>(dot(p, vec3<f32>(127.1, 311.7, 74.7)), dot(p, vec3<f32>(269.5, 183.3, 246.1)), dot(p, vec3<f32>(113.5, 271.9, 124.6)));
   return fract(sin(q) * 43758.5453);
 }
-// How far p is from the nearest edge between Voronoi cells (0 on an edge).
-fn cellEdge(p: vec3<f32>) -> f32 {
+fn crackEdge(n: vec3<f32>) -> vec2<f32> {
+  let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
+  // (Nine cells to the ball's radius as their mean, 6.7 across the grain and 12.1 along it. The noise has eight
+  // features across its texture, so 0.45 of it to the radius bends the edges over some 3 cm, and 1.6, a few mm.)
+  var p = n * 6.7;
+  p += 0.8 * dot(p, axis) * axis;
+  p += 0.9 * (textureSampleLevel(noiseTex, noiseSamp, n * 0.45 + 0.21, 0.0).xyz - 0.5);
+  p += 0.25 * (textureSampleLevel(noiseTex, noiseSamp, n * 1.6 + 0.63, 0.0).xyz - 0.5);
   let i = floor(p);
   let f = p - i;
   var d1 = 8.0;
   var d2 = 8.0;
+  var r1 = vec3<f32>(0.0);
+  var r2 = vec3<f32>(1.0);
+  var c1 = vec3<f32>(0.0);
+  var c2 = vec3<f32>(0.0);
   for (var z = -1; z <= 1; z++) {
     for (var y = -1; y <= 1; y++) {
       for (var x = -1; x <= 1; x++) {
         let o = vec3<f32>(f32(x), f32(y), f32(z));
         let r = o + hash33(i + o) - f;
         let d = dot(r, r);
-        if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) { d2 = d; }
+        if (d < d1) { d2 = d1; r2 = r1; c2 = c1; d1 = d; r1 = r; c1 = i + o; }
+        else if (d < d2) { d2 = d; r2 = r; c2 = i + o; }
       }
     }
   }
-  return sqrt(d2) - sqrt(d1);
+  // (A crack runs square to the line between the two cells' points: across the grain where that line runs along it.)
+  let across = abs(dot(normalize(r2 - r1), axis));
+  let width = (0.35 + 1.3 * hash33(c1 + c2 + 0.5).x) * mix(0.75, 1.25, across);
+  return vec2<f32>(sqrt(d2) - sqrt(d1), width);
 }
-fn crackLine(lp: vec3<f32>) -> f32 { return 1.0 - smoothstep(0.02, 0.09, cellEdge(lp * 9.0)); }
+fn crackLine(n: vec3<f32>) -> f32 {
+  let e = crackEdge(n);
+  return 1.0 - smoothstep(0.02 * e.y, 0.09 * e.y, e.x);
+}
 `
 
 // 7c. The wooden ball, as wood in cells. Beneath each texel of its skin is a column of WOOD_LAYERS cells from the
@@ -3710,7 +3736,7 @@ fn offBallShell(w: vec3<f32>) -> f32 {
 ${CHAR_CRACKS}
 // The cracks have depth: each runs down to the char's base there (BALL_HEAT's char depth, deeper under the cracks
 // themselves), its walls closing in to a third of its width at the floor, and it opens, to some 1.3 mm across on a 22 cm
-// ball, as the char deepens past a millimetre or two. A line of sight into a crack meets one of its walls or its floor,
+// ball on average (each to its own width, crackEdge's), as the char deepens past a millimetre or two. A line of sight into a crack meets one of its walls or its floor,
 // the crack taken as straight across its width (the pattern's slope there). Returns how far down it met the char (0 at
 // the surface, 1 at the floor; -1 outside a crack), the surface's normal there, the crack's opening over its walls and
 // opening together, W / (W + 2 D), and how much of the light from outside reaches that far down: the view factor out of
@@ -3724,16 +3750,17 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, fp: f32)
   var out = CrackHit(-1.0, nb, 1.0, 1.0, 0.0);
   let open = smoothstep(0.8, 2.5, sk.z);
   if (open <= 0.0) { return out; }
-  let e0 = cellEdge(lp * 9.0);
-  if (e0 >= 0.09 + 6.0 * fp / P.ball.w) { return out; }
+  let e = crackEdge(normalize(lp));
+  let e0 = e.x;
+  if (e0 >= 0.035 + 0.055 * e.y + 6.0 * fp / P.ball.w) { return out; }
   let F = tangentFrame(nb);
   let de = 0.004;
   // How fast the pattern rises away from the crack's line, per metre along the surface.
-  let g = (vec2<f32>(cellEdge((lp + F[0] * de) * 9.0), cellEdge((lp + F[1] * de) * 9.0)) - e0) / (de * P.ball.w);
+  let g = (vec2<f32>(crackEdge(normalize(lp + F[0] * de)).x, crackEdge(normalize(lp + F[1] * de)).x) - e0) / (de * P.ball.w);
   let gl = max(length(g), 1e-3);
   let across = (g.x * F[0] + g.y * F[1]) / gl;
   let x0 = e0 / gl;
-  let w = 0.055 / gl * open;
+  let w = 0.055 * e.y / gl * open;
   let cover = select(select(0.0, 1.0, x0 < w), clamp((min(x0 + 0.5 * fp, w) - max(x0 - 0.5 * fp, -w)) / max(fp, 1e-9), 0.0, 1.0), fp > 0.0);
   if (cover <= 0.0) { return out; }
   // (Into the crack, at the nearest point of it where the crack is finer than the pixel.)

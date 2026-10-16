@@ -2742,6 +2742,7 @@ export class PyroEngine {
       sootCover: a[WOOD_LAYERS * 5 + 12],
       airSpeed: a[WOOD_LAYERS * 5 + 13],
       heatTransfer: a[WOOD_LAYERS * 5 + 14],
+      crackTemp: a[WOOD_LAYERS * 5 + 15],
       wearFit: Array.from(this.wear),
       cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
     }

@@ -277,34 +277,41 @@ const SKIN_N = ${SKIN_N}u;
 const SKIN_TEXELS = ${SKIN_TEXELS}u;
 @group(0) @binding(31) var<storage, read> skin: array<vec4<f32>>;
 fn ballBurns() -> bool { return P.ball.w > 0.0 && P.ballVel.w > 0.5; }
-// The cube's faces: the two directions across each, then its outward axis.
-fn faceAxes(f: u32) -> mat3x3<f32> {
-  switch f {
-    case 0u: { return mat3x3<f32>(vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0)); }
-    case 1u: { return mat3x3<f32>(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0)); }
-    case 2u: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0)); }
-    case 3u: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, -1.0, 0.0)); }
-    case 4u: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)); }
-    default: { return mat3x3<f32>(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, -1.0)); }
-  }
-}
-// Where a direction meets the cube: the face, and the place across it in texels (0 to SKIN_N), which runs with the
-// angle, atan(u), across the face.
+// Where a direction meets the cube: the face (+x, -x, +y, -y, +z, -z), and the place across it in texels (0 to
+// SKIN_N), which runs with the angle, atan(u), across the face. (Each face's two directions across it: +x, -z and +y;
+// -x, +z and +y; +y, +x and -z; -y, +x and +z; +z, +x and +y; -z, -x and +y.)
 struct CubeAt { face: u32, x: f32, y: f32 }
 fn cubeAt(n: vec3<f32>) -> CubeAt {
   let m = abs(n);
   var f = select(5u, 4u, n.z > 0.0);
-  if (m.x >= m.y && m.x >= m.z) { f = select(1u, 0u, n.x > 0.0); } else if (m.y >= m.z) { f = select(3u, 2u, n.y > 0.0); }
-  let A = faceAxes(f);
-  let h = dot(n, A[2]);
+  var u = select(-n.x, n.x, n.z > 0.0);
+  var v = n.y;
+  var h = m.z;
+  if (m.x >= m.y && m.x >= m.z) {
+    f = select(1u, 0u, n.x > 0.0);
+    u = select(n.z, -n.z, n.x > 0.0);
+    h = m.x;
+  } else if (m.y >= m.z) {
+    f = select(3u, 2u, n.y > 0.0);
+    u = n.x;
+    v = select(n.z, -n.z, n.y > 0.0);
+    h = m.y;
+  }
   let s = f32(SKIN_N) * 0.5;
-  return CubeAt(f, (atan(dot(n, A[0]) / h) * 1.2732395 + 1.0) * s, (atan(dot(n, A[1]) / h) * 1.2732395 + 1.0) * s);
+  return CubeAt(f, (atan(u / h) * 1.2732395 + 1.0) * s, (atan(v / h) * 1.2732395 + 1.0) * s);
 }
 // The direction through a place on a face (in texels; past an edge, on round onto the face beyond).
 fn cubeDir(f: u32, x: f32, y: f32) -> vec3<f32> {
-  let A = faceAxes(f);
   let s = 2.0 / f32(SKIN_N);
-  return normalize(A[2] + tan((x * s - 1.0) * 0.78539816) * A[0] + tan((y * s - 1.0) * 0.78539816) * A[1]);
+  let a = tan((x * s - 1.0) * 0.78539816);
+  let b = tan((y * s - 1.0) * 0.78539816);
+  var d = vec3<f32>(-a, b, -1.0);
+  if (f == 0u) { d = vec3<f32>(1.0, b, -a); }
+  else if (f == 1u) { d = vec3<f32>(-1.0, b, a); }
+  else if (f == 2u) { d = vec3<f32>(a, 1.0, -b); }
+  else if (f == 3u) { d = vec3<f32>(a, -1.0, b); }
+  else if (f == 4u) { d = vec3<f32>(a, b, 1.0); }
+  return normalize(d);
 }
 fn texelIndex(f: u32, i: u32, j: u32) -> u32 { return (f * SKIN_N + j) * SKIN_N + i; }
 fn texelOf(n: vec3<f32>) -> u32 {
@@ -317,7 +324,10 @@ fn texelNear(f: u32, i: i32, j: i32) -> u32 {
   if (i >= 0 && i < n && j >= 0 && j < n) { return texelIndex(f, u32(i), u32(j)); }
   return texelOf(cubeDir(f, f32(i) + 0.5, f32(j) + 0.5));
 }
-// The four texels about a direction and their bilinear weights, across a face's edges as within it.
+// The four texels about a direction and their bilinear weights, across a face's edges as within it. (The four in a
+// loop to a bound the compiler cannot know, four always, so that it keeps one texelNear in the code rather than four
+// written out: every lookup of the ball's maps inlines this, and written out they added seconds to the image pass's
+// compile.)
 struct SkinTaps { i: vec4<u32>, w: vec4<f32> }
 fn skinTaps(n: vec3<f32>) -> SkinTaps {
   let c = cubeAt(n);
@@ -327,10 +337,12 @@ fn skinTaps(n: vec3<f32>) -> SkinTaps {
   let y0 = floor(y);
   let fx = x - x0;
   let fy = y - y0;
-  let i = i32(x0);
-  let j = i32(y0);
-  return SkinTaps(vec4<u32>(texelNear(c.face, i, j), texelNear(c.face, i + 1, j), texelNear(c.face, i, j + 1), texelNear(c.face, i + 1, j + 1)),
-    vec4<f32>((1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy));
+  var idx = vec4<u32>(0u);
+  let four = 4u + min(P.dims.x, 0u);
+  for (var k = 0u; k < four; k++) {
+    idx[k] = texelNear(c.face, i32(x0) + i32(k & 1u), i32(y0) + i32(k >> 1u));
+  }
+  return SkinTaps(idx, vec4<f32>((1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy));
 }
 // The skin where the outward normal n meets it.
 fn skinAt(n: vec3<f32>) -> vec4<f32> {
@@ -3370,18 +3382,22 @@ fn ballFireNear(ph: vec3<f32>, nb: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
 // extinction (1/m) and its soot's temperature.
 const BALL_FLAME_REACH = 0.45; // m above the surface
 const SHEET_REF = 0.002; // kg of fuel per metre of width per second, some 35 kW/m: a ball well alight
-// The ball beyond its skin where the outward normal n meets the surface, bilinear like skinAt; and the fuel flow there.
-fn ballSheetAt(n: vec3<f32>) -> vec4<f32> {
+// The ball's maps where the outward normal n meets the surface, bilinear like skinAt, from one set of taps: its skin,
+// the rest of it (BALL_HEAT's sheet: the fuel flowing up, the wear, the char's temperatures), and its soot.
+struct BallMaps { skin: vec4<f32>, sheet: vec4<f32>, soot: f32 }
+fn ballMapsAt(n: vec3<f32>) -> BallMaps {
   let t = skinTaps(n);
   let i = 2u * t.i;
-  return t.w.x * ballSheet[i.x] + t.w.y * ballSheet[i.y] + t.w.z * ballSheet[i.z] + t.w.w * ballSheet[i.w];
+  return BallMaps(t.w.x * skin[t.i.x] + t.w.y * skin[t.i.y] + t.w.z * skin[t.i.z] + t.w.w * skin[t.i.w],
+    t.w.x * ballSheet[i.x] + t.w.y * ballSheet[i.y] + t.w.z * ballSheet[i.z] + t.w.w * ballSheet[i.w],
+    t.w.x * ballSheet[i.x + 1u].x + t.w.y * ballSheet[i.y + 1u].x + t.w.z * ballSheet[i.z + 1u].x + t.w.w * ballSheet[i.w + 1u].x);
 }
-fn ballSootAt(n: vec3<f32>) -> f32 {
+// The fuel flow where the outward normal n meets the surface (in SHEET_REF).
+fn sheetAt(n: vec3<f32>) -> f32 {
   let t = skinTaps(n);
-  let i = 2u * t.i + 1u;
-  return t.w.x * ballSheet[i.x].x + t.w.y * ballSheet[i.y].x + t.w.z * ballSheet[i.z].x + t.w.w * ballSheet[i.w].x;
+  let i = 2u * t.i;
+  return (t.w.x * ballSheet[i.x].x + t.w.y * ballSheet[i.y].x + t.w.z * ballSheet[i.z].x + t.w.w * ballSheet[i.w].x) / SHEET_REF;
 }
-fn sheetAt(n: vec3<f32>) -> f32 { return ballSheetAt(n).x / SHEET_REF; }
 // The layer's thickness (m) for a fuel flow s (in SHEET_REF), and how sooty, so bright, the flame is (the layer a third
 // as sooty as the tongues it feeds).
 fn flameLayer(s: f32) -> f32 { return 0.008 + 0.022 * smoothstep(0.0, 1.0, s); }
@@ -3579,23 +3595,25 @@ fn charGlow(sk: vec4<f32>, bs: vec4<f32>, c: CrackHit) -> vec3<f32> {
   return e / (e + (1.0 - e) * c.slot) * planck(max(t, 1.0));
 }
 // The burning ball's surface where a line of sight along rd meets the ball as made, at p0: on to where the wood has worn
-// back to (the wear varies slowly over the surface), and there the material, the shading normal and the glow, down a
-// crack if the line of sight goes into one. The light from outside reaches a crack's walls only as far as they see out.
+// back to (the wear varies slowly over the surface, so its maps are read once, there), and there the material, the
+// shading normal and the glow, down a crack if the line of sight goes into one. The light from outside reaches a
+// crack's walls only as far as they see out.
 struct WoodHit { p: vec3<f32>, nb: vec3<f32>, m: BallMat, n: vec3<f32>, glow: vec3<f32> }
 fn woodAt(p0: vec3<f32>, rd: vec3<f32>) -> WoodHit {
   var nb = normalize(p0 - P.ball.xyz);
   var p = p0;
-  let worn = 0.001 * ballSheetAt(nb).y;
+  let maps = ballMapsAt(nb);
+  let worn = 0.001 * maps.sheet.y;
   if (worn > 1e-5) {
     p += rd * worn / max(-dot(rd, nb), 0.25);
     nb = normalize(p - P.ball.xyz);
   }
   let lp = (p - P.ball.xyz) / P.ball.w;
-  let sk = skinAt(nb);
+  let sk = maps.skin;
   let c = crackHit(lp, nb, rd, sk);
-  var m = ballMat(lp, sk, select(0.0, 1.0, c.depth >= 0.0), ballSootAt(nb));
+  var m = ballMat(lp, sk, select(0.0, 1.0, c.depth >= 0.0), maps.soot);
   m.base *= c.view;
-  return WoodHit(p, nb, m, c.n, charGlow(sk, ballSheetAt(nb), c));
+  return WoodHit(p, nb, m, c.n, charGlow(sk, maps.sheet, c));
 }
 
 @vertex
@@ -3975,13 +3993,11 @@ fn shadeSurface(ph: vec3<f32>, nb: vec3<f32>, n: vec3<f32>, v: vec3<f32>, m: Bal
 // light volume just outside its surface) and by the fire; matte grey, or wood that scorches, chars, glows and turns to
 // ash as its skin heats, shaded as an OpenPBR surface (ballMat).
 fn ballSurface(ph: vec3<f32>, rd: vec3<f32>, ch: vec3<f32>, fireColour: vec3<f32>) -> vec3<f32> {
-  if (ballBurns()) {
-    let w = woodAt(ph, rd);
-    return shadeSurface(w.p, w.nb, w.n, -rd, w.m, ch, fireColour, true, -1) + w.glow;
-  }
-  let nb = normalize(ph - P.ball.xyz);
-  let m = BallMat(vec3<f32>(BALL_ALBEDO), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5);
-  return shadeSurface(ph, nb, nb, -rd, m, ch, fireColour, true, -1);
+  // (One shading of the surface whatever the ball is: shadeSurface is large, and the image pass inlines this twice.)
+  var w = WoodHit(ph, normalize(ph - P.ball.xyz), BallMat(vec3<f32>(BALL_ALBEDO), 0.0, 1.0, 0.04, 0.0, vec3<f32>(0.0), 0.5), vec3<f32>(0.0), vec3<f32>(0.0));
+  w.n = w.nb;
+  if (ballBurns()) { w = woodAt(ph, rd); }
+  return shadeSurface(w.p, w.nb, w.n, -rd, w.m, ch, fireColour, true, -1) + w.glow;
 }
 
 // The floor's (or the cyc's) light toward the camera, cd/m2: at pf, facing nf, met tFloor along rd.

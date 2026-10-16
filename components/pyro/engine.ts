@@ -274,7 +274,7 @@ interface Grids {
   spread: GPUBuffer // a fire's mass keeping: the volume over which each cell's gas was spread (fixed point)
   skin: GPUBuffer // the wooden ball's skin (SKIN_TEXELS texels, four floats each), and its next step
   skinNext: GPUBuffer
-  ballSheet: GPUBuffer // the rest of the burning ball's surface, per skin texel (four floats: the fuel flowing up it, ...)
+  ballSheet: GPUBuffer // the rest of the burning ball's surface, per skin texel (eight floats: the fuel flowing up it, ...)
   // The wood beneath the skin (BALL_HEAT): its cells' temperatures (this step's and the next's), their wood, char,
   // water and ash, and each column's state (this step's and the next's).
   woodTemps: GPUBuffer
@@ -1058,7 +1058,7 @@ export class PyroEngine {
     const skinBytes = SKIN_TEXELS * 16
     const skin = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
     const skinNext = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
-    const ballSheet = d.createBuffer({ size: skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
+    const ballSheet = d.createBuffer({ size: 2 * skinBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
     const woodUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
     const woodTemps = d.createBuffer({ size: 2 * WOOD_CELLS * 4, usage: woodUsage })
     const woodCells = d.createBuffer({ size: WOOD_CELLS * 16, usage: woodUsage })
@@ -1148,7 +1148,7 @@ export class PyroEngine {
         combine: withSkin(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }, v(flame)]),
         conserveSpread: group(p.conserveSpread, [P, s, v(vel[0]), { buffer: spread }]),
         conserveRatio: withSkin(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
-        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }]),
+        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }, v(flame)]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: d.createBindGroup({
@@ -2678,22 +2678,24 @@ export class PyroEngine {
   // Development: one column of the wooden ball's wood, the one under the surface facing dir (from the ball's centre):
   // each cell's depth below the surface as made (mm), thickness (mm), temperature (K), wood left, char, water left and
   // ash; the skin there (surface temperature K, volatiles kg/m2/s, char depth mm, ash cover), the rest of the surface
-  // (fuel flow up it, wear mm, char halfway down and at its base K), and the column's grain (its wood's density against
-  // the mean) and the share of it under cracks.
+  // (fuel flow up it, wear mm, char halfway down and at its base K), the column's grain (its wood's density against the
+  // mean), the share of it under cracks, the soot on it (kg/m2) and how much of it is covered, and how much the fire's
+  // flame lies against it.
   async readWood(dir: Vec3 = [0, 0, 1]) {
     if (!this.grids) return null
     const g = this.grids
     const d = this.device
     const t = skinTexel(dir)
     const half = this.woodParity
-    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 48, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 64, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
     for (let k = 0; k < WOOD_LAYERS; k++) {
       enc.copyBufferToBuffer(g.woodTemps, (half * WOOD_CELLS + k * SKIN_TEXELS + t) * 4, read, k * 4, 4)
       enc.copyBufferToBuffer(g.woodCells, (k * SKIN_TEXELS + t) * 16, read, WOOD_LAYERS * 4 + k * 16, 16)
     }
     enc.copyBufferToBuffer(g.skin, t * 16, read, WOOD_LAYERS * 20, 16)
-    enc.copyBufferToBuffer(g.ballSheet, t * 16, read, WOOD_LAYERS * 20 + 16, 16)
+    enc.copyBufferToBuffer(g.ballSheet, t * 32, read, WOOD_LAYERS * 20 + 16, 16)
+    enc.copyBufferToBuffer(g.ballSheet, t * 32 + 16, read, WOOD_LAYERS * 20 + 48, 16)
     enc.copyBufferToBuffer(g.woodCols, ((half * SKIN_TEXELS + t) * 2 + 1) * 16, read, WOOD_LAYERS * 20 + 32, 16)
     d.queue.submit([enc.finish()])
     await read.mapAsync(GPUMapMode.READ)
@@ -2709,6 +2711,9 @@ export class PyroEngine {
       sheet: Array.from(a.slice(WOOD_LAYERS * 5 + 4, WOOD_LAYERS * 5 + 8)),
       density: a[WOOD_LAYERS * 5 + 8],
       cracks: a[WOOD_LAYERS * 5 + 9],
+      soot: a[WOOD_LAYERS * 5 + 10],
+      flameAgainst: a[WOOD_LAYERS * 5 + 11],
+      sootCover: a[WOOD_LAYERS * 5 + 12],
       cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
     }
   }

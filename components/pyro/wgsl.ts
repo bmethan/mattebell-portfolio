@@ -3,7 +3,7 @@ import { AP1_WGSL, VIEW_TRANSFORMS_WGSL } from '../lab/viewTransforms'
 import { FUZZ } from '../lookdev/gpu/wgslBsdf'
 import { COLOR_CHECKER, SCENE_MATERIALS } from '../lookdev/materials'
 import { FIRE_BANDS } from './physics'
-import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SOOT_EXTINCTION, T_AMBIENT, Y_O2_AIR, wf } from './physics'
+import { CHEMI_LM_PER_W, CP, FUEL, RHO_T, SCHMIDT_T, SMAGORINSKY, SOOT_DELAY, SOOT_EXTINCTION, SOOT_EXTINCTION_633, T_AMBIENT, Y_O2_AIR, wf } from './physics'
 
 // The fire's escape table's rings (degrees of elevation; RENDER_COMMON's escapeDir) and their sines, by which the
 // table is read; and the share of the sphere each stands for, with straight down first and straight up last (for the
@@ -218,16 +218,16 @@ struct Params {
   grid: vec4<f32>,      // dx (m), dt (s), time (s), whether the velocity is advected with MacCormack (0 or 1)
   src: vec4<f32>,       // source centre (m), radius (m)
   srcProps: vec4<f32>,  // smoke density, smoke temperature rise (K), upward speed (m/s), noise (0..1)
-  forces: vec4<f32>,    // buoyancy (m/s2 per K of temperature rise), unused, vorticity, turbulence (m/s2)
+  forces: vec4<f32>,    // buoyancy (m/s2 per K of temperature rise), the wooden ball's wood clock (s), vorticity, turbulence (m/s2)
   forces2: vec4<f32>,   // turbulence scale (m), wind x (m/s), wind z (m/s), drag (1/s)
   decay: vec4<f32>,     // cooling (1/s), dissipation (1/s), SOR relaxation, speed limit (m/s)
   stirO: vec4<f32>,     // stir centre (m), radius (m)
   stirD: vec4<f32>,     // stir velocity change (m/s), on (0 or 1)
   stirR: vec4<f32>,     // LFM's step within its cycle, the forces' time step in steps (0 = one; LFM's leapfrog), the eddy viscosity on (IVOCK or LFM; 0 or 1), the scalars' MacCormack on (0 or 1)
   origin: vec4<f32>,    // domain min corner (m)
-  detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B
+  detail: vec4<f32>,    // reset detail layer A this step (0 or 1), layer B; the wood's step against the gas's, its test exposure (BALL_HEAT)
   fire: vec4<f32>,      // source is a fire bed (0 or 1), fuel it gives off (kg/s), soot yield (kg/kg), radiant fraction
-  fire2: vec4<f32>,     // expansion (1 = physical), mixing time (s), the bed's nominal area (m2), unused
+  fire2: vec4<f32>,     // expansion (1 = physical), mixing time (s), the bed's nominal area (m2), the wood's half (BALL_HEAT)
   ball: vec4<f32>,      // the collision ball's centre (m), radius (m; 0 = none)
   ballVel: vec4<f32>,   // its velocity (m/s), whether it is wood that burns (0 or 1)
   refGrey: vec4<f32>,   // the on-set reference (engine.ts): the grey ball's centre and radius (0: no reference)
@@ -2028,6 +2028,16 @@ fn crackLine(lp: vec3<f32>) -> f32 { return 1.0 - smoothstep(0.02, 0.09, cellEdg
 // Under the ball's own flames there is next to no oxygen, so its char burns once the flames die back, as measured
 // (Richter and colleagues 2021: a flame stops smouldering by taking the oxygen).
 //
+// The fire's flames running up the ball are a wall flame too, as thin against it as its own: where the cell beside its
+// surface burns at a flame's own rate (heat released through a flame's volume runs about a megawatt per cubic metre,
+// whatever the fuel or the fire's size: De Ris and Orloff 2005), the flame lies against it, and heats the wood there
+// and above it as the ball's own flame does. And smoke leaves soot on the wood: soot drifts down a temperature gradient
+// (thermophoresis) at 0.53 nu grad T / T (soot's coefficient, measured; Suzuki, Kuwana and Dobashi 2010), the gradient
+// against the surface the convection's (h dT / k), so gas hotter than the wood soots it, and the hotter the gas and
+// the cooler the wood, the faster. The soot darkens it as it dims light in the smoke (its extinction, 8.7 m2 per gram at
+// 633 nm, so a tenth of a gram per m2 hides half the wood) and makes it a near blackbody (0.95); on a surface hot
+// enough, it burns away as the char does, first.
+//
 // The volatiles leave through the char at once, so the surface gives off what its column makes, which COMBINE adds to
 // the gas as fuel: the ball's flames are the solver's own combustion. Where the char burns away, its cell empties and
 // the surface steps in: the shape wears back where it is hottest. Down a crack in the char, heat crosses the open
@@ -2039,9 +2049,9 @@ ${CHAR_CRACKS}
 @group(0) @binding(2) var scal: texture_3d<f32>;
 @group(0) @binding(3) var<storage, read> fireSums: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> skinOut: array<vec4<f32>>;
-// For the renderer, per texel: the fuel flowing up along the surface past it (kg per metre of width per second, for
-// the drawn flames), how far the surface has worn back (mm), and the char's temperature halfway down and at its base
-// (K), for the walls of its cracks.
+// For the renderer, per texel, two: the fuel flowing up along the surface past it (kg per metre of width per second,
+// for the drawn flames), how far the surface has worn back (mm), and the char's temperature halfway down and at its
+// base (K), for the walls of its cracks; then how much of the surface soot covers.
 @group(0) @binding(5) var<storage, read_write> sheetOut: array<vec4<f32>>;
 @group(0) @binding(6) var noiseTex: texture_3d<f32>;
 @group(0) @binding(7) var noiseSamp: sampler;
@@ -2052,9 +2062,11 @@ ${CHAR_CRACKS}
 // water left, w its ash (y and w in kg per kg of the cell's wood as made).
 @group(0) @binding(9) var<storage, read_write> cells: array<vec4<f32>>;
 // Each column's state, this step's and the next's (as the temperatures): the deepest layer heat has reached, the
-// surface's temperature (K) and how much of the surface below it is alight (for its flame's heat); then the wood's density there against its mean, the share of the column under cracks, and
-// 1 once it has been set up.
+// surface's temperature (K) and how much of the surface below it is alight (for its flame's heat); then the wood's
+// density there against its mean (0 until the column is set up), the share of the column under cracks, the soot on its
+// surface (kg/m2), and how much the fire's flame lies against it.
 @group(0) @binding(10) var<storage, read_write> cols: array<vec4<f32>>;
+@group(0) @binding(11) var flameTex: texture_3d<f32>; // the gas's heat release last step (MW/m3), COMBINE's
 const WOOD_LAYERS = ${WOOD_LAYERS}u;
 const WOOD_CELLS = ${WOOD_CELLS}u;
 const GRADED = 9u;
@@ -2200,7 +2212,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var cA = cols[cRead];
   var cB = cols[cRead + 1u];
   // A fresh ball: wood at the air's temperature with its water, and the column's grain and cracks, worked out once.
-  if (cB.z < 0.5) {
+  if (cB.x <= 0.0) {
     for (var k = 0u; k < WOOD_LAYERS; k++) {
       temps[k * SKIN_TEXELS + t] = T_AMB;
       temps[WOOD_CELLS + k * SKIN_TEXELS + t] = T_AMB;
@@ -2211,7 +2223,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       for (var b = 0; b < 3; b++) { crack += crackLine(cubeDir(face, f32(ti) + (f32(a) + 0.5) / 3.0, f32(tj) + (f32(b) + 0.5) / 3.0)); }
     }
     cA = vec4<f32>(2.0, T_AMB, 0.0, 0.0);
-    cB = vec4<f32>(woodDensity(n), crack / 9.0, 1.0, 0.0);
+    cB = vec4<f32>(woodDensity(n), crack / 9.0, 0.0, 0.0);
   }
   let prev = skin[t];
   colR = r;
@@ -2259,7 +2271,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var tGas = T_AMB;
   var hConv = H_CONV;
   var o2 = 1.0;
-  var eps = mix(0.9, 0.838, smoothstep(0.0, 0.3, prev.z));
+  let sootCover = 1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * cB.z);
+  var eps = mix(mix(0.9, 0.838, smoothstep(0.0, 0.3, prev.z)), 0.95, sootCover);
+  var contact = 0.0;
+  var sootIn = 0.0;
   if (P.detail.w > 0.0 || P.detail.w <= -10.0) {
     // (Development: a radiant flux of |P.detail.w| W/m2 on the whole ball in still air, as a cone calorimeter heats a
     // sample: positive, the sample flaming (its flame takes the oxygen); negative, with its flame out, the char in air.)
@@ -2313,24 +2328,39 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         qFire += radiated * lum / lumAll * max(dot(n, d) / dist, 0.0) / (12.566371 * dist * dist) * smoothstep(0.35, 0.7, dist);
       }
     }
-    // The ball's own flame along its surface: a layer too thin for the grid, it heats the wood above a burning patch,
-    // which is how fire climbs a surface. A wall flame's heat flux grows with the burning height beneath it, to about
-    // 25 kW/m2 once some 9 cm of the surface below is alight (measured averages run 15 to 20, the usual assumption 25
-    // to 30): a small new patch cannot keep thick wood burning without outside heat, a tall one can. Down the surface
-    // in steps of 1.1 cm, a texel to either side at random each step, averaged over the last few steps.
+    // The fire's flame against the surface here: the cell beside it burning at about a flame's own rate.
+    let nearAt = surface + n * dx;
+    contact = smoothstep(0.2, 1.1, textureSampleLevel(flameTex, samp, (nearAt - P.origin.xyz) / (vec3<f32>(P.dims.xyz) * dx), 0.0).x);
+    // The flame along the surface, the ball's own or the fire's: a layer too thin for the grid, it heats the wood
+    // above a burning patch, which is how fire climbs a surface. A wall flame's heat flux grows with the burning height
+    // beneath it, to about 25 kW/m2 once some 9 cm of the surface below is alight (measured averages run 15 to 20, the
+    // usual assumption 25 to 30): a small new patch cannot keep thick wood burning without outside heat, a tall one
+    // can. Down the surface in steps of 1.1 cm, a texel to either side at random each step, averaged over the last few
+    // steps; and where the fire's flame lies against the wood here, it heats it as fully as it lies.
     var below = 0.0;
     let stepA = 0.011 / r;
     let e = east * ((2.0 * jitter - 1.0) * 1.5707963 / f32(SKIN_N));
     for (var k = 1; k <= 8; k++) {
       let a = f32(k) * stepA;
       if (th0 + a > 3.1415927) { break; }
-      below += smoothstep(0.0015, 0.0025, skin[texelOf(normalize(n * cos(a) + down * sin(a) + e))].y) / 8.0;
+      let tb = texelOf(normalize(n * cos(a) + down * sin(a) + e));
+      below += max(smoothstep(0.0015, 0.0025, skin[tb].y), cols[(par * SKIN_TEXELS + tb) * 2u + 1u].w) / 8.0;
     }
-    below = mix(cA.z, below, 0.5);
+    below = mix(cA.z, max(below, contact), 0.5);
     belowOut = below;
     // The flame flickers, a pattern rising over the surface at a couple of hertz, so the front advances in fingers.
     let flicker = 0.5 + fbm(n * 5.0 + vec3<f32>(0.0, -2.0 * P.grid.z, 0.0));
     qIn = qGas + qFire + 25000.0 * below * flicker;
+    // The soot the smoke leaves (kg/m2/s): where the gas is hotter than the surface, thermophoresis, with air's
+    // viscosity and conductivity at the film between them.
+    let tg = T_AMB + near.rise;
+    let ts0 = cA.y;
+    if (tg > ts0) {
+      let tf = 0.5 * (tg + ts0);
+      let nu = 1.5e-5 * pow(tf / 293.0, 1.7);
+      let kAir = 0.0257 * pow(tf / 293.0, 0.8);
+      sootIn = near.soot / SOOT_G * (RHO_T / tg) * 0.53 * nu / tf * H_CONV * (tg - ts0) / kAir;
+    }
     tGas = T_AMB + near.rise;
     o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
   }
@@ -2345,6 +2375,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let byRate = 0.248 * exp(-39784.0 / (RG * tsPrev)) * pow(o2, 0.68);
   let byOxygen = hConv / 1200.0 * Y_O2_AIR * o2 * 0.5;
   let burnRate = min(byRate, byOxygen) * smoothstep(0.05, 0.3, prev.z);
+  // (Soot burns as bare char does, and like it, not on a surface below 286 C.)
+  let soot = max(cB.z + (sootIn - min(byRate, byOxygen) * smoothstep(559.0, 640.0, tsPrev)) * dt, 0.0);
   colOx = burnRate * areaS * dt;
   // The surface's balance, its own radiation linearised about last step's temperature: q0 - lam Ts.
   let lam = hConv + 4.0 * eps * SIGMA * tsPrev * tsPrev * tsPrev;
@@ -2476,11 +2508,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let a = (f32(j) + jitter) * dth;
     sheet += burning(skin[texelOf(normalize(n * cos(a) + down * sin(a)))].y) * sin(th0 + a);
   }
-  sheet = mix(sheetOut[t].x, sheet * r * dth / max(sin(th0), 0.15), 0.3);
+  sheet = mix(sheetOut[2u * t].x, sheet * r * dth / max(sin(th0), 0.15), 0.3);
   skinOut[t] = vec4<f32>(ts, sumFuel, 1000.0 * sumChar, 1.0 - exp(-sumAsh / (areaS * ASH_COVER)));
-  sheetOut[t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
+  sheetOut[2u * t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
+  sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), 0.0, 0.0, 0.0);
   cols[cWrite] = vec4<f32>(f32(max(u32(cA.x), min(warm + 1u, WOOD_LAYERS - 1u))), ts, belowOut, 0.0);
-  cols[cWrite + 1u] = cB;
+  cols[cWrite + 1u] = vec4<f32>(cB.x, cB.y, soot, contact);
 }
 `
 
@@ -3134,8 +3167,9 @@ ${bandSpreadWgsl('fireLight')}
 @group(0) @binding(11) var blueTex: texture_2d_array<f32>; // spatiotemporal blue noise, a slice a frame
 @group(0) @binding(12) var upresTex: texture_3d<f32>; // a smoke source's density on the twice-as-fine grid
 @group(0) @binding(13) var flameTex: texture_3d<f32>; // a fire's heat release rate (MW/m3)
-// The burning ball beyond its skin (BALL_HEAT), per skin texel: the fuel flowing up its surface, how far the surface has
-// worn back (mm), and the char's temperature halfway down and at its base (K).
+// The burning ball beyond its skin (BALL_HEAT), per skin texel, two: the fuel flowing up its surface, how far the
+// surface has worn back (mm), and the char's temperature halfway down and at its base (K); then how much of the surface
+// soot covers.
 @group(0) @binding(32) var<storage, read> ballSheet: array<vec4<f32>>;
 @group(0) @binding(33) var envTex: texture_2d<f32>; // an HDR environment's backdrop, softened (environment.ts)
 @group(0) @binding(34) var light2: texture_3d<f32>; // x: optical depth toward the softbox rig's rim (LIGHT)
@@ -3339,7 +3373,13 @@ const SHEET_REF = 0.002; // kg of fuel per metre of width per second, some 35 kW
 // The ball beyond its skin where the outward normal n meets the surface, bilinear like skinAt; and the fuel flow there.
 fn ballSheetAt(n: vec3<f32>) -> vec4<f32> {
   let t = skinTaps(n);
-  return t.w.x * ballSheet[t.i.x] + t.w.y * ballSheet[t.i.y] + t.w.z * ballSheet[t.i.z] + t.w.w * ballSheet[t.i.w];
+  let i = 2u * t.i;
+  return t.w.x * ballSheet[i.x] + t.w.y * ballSheet[i.y] + t.w.z * ballSheet[i.z] + t.w.w * ballSheet[i.w];
+}
+fn ballSootAt(n: vec3<f32>) -> f32 {
+  let t = skinTaps(n);
+  let i = 2u * t.i + 1u;
+  return t.w.x * ballSheet[i.x].x + t.w.y * ballSheet[i.y].x + t.w.z * ballSheet[i.z].x + t.w.w * ballSheet[i.w].x;
 }
 fn sheetAt(n: vec3<f32>) -> f32 { return ballSheetAt(n).x / SHEET_REF; }
 // The layer's thickness (m) for a fuel flow s (in SHEET_REF), and how sooty, so bright, the flame is (the layer a third
@@ -3440,7 +3480,7 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>) -> Crack
   let x = z / (2.0 * (w - k * z));
   return CrackHit(z / floorD, nn, w / (w + floorD), sqrt(1.0 + x * x) - x);
 }
-fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> vec3<f32> {
+fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32) -> vec3<f32> {
   let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
   let wave = textureSampleLevel(noiseTex, noiseSamp, lp * 0.3 + 0.5, 0.0).x - 0.5;
   let ring = fract(length(lp - dot(lp, axis) * axis) * 16.0 + 0.6 * wave);
@@ -3450,6 +3490,8 @@ fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> vec3<f32> {
   // thinnest cell a fiftieth converted, which browns wood, and it is black once that cell is most of the way to char.)
   a = mix(a, vec3<f32>(0.16, 0.07, 0.03), smoothstep(0.0, 0.02, sk.z));
   a = mix(a, vec3<f32>(0.035, 0.03, 0.028), smoothstep(0.03, 0.4, sk.z));
+  // Soot over it (its own black, a few percent), but not down a crack, opened since.
+  a = mix(a, vec3<f32>(0.03), soot * (1.0 - crack));
   let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
   return REC709_TO_AP1 * mix(a, vec3<f32>(0.42, 0.41, 0.39), sk.w * mix(0.55, 1.0, plates) * (1.0 - crack));
 }
@@ -3471,12 +3513,13 @@ struct BallMat {
   fuzzColor: vec3<f32>,
   fuzzRough: f32,
 }
-fn ballMat(lp: vec3<f32>, sk: vec4<f32>, crack: f32) -> BallMat {
+fn ballMat(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32) -> BallMat {
   let charred = smoothstep(0.03, 0.4, sk.z);
   let ior = mix(1.5, 1.9, charred);
   let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
   let ash = sk.w * mix(0.55, 1.0, plates) * (1.0 - crack);
-  return BallMat(woodAlbedo(lp, sk, crack), (1.0 - crack) * (1.0 - 0.7 * ash), mix(0.6, 0.4, charred), sq((ior - 1.0) / (ior + 1.0)),
+  // (Soot is matte: the wood's sheen fades under it.)
+  return BallMat(woodAlbedo(lp, sk, crack, soot), (1.0 - crack) * (1.0 - 0.7 * ash) * (1.0 - 0.8 * soot), mix(0.6, 0.4, charred), sq((ior - 1.0) / (ior + 1.0)),
     0.8 * ash, REC709_TO_AP1 * vec3<f32>(0.42, 0.41, 0.39), 0.7);
 }
 // Columns: two tangents and the normal.
@@ -3550,7 +3593,7 @@ fn woodAt(p0: vec3<f32>, rd: vec3<f32>) -> WoodHit {
   let lp = (p - P.ball.xyz) / P.ball.w;
   let sk = skinAt(nb);
   let c = crackHit(lp, nb, rd, sk);
-  var m = ballMat(lp, sk, select(0.0, 1.0, c.depth >= 0.0));
+  var m = ballMat(lp, sk, select(0.0, 1.0, c.depth >= 0.0), ballSootAt(nb));
   m.base *= c.view;
   return WoodHit(p, nb, m, c.n, charGlow(sk, ballSheetAt(nb), c));
 }

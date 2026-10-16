@@ -2385,9 +2385,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         qFire += radiated * lum / lumAll * max(dot(n, d) / dist, 0.0) / (12.566371 * dist * dist) * smoothstep(0.35, 0.7, dist);
       }
     }
-    // The fire's flame against the surface here: the cell beside it burning at about a flame's own rate.
+    // The fire's flame against the surface here: the cell beside it burning at about a flame's own rate. Only where
+    // the wood is not alight itself: wood that is gives off its volatiles fast enough to hold an outer flame off it
+    // (blowing), and the flame that burns beside it then is its own, which the burning below it counts. (Taken for the
+    // fire's, a ball out of the fire kept itself alight.)
     let nearAt = surface + n * dx;
     contact = smoothstep(0.2, 1.1, textureSampleLevel(flameTex, samp, (nearAt - P.origin.xyz) / (vec3<f32>(P.dims.xyz) * dx), 0.0).x);
+    contact *= 1.0 - smoothstep(0.0015, 0.0025, prev.y);
     // The flame along the surface, the ball's own or the fire's: a layer too thin for the grid, it heats the wood
     // above a burning patch, which is how fire climbs a surface. A wall flame's heat flux grows with the burning height
     // beneath it, to about 25 kW/m2 once some 9 cm of the surface below is alight (measured averages run 15 to 20, the
@@ -2444,8 +2448,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let nbWorn = vec4<f32>(cols[(nbAt + colNb.x) * 2u].w, cols[(nbAt + colNb.y) * 2u].w, cols[(nbAt + colNb.z) * 2u].w, cols[(nbAt + colNb.w) * 2u].w);
   let proud = clamp(1.0 + dot(nbWorn - worn, vec4<f32>(1.0)) * sqrt(colSide) * r / rs, 0.25, 3.0);
   let burnRate = min(byRate, byOxygen) * smoothstep(0.05, 0.3, prev.z) * proud;
-  // (Soot burns as bare char does, and like it, not on a surface below 286 C.)
-  let soot = max(cB.z + (sootIn - min(byRate, byOxygen) * smoothstep(559.0, 640.0, tsPrev)) * dt, 0.0);
+  // Soot burns far less readily than wood's char: at Lee, Thring and Beer's rate for soot in oxygen, 1.085e5 P_O2
+  // T^-1/2 exp(-19,778 / T) g per cm2 a second (P_O2 in atmospheres), no faster than oxygen reaches it. A layer that
+  // blackens the wood lasts a quarter of an hour at 530 C, a minute at 630 and seconds at 730, so the soot stays on
+  // the wood until it chars and glows.
+  let sootBurn = min(1.085e6 * 0.21 * o2 / sqrt(tsPrev) * exp(-19778.0 / tsPrev), byOxygen);
+  let soot = max(cB.z + (sootIn - sootBurn) * dt, 0.0);
   colOx = burnRate * areaS * dt;
   // The surface's balance, its own radiation linearised about last step's temperature: q0 - lam Ts.
   let lam = hConv + 4.0 * eps * SIGMA * tsPrev * tsPrev * tsPrev;

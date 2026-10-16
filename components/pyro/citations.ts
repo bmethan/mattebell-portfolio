@@ -362,6 +362,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.20619/jcombsj.52.159_68',
   },
   {
+    id: 'lee-thring-beer',
+    group: 'Burning ball',
+    authors: 'K. B. Lee, M. W. Thring, J. M. Beér',
+    title: 'On the Rate of Combustion of Soot in a Laminar Soot Flame',
+    venue: 'Combustion and Flame 6, soot’s burning in oxygen, 1.085e5 P_O2 T^-1/2 exp(-19,778 / T) g/cm²/s',
+    year: '1962',
+    url: 'https://doi.org/10.1016/0010-2180(62)90082-2',
+  },
+  {
     id: 'emberley',
     group: 'Burning ball',
     authors: 'Richard Emberley, Carmen Gorska Putynska, Aaron Bolanos, Andrea Lucherini, Angela Solarte, Diana Soriguer, Mateo Gutierrez Gonzalez, Kathryn Humphreys, Juan P. Hidalgo, Cristian Maluk, Angus Law, José L. Torero',

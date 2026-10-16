@@ -2442,12 +2442,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       let tg = T_AMB + g.rise;
       let fv = g.soot / SOOT_G * (RHO_T / tg) / 1800.0; // soot's volume fraction (1800 kg/m3)
       let a = 1.0 - exp(-1810.0 * fv * tg * 2.0 * dx * 1.5); // (1.5: the mean path across the layer over a hemisphere)
-      qGas += through * a * SIGMA * t4(tg);
+      qGas += through * a * SIGMA * t4(min(tg, 1550.0));
       through *= 1.0 - a;
     }
     // The flames' emissivity is held to 0.25, a wood flame's some 40 cm deep (such flames absorb about 0.7 per metre):
     // the lab's soot yield is a look as much as a measurement, and its flames run hotter than measured (see
-    // Validation), which T^4 would magnify.
+    // Validation), which T^4 would magnify. For that too, each layer's soot radiates at no more than 1550 K, the hot
+    // end of what wood flames measure: in a bonfire's bed the solver's gas runs to some 1900 K, and the char beside it
+    // ran to 1200 C, where a log's runs 800 to 1000.
     let flameEps = 1.0 - through;
     if (flameEps > 0.25) { qGas *= 0.25 / flameEps; through = 0.75; }
     qGas += through * SIGMA * t4(T_AMB);
@@ -2505,7 +2507,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       let kAir = 0.0257 * pow(tf / 293.0, 0.8);
       sootIn = near.soot / SOOT_G * (RHO_T / tg) * 0.53 * nu / tf * hConv * (tg - ts0) / kAir;
     }
-    tGas = T_AMB + near.rise;
+    // Where a flame lies against the wood, its heat is the wall flame's above, the heat flux wall flames are measured
+    // to give, convection and all: the flame's gas beside the wood heats it no further (it may still cool it). Taking
+    // both counted the flame twice, and with the coefficient a breeze over crazed char takes, held the char in a
+    // bonfire's bed at the solver's flame temperature, some 1200 C, where a log's runs 800 to 1000.
+    tGas = mix(T_AMB + near.rise, min(T_AMB + near.rise, cA.y), below);
     o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
   }
   // The char burning where it is bare, at last step's surface temperature: as its own chemistry allows (charKinetics,

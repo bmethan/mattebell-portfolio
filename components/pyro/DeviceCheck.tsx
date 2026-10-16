@@ -104,20 +104,20 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
         }
         lines.push(`${c.name} | ${m.resolution} | ${m.steps} | ${m.fps} | ${m.scale} | ${m.errors} | ${v ? `${v.frame}, ${v.textures}` : '?'} | ${v ? v.ceiling : '?'}`)
       }
-      // The wooden ball held in the bonfire's flames until 12 simulated seconds (it catches at 6 to 8).
+      // The wooden ball held in the bonfire's flames until 16 simulated seconds (it catches at 10 to 12).
       setProgress(`${cases.length + 1} of ${cases.length + 1}: the wooden ball in the bonfire`)
       applyPreset({ velocity: PYRO_DEFAULTS.velocity, ...PRESETS.find(p => p.id === 'bonfire')!.state, ball: true, ballBurns: true })
       ensureRunning()
       await sleep(300)
       e.placeBall(0, 0.45)
       const t0 = performance.now()
-      while ((statusRef.current?.simTime ?? 0) < 12 && performance.now() - t0 < 60000) await sleep(500)
+      while ((statusRef.current?.simTime ?? 0) < 16 && performance.now() - t0 < 60000) await sleep(500)
       const s = statusRef.current
       const b = s?.ball
       lines.push(
         '',
         b
-          ? `Burning ball at ${s!.simTime.toFixed(1)} s: ${Math.round(b.surfaceK - 273)} C, burning ${b.burningKW.toFixed(1)} kW, ${Math.round(b.charred * 100)}% charred: ${b.burningKW >= 0.5 ? 'caught, as it should' : 'not alight yet (it should be by 8 s)'}`
+          ? `Burning ball at ${s!.simTime.toFixed(1)} s: ${Math.round(b.surfaceK - 273)} C, burning ${b.burningKW.toFixed(1)} kW, ${Math.round(b.charred * 100)}% charred: ${b.burningKW >= 0.5 ? 'caught, as it should' : 'not alight yet (it should be by about 12 s)'}`
           : `Burning ball: no reading by ${(s?.simTime ?? 0).toFixed(1)} s`,
       )
       lines.push(`WebGPU errors in all: ${e.gpuErrors.length}${e.gpuErrors.length ? `; first: ${e.gpuErrors[0]}` : ''}`)

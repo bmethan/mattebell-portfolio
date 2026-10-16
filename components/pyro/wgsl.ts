@@ -258,7 +258,7 @@ struct Params {
   refChartV: vec4<f32>, // its height, up its face; the set's greatest x
   wear1: vec4<f32>,     // the wooden ball's wear (m) as the gas sees it (wornBall): along x, y and z
   wear2: vec4<f32>,     // along x2, y2 and z2
-  wear3: vec4<f32>,     // along xy, yz and zx
+  wear3: vec4<f32>,     // along xy, yz and zx; the air blown over the wood under a test exposure (m/s; BALL_HEAT)
 }
 @group(0) @binding(0) var<uniform> P: Params;
 
@@ -377,6 +377,25 @@ fn skinAt(n: vec3<f32>) -> vec4<f32> {
 }
 // What reaches the fire from the ball's surface: its volatiles, once they come off fast enough to burn (about 2 g per
 // m2 a second, wood's critical mass flux for flaming); slower, they only scorch it.
+// The heat transfer coefficient (W/m2 K) between the wooden ball's surface, at ts, and the air beside it, at tg, the
+// air moving past it at u (m/s), the ball of radius r: forced convection as over a sphere (Whitaker 1972), but once the
+// char crazes (crazed 0 to 1) over its blocks, a ninth of the radius across, each starting afresh at its upstream crack
+// as a body of its own; and natural convection over the whole ball (Churchill 1983); combined as the cube root of the
+// sum of their cubes, Churchill's rule for mixed convection. Air's viscosity and conductivity at the film between
+// them, its Prandtl number 0.71. In still air a 22 cm ball takes some 5 W/m2 K; its crazed char in a breeze of 1.5 m/s,
+// some 27, which is why a breath over embers makes them flare.
+fn surfaceH(u: f32, ts: f32, tg: f32, r: f32, crazed: f32) -> f32 {
+  let tf = 0.5 * (ts + tg);
+  let nu = 1.5e-5 * pow(tf / 293.0, 1.7);
+  let kAir = 0.0257 * pow(tf / 293.0, 0.8);
+  let d = 2.0 * r;
+  let l = mix(d, r / 9.0, crazed);
+  let re = u * l / nu;
+  let hF = (2.0 + (0.4 * sqrt(re) + 0.06 * pow(re, 0.6666667)) * 0.872) * kAir / l;
+  let ra = 9.81 * abs(ts - tg) / tf * d * d * d * 0.71 / (nu * nu);
+  let hN = (2.0 + 0.589 * pow(ra, 0.25) / 1.296) * kAir / d;
+  return pow(hF * hF * hF + hN * hN * hN, 0.3333333);
+}
 fn ballFuelFlux(n: vec3<f32>) -> f32 {
   let m = skinAt(n).y;
   return m * smoothstep(0.0015, 0.0025, m);
@@ -486,6 +505,21 @@ fn heatRise(burned: f32) -> f32 { return burned * HEAT * (1.0 - P.fire.w) / CP; 
 fn expansionOf(g: Gas, hrrHere: f32, w: vec3<f32>, measuredArea: f32) -> f32 {
   let heating = hrrHere * (1.0 - P.fire.w) / (RHO_T / (T_AMB + g.rise) * CP);
   return P.fire2.x * heating / (T_AMB + g.rise) + fuelAdded(g, w, measuredArea, P.grid.y) / P.grid.y;
+}
+// The heat a burning ball's surface gives the gas beside it (K of the gas's temperature rise in dt), u the gas's
+// velocity there: convected from the surface at the coefficient the wood itself takes (surfaceH), into the layer of
+// cells just outside it as it has worn back, each of which holds about dx^2 of its surface. (Gas hotter than the
+// surface gives it heat instead.) A glowing ball warms the air beside it, which rises and draws fresh air past it.
+fn ballWarmth(g: Gas, w: vec3<f32>, u: vec3<f32>, dt: f32) -> f32 {
+  if (!ballBurns()) { return 0.0; }
+  let d = w - P.ball.xyz;
+  let l = max(length(d), 1e-6);
+  let gap = l - wornRadius(d / l);
+  if (gap <= 0.0 || gap > P.grid.x) { return 0.0; }
+  let sk = skinAt(d / l);
+  let tg = T_AMB + g.rise;
+  let h = surfaceH(length(u - P.ballVel.xyz), sk.x, tg, P.ball.w, smoothstep(0.8, 2.5, sk.z));
+  return h * (sk.x - tg) * dt / (RHO_T / tg * CP * P.grid.x);
 }
 // Fixed point for the mass-keeping pass's atomic sums of trilinear weights.
 const SPREAD_ONE = 1048576.0;
@@ -2066,13 +2100,15 @@ fn crackLine(lp: vec3<f32>) -> f32 { return 1.0 - smoothstep(0.02, 0.09, cellEdg
 // slowly. Only cells heat has reached are worked, down to a layer more than it has reached in the column or beside it.
 //
 // At the surface the heat balance is as before: radiation from the gas outside it (four layers along the normal), from
-// the fire further off and from the ball's own flame on the wood above a burning patch; convection; the surface's own
-// radiation; and, where its char is bare, the char's burning, 0.248 exp(-39.8 kJ/mol / RT) kg per m2 a second
-// (Chatani and Harada's measurement on larch, 2024: half a gram at 500 C, next to nothing below 290 C), as the oxygen
-// at the surface allows (to the power 0.68, as Rinta-Paavola and colleagues took it), releasing 23.4 MJ/kg and leaving
-// pine's ash, 0.4% of the wood (0.2 to 0.7% measured in pine, spruce, birch and aspen; Werkelin and colleagues 2005).
-// Under the ball's own flames there is next to no oxygen, so its char burns once the flames die back, as measured
-// (Richter and colleagues 2021: a flame stops smouldering by taking the oxygen).
+// the fire further off and from the ball's own flame on the wood above a burning patch; convection, at a coefficient
+// the air moving past sets (surfaceH); the surface's own radiation; and, where its char is bare, the char's burning,
+// 0.248 exp(-39.8 kJ/mol / RT) kg per m2 a second (Chatani and Harada's measurement on larch, 2024: half a gram at
+// 500 C, next to nothing below 290 C), as the oxygen at the surface allows (to the power 0.68, as Rinta-Paavola and
+// colleagues took it) and no faster than the air brings it, releasing the heat of what it burns to, and leaving pine's
+// ash, 0.4% of the wood (0.2 to 0.7% measured in pine, spruce, birch and aspen; Werkelin and colleagues 2005). Under
+// the ball's own flames there is next to no oxygen, so its char burns once the flames die back, as measured (Richter
+// and colleagues 2021: a flame stops smouldering by taking the oxygen), and glows as embers do: brighter where the air
+// moves past it faster, as a breath over embers makes them flare.
 //
 // The fire's flames running up the ball are a wall flame too, as thin against it as its own: where the cell beside its
 // surface burns at a flame's own rate (heat released through a flame's volume runs about a megawatt per cubic metre,
@@ -2097,7 +2133,8 @@ ${CHAR_CRACKS}
 @group(0) @binding(4) var<storage, read_write> skinOut: array<vec4<f32>>;
 // For the renderer, per texel, two: the fuel flowing up along the surface past it (kg per metre of width per second,
 // for the drawn flames), how far the surface has worn back (mm), and the char's temperature halfway down and at its
-// base (K), for the walls of its cracks; then how much of the surface soot covers.
+// base (K), for the walls of its cracks; then how much of the surface soot covers, the air's speed past it (m/s) and
+// the heat transfer coefficient that sets (W/m2 K).
 @group(0) @binding(5) var<storage, read_write> sheetOut: array<vec4<f32>>;
 @group(0) @binding(6) var noiseTex: texture_3d<f32>;
 @group(0) @binding(7) var noiseSamp: sampler;
@@ -2113,6 +2150,7 @@ ${CHAR_CRACKS}
 // under cracks, the soot on its surface (kg/m2), and how much the fire's flame lies against it.
 @group(0) @binding(10) var<storage, read_write> cols: array<vec4<f32>>;
 @group(0) @binding(11) var flameTex: texture_3d<f32>; // the gas's heat release last step (MW/m3), COMBINE's
+@group(0) @binding(12) var vel: texture_3d<f32>; // the gas's velocity (m/s)
 const WOOD_LAYERS = ${WOOD_LAYERS}u;
 const WOOD_CELLS = ${WOOD_CELLS}u;
 const GRADED = 9u;
@@ -2127,7 +2165,6 @@ const CHAR_YIELD = 0.16;
 const ASH_YIELD = 0.004;
 const H_PYRO = 1.4e5; // J per kg of wood broken down
 const L_EVAP = 2.26e6;
-const H_OX = 2.341e7; // J per kg of char burned
 const FISSURE = 0.0015; // m, a crack's width in the char
 // The ash on the surface (kg/m2) that covers most of it: a layer some 10 micrometres deep, a few of its fine particles
 // thick (an estimate).
@@ -2194,7 +2231,8 @@ var<private> colLat: f32;
 var<private> colCrack: f32; // the share of the column's char split by cracks
 var<private> colNb: vec4<u32>; // the columns beside it
 var<private> colSide: f32; // 1 / its area at the surface as made, for the heat from beside it
-var<private> colOx: f32; // the char burning off the surface this step, kg per m2 of the surface as made
+var<private> colOx: f32; // the char still to burn this step, kg per m2 of the surface as made, from the surface down
+var<private> colOxTo: u32; // the deepest cell it may reach
 var<private> sumFuel: f32;
 var<private> sumChar: f32;
 var<private> sumAsh: f32;
@@ -2205,7 +2243,7 @@ struct Cell { t: f32, c: f32, rHalf: f32, rhs: f32, side: f32 }
 // the step's start and its own at the step's end (side, the conductance to them, goes with its heat capacity), which is
 // stable at any step: deep in, the columns narrow, and with the time-lapse's long steps heat from beside a cell taken
 // wholly at the step's start ran away there.
-fn cellStep(k: u32, surface: bool) -> Cell {
+fn cellStep(k: u32) -> Cell {
   let idx = k * SKIN_TEXELS + colT;
   let t = clamp(temps[colRead + idx], 250.0, 2500.0);
   let m = cells[idx];
@@ -2235,9 +2273,10 @@ fn cellStep(k: u32, surface: bool) -> Cell {
   let side = g * dot(open, vec4<f32>(1.0));
   var c1 = m.y + CHAR_YIELD * dWood;
   var a1 = m.w;
-  if (surface && colOx > 0.0) {
+  if (colOx > 0.0 && k <= colOxTo) {
     let burnt = min(colOx / m0, c1);
     c1 -= burnt;
+    colOx -= burnt * m0;
     a1 += burnt * ASH_YIELD / CHAR_YIELD;
   }
   cells[idx] = vec4<f32>(w1, c1, m.z - dWater, a1);
@@ -2327,6 +2366,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var belowOut = 0.0;
   var tGas = T_AMB;
   var hConv = H_CONV;
+  var uRel = 0.0;
   var o2 = 1.0;
   let sootCover = 1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * cB.z);
   var eps = mix(mix(0.9, 0.838, smoothstep(0.0, 0.3, prev.z)), 0.95, sootCover);
@@ -2337,15 +2377,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // sample: positive, the sample flaming (its flame takes the oxygen); negative, with its flame out, the char in air.)
     qIn = abs(P.detail.w) + SIGMA * t4(T_AMB);
     o2 = select(1.0, 0.0, P.detail.w > 0.0);
+    // (Blown at P.wear3.w m/s, as a breeze over the char.)
+    if (P.wear3.w > 0.0) {
+      uRel = P.wear3.w;
+      hConv = surfaceH(uRel, cA.y, T_AMB, r, smoothstep(0.8, 2.5, prev.z));
+    }
   } else if (P.detail.w < 0.0) {
     // (Development: the standard fire of fire-resistance furnaces, ISO 834, P.forces.y seconds in; convection 25
-    // W/(m2 K) and the surface's emissivity 0.8, as Eurocode 1 takes them, and some 6% oxygen.)
+    // W/(m2 K) and the surface's emissivity 0.8, as Eurocode 1 takes them, and some 6% oxygen, which the sample's own
+    // volatiles take while it gives them off fast enough to flame, as they do in the fire.)
     let tf = T_AMB + 345.0 * log(8.0 * P.forces.y / 60.0 + 1.0) * 0.43429448;
     qIn = SIGMA * t4(tf);
     tGas = tf;
     hConv = 25.0;
     eps = 0.8;
-    o2 = 0.3;
+    o2 = 0.3 * (1.0 - smoothstep(0.0015, 0.0025, prev.y));
   } else {
     // The gas along the normal: four layers out to 25 cm, each a layer of soot at its own temperature (soot's
     // Planck-mean absorption coefficient, 3.72 C0 T / C2 per unit volume fraction with C0 = 7, about 1810 f_v T per
@@ -2353,6 +2399,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var through = 1.0;
     var qGas = 0.0;
     let near = gasAt(surface + n * dx);
+    // The air moving past the surface, against the ball's own motion (swinging the ball fans it as a breeze does).
+    uRel = length(velAt(vel, samp, (surface + n * dx - P.origin.xyz) / dx) - P.ballVel.xyz);
+    hConv = surfaceH(uRel, cA.y, T_AMB + near.rise, r, smoothstep(0.8, 2.5, prev.z));
     for (var k = 0; k < 4; k++) {
       var g = near;
       if (k > 0) { g = gasAt(surface + n * (1.0 + 2.0 * f32(k)) * dx); }
@@ -2420,7 +2469,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       let tf = 0.5 * (tg + ts0);
       let nu = 1.5e-5 * pow(tf / 293.0, 1.7);
       let kAir = 0.0257 * pow(tf / 293.0, 0.8);
-      sootIn = near.soot / SOOT_G * (RHO_T / tg) * 0.53 * nu / tf * H_CONV * (tg - ts0) / kAir;
+      sootIn = near.soot / SOOT_G * (RHO_T / tg) * 0.53 * nu / tf * hConv * (tg - ts0) / kAir;
     }
     tGas = T_AMB + near.rise;
     o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
@@ -2428,10 +2477,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // The char burning where it is bare, at last step's surface temperature: at the measured rate (measured in a cone
   // calorimeter's still air, so with the oxygen reaching it there), but no faster than oxygen reaches the surface.
   // Oxygen reaches it as heat does (the analogy of heat and mass transfer: h / cp kg per m2 a second, times its mass
-  // fraction), and burns half its mass of carbon (between carbon dioxide's 0.375 and carbon monoxide's 0.75): in still
+  // fraction, air's cp some 1100 J/kg K at the film), and burns the carbon its products take (below): in a cone's still
   // air, about a gram per m2 a second, which is what the measurement levels off at above 600 C, and what holds char in
   // a furnace's hot gas, with its few percent of oxygen, to a burning its chemistry alone would run several times
-  // faster.
+  // faster. A breeze brings more, and the char burns hotter.
   // A column worn back less than those beside it stands above them, and the heat and oxygen that burn its char reach it
   // more readily than one sunk between its neighbours: its char burns faster, a sunk column's slower, by the depth it
   // stands above or below each neighbour over its width, and the surface as a whole burns as before. (Its true area
@@ -2440,14 +2489,41 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // depth of denser char), stands proud until it burns enough faster to keep pace, under a millimetre above the wood
   // beside it, as the rings stand on charred or weathered wood. Without this the relief would deepen for as long as the
   // wood burned.
+  // What the char burns to: more carbon monoxide the hotter it is, at the ratio CO / CO2 = 10^3.4 exp(-12,400 cal/mol
+  // / RT) that Arthur measured (as char-burning models take it): a kilogram of carbon takes 2.67 kg of oxygen to carbon
+  // dioxide and releases 32.8 MJ, or 1.33 kg to carbon monoxide and 9.2 MJ, the monoxide carrying its own heat away.
+  // At 500 C nearly half goes to the monoxide, some 22 MJ per kg of char (Chatani and Harada's heat balance gave
+  // 23.4); at 900 C, nine tenths, some 11.
   let tsPrev = cA.y;
-  let byRate = 0.248 * exp(-39784.0 / (RG * tsPrev)) * pow(o2, 0.68);
-  let byOxygen = hConv / 1200.0 * Y_O2_AIR * o2 * 0.5;
+  let co = 2512.0 * exp(-6240.0 / tsPrev);
+  let toCO = co / (1.0 + co);
+  let heatPerC = mix(3.28e7, 9.2e6, toCO);
+  // The cracks (the column's share of them, colCrack, open once the char is a millimetre or two deep) bare their walls,
+  // down to the char's base, to the burning as well as the face between them: the char burns over 1 + 2 D / W times the
+  // area there, D the char's depth and W a crack's width, as far as its chemistry allows (the oxygen still comes in at
+  // the top); and a crack's mouth radiates as a cavity, its walls seeing one another, e / (e + (1 - e) W / (W + 2 D)),
+  // as the renderer draws it. So the glow lingers along the cracks after the faces between them have gone dark, as it
+  // does in embers.
+  let crackD = 0.001 * prev.z;
+  let walls = 1.0 + colCrack * min(2.0 * crackD / FISSURE, 6.0);
+  eps = mix(eps, eps / (eps + (1.0 - eps) * FISSURE / (FISSURE + 2.0 * crackD)), colCrack);
+  let byRate = 0.248 * exp(-39784.0 / (RG * tsPrev)) * pow(o2, 0.68) * walls;
+  let byOxygen = hConv / 1100.0 * Y_O2_AIR * o2 * 0.375 / (1.0 - 0.5 * toCO);
   let nbAt = par * SKIN_TEXELS;
   let worn = r - rs;
   let nbWorn = vec4<f32>(cols[(nbAt + colNb.x) * 2u].w, cols[(nbAt + colNb.y) * 2u].w, cols[(nbAt + colNb.z) * 2u].w, cols[(nbAt + colNb.w) * 2u].w);
   let proud = clamp(1.0 + dot(nbWorn - worn, vec4<f32>(1.0)) * sqrt(colSide) * r / rs, 0.25, 3.0);
-  let burnRate = min(byRate, byOxygen) * smoothstep(0.05, 0.3, prev.z) * proud;
+  // The char the burning reaches: the surface cell's and, through a cell its burning has emptied of char (left with a
+  // sliver of wood its pyrolysis has not quite finished, which oxygen passes through), the char of the two beneath.
+  // Without that, such a sliver stopped the char beneath from burning at all.
+  var charNear = 0.0;
+  colOxTo = min(s + 2u, WOOD_LAYERS - 1u);
+  for (var k = s; k <= colOxTo; k++) {
+    let hk = layerThick(k, r);
+    let mk = (r - layerTop(k, r) - 0.5 * hk) / r;
+    charNear += WOOD_RHO * colPatch * ringDensity(colGrain, mk) * layerVol(k, r) * cells[k * SKIN_TEXELS + t].y;
+  }
+  let burnRate = min(min(byRate, byOxygen) * smoothstep(0.05, 0.3, prev.z) * proud, charNear / (areaS * dt));
   // Soot burns far less readily than wood's char: at Lee, Thring and Beer's rate for soot in oxygen, 1.085e5 P_O2
   // T^-1/2 exp(-19,778 / T) g per cm2 a second (P_O2 in atmospheres), no faster than oxygen reaches it. A layer that
   // blackens the wood lasts a quarter of an hour at 530 C, a minute at 630 and seconds at 730, so the soot stays on
@@ -2457,7 +2533,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   colOx = burnRate * areaS * dt;
   // The surface's balance, its own radiation linearised about last step's temperature: q0 - lam Ts.
   let lam = hConv + 4.0 * eps * SIGMA * tsPrev * tsPrev * tsPrev;
-  let q0 = eps * qIn + hConv * tGas + 3.0 * eps * SIGMA * t4(tsPrev) + burnRate * H_OX;
+  let q0 = eps * qIn + hConv * tGas + 3.0 * eps * SIGMA * t4(tsPrev) + burnRate * heatPerC;
 
   // How deep to work: a layer past the deepest heat has reached here or beside it.
   var reach = u32(cA.x);
@@ -2470,7 +2546,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let last = min(reach, s + IMPLICIT - 1u);
   var cp: array<f32, IMPLICIT>;
   var dp: array<f32, IMPLICIT>;
-  var cur = cellStep(s, true);
+  var cur = cellStep(s);
   var below = cur;
   let gs = 1.0 / cur.rHalf;
   let gEff = gs * areaS * lam / (areaS * lam + gs);
@@ -2486,7 +2562,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       d += gEff * q0 / lam;
     }
     if (k < reach) {
-      below = cellStep(k + 1u, false);
+      below = cellStep(k + 1u);
       let g = 1.0 / (cur.rHalf + below.rHalf);
       if (k < last) { gDn = g; } else { d += g * below.t; }
       b += g;
@@ -2535,7 +2611,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       var gSum = gA;
       var next = cur;
       if (j < reach) {
-        next = cellStep(j + 1u, false);
+        next = cellStep(j + 1u);
         let gB = 1.0 / (cur.rHalf + next.rHalf);
         flow += gB * next.t;
         gSum += gB;
@@ -2586,7 +2662,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   sheet = mix(sheetOut[2u * t].x, sheet * r * dth / max(sin(th0), 0.15), 0.3);
   skinOut[t] = vec4<f32>(ts, sumFuel, 1000.0 * sumChar, 1.0 - exp(-sumAsh / (areaS * ASH_COVER)));
   sheetOut[2u * t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
-  sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), 0.0, 0.0, 0.0);
+  sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), uRel, hConv, 0.0);
   cols[cWrite] = vec4<f32>(f32(max(u32(cA.x), min(warm + 1u, WOOD_LAYERS - 1u))), ts, belowOut, worn);
   cols[cWrite + 1u] = vec4<f32>(cB.x, cB.y, soot, contact);
 }
@@ -2666,6 +2742,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     g.z = (g.z + a) / (1.0 + a);
     g.fuel = (g.fuel + a) / (1.0 + a);
     g.soot = g.soot / (1.0 + a);
+    g.rise = clamp(g.rise + ballWarmth(g, worldOf(vec3<f32>(id) + 0.5), cellVel(vel, c), dt), 0.0, RISE_MAX);
     // Burning: the fuel burned heats the gas (less the share radiated away) and leaves soot at the fuel's yield.
     // (Gas at the cap burns no further until it cools: the expansion follows the heat released.)
     let burned = min(fuelBurned(g, dt, mixTime(strainRate(vel, c))), max(RISE_MAX - g.rise, 0.0) / heatRise(1.0));

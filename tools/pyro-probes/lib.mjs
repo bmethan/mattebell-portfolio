@@ -73,9 +73,10 @@ export async function launch() {
 }
 
 // Opens the lab, clicks the scenario's starting point, applies its patch and restarts, paused: from here the
-// simulation moves only when a probe steps it, so every run of a scenario is the same run.
-export async function openLab(browser, scenario) {
-  const page = await browser.newPage({ viewport: { width: 1280, height: 860 } })
+// simulation moves only when a probe steps it, so every run of a scenario is the same run. view: the window's size and
+// its device pixels per CSS pixel, as { width, height, dpr } (1280 x 860 at 1 by default).
+export async function openLab(browser, scenario, view = {}) {
+  const page = await browser.newPage({ viewport: { width: view.width ?? 1280, height: view.height ?? 860 }, deviceScaleFactor: view.dpr ?? 1 })
   page.on('console', m => {
     if (m.type() === 'error' && !/401|font-size|Turnstile|ERR_INTERNET/.test(m.text())) console.error('page error:', m.text().slice(0, 300))
   })

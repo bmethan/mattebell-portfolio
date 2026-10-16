@@ -4984,6 +4984,98 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `
 
+// (Prototype, for the full-resolution plan: development only, with the engine's upsample switch on.) Temporal
+// upsampling: the march runs at a fraction of the display's pixels, its rays through a different point of their pixels
+// each frame (the R2 sequence), and this pass gathers each frame's samples into a history at the display's own size.
+// The camera never moves, so a point of the set or the floor stays on the same display pixel from frame to frame and
+// needs no motion vectors. The history is clipped to the frame's 3 x 3 neighbourhood of samples (to their mean, give
+// or take 1.25 standard deviations, within their range; in the same luminance-compressed space as RESOLVE), and the
+// further the clip moves it, the fewer samples it counts for (its count is the alpha). A history that counts for many
+// takes in the samples that landed near the display pixel's centre this frame (a narrow Gaussian, half a display pixel),
+// which is what sharpens the still set, floor and ball; one that counts for few (just reset, or where the flames move)
+// takes the frame's smooth reconstruction instead (a Gaussian over its samples, about a march pixel wide), so the
+// moving flames are drawn soft rather than as a mosaic of single samples.
+export const RESOLVE_UP = /* wgsl */ `
+${SIM_COMMON}
+${RENDER_COMMON}
+@group(0) @binding(2) var current: texture_2d<f32>;
+@group(0) @binding(3) var history: texture_2d<f32>;
+// History valid (0 or 1), the exposure's change since the history's frame (the auto exposure eases every frame, and the
+// march's output is exposed), the march's offset within its pixels this frame (x, y); the march's pixels per
+// display pixel (x, y), the samples the history may count at most, the narrow Gaussian's 1 / (2 sigma^2) (display
+// pixels).
+@group(0) @binding(4) var<uniform> T: array<vec4<f32>, 2>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn squash(c: vec3<f32>) -> vec3<f32> { return c / (1.0 + ap1Lum(c)); }
+fn unsquash(c: vec3<f32>) -> vec3<f32> { return c / max(1.0 - ap1Lum(c), 1e-4); }
+
+@fragment
+fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
+  let p = vec2<i32>(fc.xy);
+  let k = T[1].xy;
+  let sub = T[0].zw;
+  let most = T[1].z;
+  let last = vec2<i32>(textureDimensions(current)) - 1;
+  // This display pixel's centre in the march's pixels; march pixel i's sample sits at i + 0.5 + sub.
+  let q = fc.xy * k;
+  let c0 = vec2<i32>(floor(q - sub));
+  var narrow = vec3<f32>(0.0);
+  var wN = 0.0;
+  var wide = vec3<f32>(0.0);
+  var wW = 0.0;
+  var lo = vec3<f32>(1e9);
+  var hi = vec3<f32>(-1e9);
+  var m1 = vec3<f32>(0.0);
+  var m2 = vec3<f32>(0.0);
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let ip = c0 + vec2<i32>(dx, dy);
+      let c = max(textureLoad(current, clamp(ip, vec2<i32>(0), last), 0).xyz, vec3<f32>(0.0));
+      let s = squash(c);
+      lo = min(lo, s);
+      hi = max(hi, s);
+      m1 += s;
+      m2 += s * s;
+      let dm = vec2<f32>(ip) + 0.5 + sub - q;
+      let dd = dm / k;
+      let wn = exp(-T[1].w * dot(dd, dd));
+      let ww = exp(-1.4 * dot(dm, dm));
+      narrow += c * wn;
+      wN += wn;
+      wide += c * ww;
+      wW += ww;
+    }
+  }
+  let soft = wide / max(wW, 1e-6);
+  let mu = m1 / 9.0;
+  let sd = sqrt(max(m2 / 9.0 - mu * mu, vec3<f32>(0.0)));
+  let blo = max(lo, mu - 1.25 * sd);
+  let bhi = min(hi, mu + 1.25 * sd);
+  var h = vec3<f32>(0.0);
+  var n = 0.0;
+  if (T[0].x > 0.5) {
+    let hv = textureLoad(history, p, 0);
+    let hs = squash(max(hv.xyz * T[0].y, vec3<f32>(0.0)));
+    let hc = clamp(hs, blo, bhi);
+    h = unsquash(hc);
+    // (A small move is the fire's flicker relighting what is still there, and costs it little.)
+    n = min(hv.w, most) * (1.0 - smoothstep(0.03, 0.12, length(hc - hs)));
+  }
+  let trust = smoothstep(0.5, 3.0, n);
+  let wSharp = wN * trust;
+  let wSoft = 1.0 - trust;
+  let total = n + wSharp + wSoft;
+  let col = (h * n + narrow * trust + soft * wSoft) / max(total, 1e-6);
+  return vec4<f32>(col, min(total, most));
+}
+`
+
 // The lens's glare: a real lens scatters a few percent of the light it passes into a wide, soft halo (veiling glare),
 // unseen around most of a scene but plain around anything far brighter than what surrounds it, as flames are at
 // dusk. Without a threshold, so it keeps the light's energy: the image is blurred into a chain of GLARE_LEVELS mips,

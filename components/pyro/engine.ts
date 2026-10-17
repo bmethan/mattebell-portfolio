@@ -621,6 +621,7 @@ export class PyroEngine {
   private woodPhase = -1
   woodSpeed = 1
   woodTest = 0
+  woodAir = 0 // (development: m/s of air blown over the wood under a test exposure; 0, the test's still air)
   // The wood's wear as the gas sees it (wornRadius; fitWear), fitted afresh from the wear map every fourth time the
   // ball is read back, about once a second (the wear moves a millimetre in a minute or two).
   private wear: Float32Array = new Float32Array(12)
@@ -1154,7 +1155,7 @@ export class PyroEngine {
         combine: withSkin(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }, v(flame)]),
         conserveSpread: group(p.conserveSpread, [P, s, v(vel[0]), { buffer: spread }]),
         conserveRatio: withSkin(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
-        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }, v(flame)]),
+        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }, v(flame), v(vel[0])]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: d.createBindGroup({
@@ -1878,6 +1879,7 @@ export class PyroEngine {
     // The wooden ball as it has worn back (the grey ball keeps its shape).
     const wear = s.ball && s.ballBurns ? this.wear : NO_WEAR
     f.set(wear, 84)
+    f[95] = this.woodAir
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
     this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx, ...set, ...wear]))
   }
@@ -2738,6 +2740,9 @@ export class PyroEngine {
       soot: a[WOOD_LAYERS * 5 + 10],
       flameAgainst: a[WOOD_LAYERS * 5 + 11],
       sootCover: a[WOOD_LAYERS * 5 + 12],
+      airSpeed: a[WOOD_LAYERS * 5 + 13],
+      heatTransfer: a[WOOD_LAYERS * 5 + 14],
+      crackTemp: a[WOOD_LAYERS * 5 + 15],
       wearFit: Array.from(this.wear),
       cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
     }

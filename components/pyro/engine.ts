@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, RESOLVE_UP, SOR } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_H, SKIN_W, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -33,7 +33,7 @@ const MG_COARSE_OMEGA = 1.6
 const SPEED_LIMIT = 8 // m/s
 const FOV_Y = (32 * Math.PI) / 180
 const RENDER_SCALE_MIN = 0.5
-const RENDER_SCALE_MAX = 0.75
+const RENDER_SCALE_START = 0.75
 // The simulation falling behind real time while the page's frames still come (the GPU is the bottleneck, and the
 // two-frames-in-flight gate keeps the page smooth by skipping steps): fewer steps than this a second, for a second of
 // steady running, renders fewer pixels, so more of the GPU goes to the steps. Judged only after SIM_SETTLE_MS of
@@ -42,6 +42,8 @@ const RENDER_SCALE_MAX = 0.75
 // bonfire's frame costs 21 ms at full scale and 10 at the lowest, its step 16: 24 steps a second at full scale, 29 at
 // the lowest. (A smoke source's step there costs about 30 ms by itself, so a softer image gains it little.)
 const SIM_BEHIND_RATE = 27
+// (And raising the render scale past its start needs the simulation at real time: this many steps a second.)
+const SIM_REAL_RATE = 29
 const SIM_BEHIND_MS = 750
 const SIM_SETTLE_MS = 1000
 // A default resolution that cannot keep up steps down: judged on the steps taken between 3 and 6 s of running
@@ -49,16 +51,32 @@ const SIM_SETTLE_MS = 1000
 const AUTO_RES_FROM_S = 3
 const AUTO_RES_TO_S = 6
 const AUTO_RES_MIN_RATE = 18
-const MAX_RENDER_PIXELS = 900_000
-// (Prototype, development only: the upsample switch.) The display's own pixels, up to two per CSS pixel and this many
-// in all, which the temporal upsampling resolves to from the march's fewer.
+// The image is the display's own pixels (the canvas), up to DISPLAY_DPR_MAX per CSS pixel and MAX_DISPLAY_PIXELS in all,
+// which the temporal upsampling (RESOLVE) builds up from the march's fewer. The march runs at the render scale of the
+// frame's CSS pixels times their density (held to 1.5, as before), from RENDER_SCALE_START: down to RENDER_SCALE_MIN on
+// a GPU that falls behind, and up to the display's own size on one with room. Paused, the march draws PAUSED_QUICK
+// frames at the running size (so a control dragged while paused answers at the running frame rate), then settles at
+// the display's size, held to PAUSED_MAX_PIXELS (beyond it, over proportionately more frames). On the HP Envy the march
+// of the bonfire costs 20 ms at the half scale and 70 at the display's size; the passes after it, at the display's
+// size, 1.9 ms (0.5 when the canvas was the march's size).
 const DISPLAY_DPR_MAX = 2
 const MAX_DISPLAY_PIXELS = 4_000_000
+const PAUSED_QUICK = 3
+const PAUSED_MAX_PIXELS = 2_200_000
+// The upsampling's history: the samples a running pixel may count (enough to sharpen the still set; the moving flames'
+// are rejected long before), and the sharpness of its gather of each frame's samples, 1 / (2 sigma^2) in display
+// pixels: at half the display's size, where a display pixel finds a sample near it only every few frames; and at its
+// full size, where each finds its own every frame and the gather need take in no neighbour's (as the settled stills
+// always have).
+const RUNNING_SAMPLES = 8
+const GATHER_SHARPNESS = [3, 6]
+// The share of the way the running history is relit toward the frame's light each frame (see RESOLVE): enough that
+// neighbours do not hold different moments of the fire's flicker, little enough to keep the frame's noise out of it.
+const RELIGHT = 0.5
 const STATUS_MS = 250
 const STIR_RADIUS = 0.3 // m
 const DETAIL_PERIOD = 1 // s of simulation between resets of each upres layer (half a period apart); the plume stretches them fast
 const NOISE_SIZE = 64 // texels along each side of the tileable detail noise
-const TAA_WEIGHT = 0.2 // the current frame's share of the accumulated image while simulating
 // Spatiotemporal blue noise for the march's offsets: 64 x 64 x 16, made by void and cluster with Wolfe et al.'s energy
 // (tools/stbn_gen.py) and served as a file.
 const STBN_SLICES = 16
@@ -178,6 +196,7 @@ const toHalf = (src: Float32Array) => {
   return out
 }
 const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 const cross = (a: Vec3, b: Vec3): Vec3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 const norm = (a: Vec3): Vec3 => {
   const l = Math.hypot(a[0], a[1], a[2]) || 1
@@ -188,9 +207,6 @@ const norm = (a: Vec3): Vec3 => {
 interface Targets {
   w: number
   h: number
-  mw: number // the march's size (the display's, unless upsampling)
-  mh: number
-  up: boolean // upsampling (the prototype)
   hdr: GPUTexture
   hist: [GPUTexture, GPUTexture]
   glare: GPUTexture
@@ -249,7 +265,6 @@ interface Pipes {
   floorNear: GPUComputePipeline
   render: GPURenderPipeline
   resolve: GPURenderPipeline
-  resolveUp: GPURenderPipeline
   display: GPURenderPipeline
   glareFirst: GPURenderPipeline
   glareDown: GPURenderPipeline
@@ -260,7 +275,7 @@ interface Pipes {
 }
 // The pipelines only drawing needs (the light volume, the flames' and the floor's near light, the cyc's maps, the image
 // pass and what follows it), and the solver's: everything else.
-type FrameKey = 'light' | 'cycDirect' | 'cycBounce' | 'flameNear' | 'floorNear' | 'render' | 'resolve' | 'resolveUp' | 'display' | 'glareFirst' | 'glareDown' | 'glareUp' | 'ptComposite'
+type FrameKey = 'light' | 'cycDirect' | 'cycBounce' | 'flameNear' | 'floorNear' | 'render' | 'resolve' | 'display' | 'glareFirst' | 'glareDown' | 'glareUp' | 'ptComposite'
 type FramePipes = Pick<Pipes, FrameKey>
 type SolverPipes = Omit<Pipes, FrameKey>
 
@@ -414,7 +429,6 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat, onSolver?: (
     d.createComputePipelineAsync({ layout: 'auto', compute: { module: d.createShaderModule({ code }), entryPoint: 'main', constants } })
   const renderModule = d.createShaderModule({ code: RENDER })
   const resolveModule = d.createShaderModule({ code: RESOLVE })
-  const resolveUpModule = d.createShaderModule({ code: RESOLVE_UP })
   const displayModule = d.createShaderModule({ code: DISPLAY })
   const glareModule = d.createShaderModule({ code: GLARE })
   const compositeModule = d.createShaderModule({ code: PT_COMPOSITE })
@@ -493,12 +507,6 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat, onSolver?: (
       layout: 'auto',
       vertex: { module: resolveModule, entryPoint: 'vs' },
       fragment: { module: resolveModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
-      primitive: { topology: 'triangle-list' },
-    }),
-    resolveUp: d.createRenderPipelineAsync({
-      layout: 'auto',
-      vertex: { module: resolveUpModule, entryPoint: 'vs' },
-      fragment: { module: resolveUpModule, entryPoint: 'fs', targets: [{ format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list' },
     }),
     display: d.createRenderPipelineAsync({
@@ -714,18 +722,24 @@ export class PyroEngine {
   private lightDirty = true
   private stepTimes: number[] = []
   private frameTimes: number[] = []
-  private renderScale = RENDER_SCALE_MAX
-  // (Prototype, development only: temporal upsampling to the display's own pixels, the march at the render scale's,
-  // and at the display's while paused; and a render scale pinned, which the adapting leaves alone.)
-  upsample = false
-  private exposure = 1 // (this frame's and the last's exposure, for the upsampling's history)
-  private lastExposure = 1
-  upMost = 8 // (the samples a running pixel's history may count, upsampling)
-  upSharp = 3 // (the narrow gather's 1 / (2 sigma^2), in display pixels)
-  pinScale: number | null = null
+  private renderScale = RENDER_SCALE_START
+  private scaleCeiling = Infinity // the render scale the simulation keeps real time at (lowered when it falls behind)
+  // The march's size while running (at the render scale), and this frame's (paused, the display's once settling);
+  // frames drawn since the pause or the last change while paused; this frame's exposure and the last's (the history is
+  // rescaled by their ratio as the auto exposure eases); the camera's version (a new framing starts the history
+  // afresh); and the collision ball where the last frame drew it (the history under its old and new places starts
+  // afresh as it is dragged, rather than the whole frame's).
   private marchW = 1
   private marchH = 1
-  private scaleCeiling = RENDER_SCALE_MAX // the render scale the simulation keeps real time at (lowered when it falls behind)
+  private frameMarch: [number, number] = [1, 1]
+  private settle = 0
+  private exposure = 1
+  private lastExposure = 1
+  private camVersion = 0
+  private ballDrawn: Vec3 | null = null
+  // (Development: a render scale pinned, which the adapting leaves alone; and a march size forced, for a still.)
+  pinScale: number | null = null
+  private forceMarch: [number, number] | null = null
   private steadySince = 0 // when the loop last began running without a break (ms)
   private behindMs = 0 // how long the simulation has run behind real time, without a break
   private lastAdapt = 0
@@ -809,7 +823,7 @@ export class PyroEngine {
         this.taaCount = 0
       })
       .catch(() => {})
-    this.taaBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
+    this.taaBuf = d.createBuffer({ size: 64, usage: U.UNIFORM | U.COPY_DST })
     this.ballBuf = d.createBuffer({ size: 112, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
@@ -1303,8 +1317,8 @@ export class PyroEngine {
     this.runClock = 0
     this.autoSteps = 0
     this.stepTimes = []
-    this.renderScale = RENDER_SCALE_MAX
-    this.scaleCeiling = RENDER_SCALE_MAX
+    this.renderScale = RENDER_SCALE_START
+    this.scaleCeiling = Infinity
     this.behindMs = 0
     this.steadySince = performance.now()
     this.applySize()
@@ -1337,11 +1351,11 @@ export class PyroEngine {
       this.fireResum = true
       this.lightDirty = true
       this.needsRender = true
+      // (The running history carries on, settling now at the display's own size.)
+      this.settle = 0
     }
     if (!paused) this.pt.on = false
     this.acc = 0
-    // (Upsampling, the march goes to the display's own size while paused, and back.)
-    if (this.upsample) this.applySize()
     this.kick()
     this.report(true)
   }
@@ -1359,7 +1373,7 @@ export class PyroEngine {
     else this.stop()
   }
 
-  // The canvas follows the frame; the image renders at a fraction of its device pixels (smoke is soft).
+  // The canvas follows the frame, at its device pixels; the march, at a fraction of them (see DISPLAY_DPR_MAX).
   resize(cssW: number, cssH: number, dpr: number) {
     this.cssW = cssW
     this.cssH = cssH
@@ -1373,36 +1387,52 @@ export class PyroEngine {
     this.needsRender = true
     this.kick()
   }
-  // The canvas's size and the march's: the same, at the render scale (held to MAX_RENDER_PIXELS); or, upsampling, the
-  // canvas at the display's own pixels and the march at the render scale's (the display's while paused).
+  // The canvas at the display's own pixels, and the running march at the render scale's (never past the display's).
   private sizeTo() {
-    const fit = (scale: number, most: number) => {
-      let w = Math.max(1, Math.round(this.cssW * scale))
-      let h = Math.max(1, Math.round(this.cssH * scale))
-      if (w * h > most) {
-        const k = Math.sqrt(most / (w * h))
-        w = Math.round(w * k)
-        h = Math.round(h * k)
-      }
-      return [w, h]
-    }
+    const [w, h] = this.fit(Math.min(this.dpr, DISPLAY_DPR_MAX), MAX_DISPLAY_PIXELS)
     if (this.pinScale != null) this.renderScale = this.pinScale
-    let [w, h] = fit(Math.min(this.dpr, 1.5) * this.renderScale, MAX_RENDER_PIXELS)
-    this.marchW = w
-    this.marchH = h
-    if (this.upsample) {
-      ;[w, h] = fit(Math.min(this.dpr, DISPLAY_DPR_MAX), MAX_DISPLAY_PIXELS)
-      if (this.paused || this.marchW > w) {
-        this.marchW = w
-        this.marchH = h
-      }
-    }
+    this.renderScale = Math.min(this.renderScale, this.scaleMax())
+    const [mw, mh] = this.fit(Math.min(this.dpr, 1.5) * this.renderScale, w * h)
+    this.marchW = Math.min(mw, w)
+    this.marchH = Math.min(mh, h)
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w
       this.canvas.height = h
     }
   }
-
+  // The frame's CSS size at a density, held to a number of pixels.
+  private fit(density: number, most: number): [number, number] {
+    let w = Math.max(1, Math.round(this.cssW * density))
+    let h = Math.max(1, Math.round(this.cssH * density))
+    if (w * h > most) {
+      const k = Math.sqrt(most / (w * h))
+      w = Math.max(1, Math.round(w * k))
+      h = Math.max(1, Math.round(h * k))
+    }
+    return [w, h]
+  }
+  // The render scale at which the march is the display's own size.
+  private scaleMax() {
+    return Math.min(this.dpr, DISPLAY_DPR_MAX) / Math.min(this.dpr, 1.5)
+  }
+  // The paused march: the display's own size, held to PAUSED_MAX_PIXELS; and the frames a paused image settles over,
+  // TAA_SETTLE at the display's size, proportionately more at fewer pixels (each display pixel then gathers fewer).
+  private pausedMarch(): [number, number] {
+    if (this.forceMarch) return this.forceMarch
+    const w = this.canvas.width
+    const h = this.canvas.height
+    const [mw, mh] = this.fit(Math.min(this.dpr, DISPLAY_DPR_MAX), PAUSED_MAX_PIXELS)
+    return [Math.min(mw, w), Math.min(mh, h)]
+  }
+  private settleFrames() {
+    const [mw, mh] = this.pausedMarch()
+    return PAUSED_QUICK + Math.ceil(TAA_SETTLE * Math.max(1, (this.canvas.width * this.canvas.height) / (mw * mh)))
+  }
+  // This frame's march: the running size, or paused (after its first PAUSED_QUICK frames) the paused size.
+  private chooseMarch() {
+    const quick = !this.paused || (this.settle < PAUSED_QUICK && !this.forceMarch)
+    this.frameMarch = quick ? [this.marchW, this.marchH] : this.pausedMarch()
+  }
   // A camera a little below the plume's middle, looking along -z, as close as framing the domain's height allows, and
   // closer still on wide frames, until the domain spans the frame's width (smoke then leaves through the frame's
   // edges, never a side of the box in view).
@@ -1419,6 +1449,12 @@ export class PyroEngine {
     const fwd = norm(sub(target, pos))
     const right = norm(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
+    // A new framing starts the history afresh (it is in the display's pixels, which no longer show the same points).
+    const was = this.cam
+    if ([...pos, ...fwd, tanY, aspect].some((v, i) => Math.abs(v - [...was.pos, ...was.fwd, was.tanY, was.aspect][i]) > 1e-6)) {
+      this.camVersion++
+      this.taaCount = 0
+    }
     this.cam = { pos, fwd, right, up, tanY, aspect }
     this.framing = { z: pos[2], tanY, aspect }
   }
@@ -1498,7 +1534,6 @@ export class PyroEngine {
     this.ballDragAt = now
     this.lightDirty = true
     this.needsRender = true
-    this.taaCount = 0
     this.kick()
   }
 
@@ -1515,7 +1550,6 @@ export class PyroEngine {
     this.ballDragAt = performance.now()
     this.lightDirty = true
     this.needsRender = true
-    this.taaCount = 0
     this.kick()
   }
 
@@ -2052,7 +2086,7 @@ export class PyroEngine {
     r.set([...sunLux, s.densityScale], 20)
     r.set([...SKY_COLOUR.map(v => v * luxOfEV(s.skyEV)), s.albedo], 24)
     r.set([floorAlbedo, floorAlbedo, floorAlbedo, 3.2], 28)
-    r.set([this.marchW, this.marchH, this.simTime, fire ? s.flameDetail : 0], 32)
+    r.set([...this.frameMarch, this.simTime, fire ? s.flameDetail : 0], 32)
     // Cross-fade weights: each layer is weighted by a triangle of its age, 0 when it was just reset, 1 half a period on.
     const ageA = (this.simTime / DETAIL_PERIOD) % 1
     const ageB = (this.simTime / DETAIL_PERIOD + 0.5) % 1
@@ -2119,39 +2153,29 @@ export class PyroEngine {
     ]
   }
 
-  // The frame's targets at the canvas's size (made again, and the history dropped, when it changes): the march's
-  // image, the accumulated history (two, swapped each frame), and the glare's chain of mips at half size.
+  // The frame's targets at the canvas's size, the display's (made again, and the history dropped, when it changes): the
+  // march's image (drawn into its top left corner at the march's own size, which can change from frame to frame), the
+  // accumulated history (two, swapped each frame), and the glare's chain of mips at half size.
   private ensureTargets() {
     const w = this.canvas.width
     const h = this.canvas.height
-    const up = this.upsample
-    const mw = up ? this.marchW : w
-    const mh = up ? this.marchH : h
+    if (this.targets && this.targets.w === w && this.targets.h === h) return this.targets
+    if (this.targets) {
+      this.targets.hdr.destroy()
+      this.targets.hist.forEach(t => t.destroy())
+      this.targets.glare.destroy()
+    }
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-    const tex = (more = 0, tw = w, th = h) => this.device.createTexture({ size: [tw, th], format: 'rgba16float', usage: usage | more })
-    const t0 = this.targets
-    if (t0 && t0.w === w && t0.h === h && t0.up === up) {
-      if (t0.mw === mw && t0.mh === mh) return t0
-      // (Upsampling, a new march size keeps the history, which is the display's.)
-      t0.hdr.destroy()
-      const hdr = tex(GPUTextureUsage.COPY_SRC, mw, mh)
-      this.targets = { ...t0, mw, mh, hdr, ...this.postGroups(hdr, t0.hist, t0.glareViews) }
-      return this.targets
-    }
-    if (t0) {
-      t0.hdr.destroy()
-      t0.hist.forEach(t => t.destroy())
-      t0.glare.destroy()
-    }
+    const tex = (more = 0) => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: usage | more })
     // (The frame and its history are readable, for the probes that compare them with the path-traced reference.)
-    const hdr = tex(GPUTextureUsage.COPY_SRC, mw, mh)
+    const hdr = tex(GPUTextureUsage.COPY_SRC)
     const hist: [GPUTexture, GPUTexture] = [tex(GPUTextureUsage.COPY_SRC), tex(GPUTextureUsage.COPY_SRC)]
     const gw = Math.max(1, w >> 1)
     const gh = Math.max(1, h >> 1)
     const levels = Math.max(1, Math.min(GLARE_LEVELS, Math.floor(Math.log2(Math.min(gw, gh))) + 1))
     const glare = this.device.createTexture({ size: [gw, gh], format: 'rgba16float', usage, mipLevelCount: levels })
     const glareViews = Array.from({ length: levels }, (_, i) => glare.createView({ baseMipLevel: i, mipLevelCount: 1 }))
-    this.targets = { w, h, mw, mh, up, hdr, hist, glare, glareViews, ...this.postGroups(hdr, hist, glareViews) }
+    this.targets = { w, h, hdr, hist, glare, glareViews, ...this.postGroups(hdr, hist, glareViews) }
     this.taaCount = 0
     return this.targets
   }
@@ -2166,7 +2190,7 @@ export class PyroEngine {
     const src = (pipe: GPURenderPipeline, view: GPUTextureView) => group(pipe, [{ binding: 0, resource: view }, { binding: 1, resource: this.glareSampler }])
     const both = <T>(f: (k: number) => T): [T, T] => [f(0), f(1)]
     return {
-      resolve: both(k => group(this.upsample ? p.resolveUp : p.resolve, [{ binding: 2, resource: hdr.createView() }, { binding: 3, resource: hist[k].createView() }, { binding: 4, resource: { buffer: this.taaBuf } }])),
+      resolve: both(k => group(p.resolve, [{ binding: 2, resource: hdr.createView() }, { binding: 3, resource: hist[k].createView() }, { binding: 4, resource: { buffer: this.taaBuf } }, { binding: 5, resource: this.glareSampler }])),
       glareFirst: both(k => src(p.glareFirst, hist[k].createView())),
       glareDown: glareViews.map((_, i) => (i > 0 ? src(p.glareDown, glareViews[i - 1]) : null)),
       glareUp: glareViews.map((_, i) => (i < glareViews.length - 1 ? src(p.glareUp, glareViews[i + 1]) : null)),
@@ -2204,7 +2228,7 @@ export class PyroEngine {
       if (end) q += 2
       return w
     }
-    draw(t.hist[next].createView(), t.up ? p.resolveUp : p.resolve, t.resolve[this.histIndex], false, stamp(true, true))
+    draw(t.hist[next].createView(), p.resolve, t.resolve[this.histIndex], false, stamp(true, true))
     if (this.state.glare > 0) {
       const L = t.glareViews.length
       draw(t.glareViews[0], p.glareFirst, t.glareFirst[next], false, stamp(true, L === 1))
@@ -2346,24 +2370,29 @@ export class PyroEngine {
     const f = g.frame!
     const p = this.pipes!
     this.needsRender = false
-    this.writeRender()
     const t = this.ensureTargets()
-    if (this.pt.on && this.paused && this.ptPipe && this.taaCount >= TAA_SETTLE) {
+    // (A history started afresh, paused: the settling starts again, at the running size for its first frames.)
+    if (this.taaCount === 0) this.settle = 0
+    this.chooseMarch()
+    this.writeRender()
+    if (this.pt.on && this.paused && this.ptPipe && this.settle >= this.settleFrames()) {
       this.renderTraced(screen, t)
       return
     }
-    // The current frame's weight: a running average while nothing changes (paused), a fixed share while simulating.
-    const weight = this.taaCount === 0 ? 1 : this.paused ? Math.max(1 / (this.taaCount + 1), 1 / TAA_SETTLE) : TAA_WEIGHT
-    // (Upsampling: also this frame's offset within the march's pixels, as the image pass draws it (the R2 sequence), the
-    // march's pixels per display pixel, and the samples the history may count: as many as the paused frame settles over,
-    // or while the fire runs as many as its fixed share keeps.)
+    // The resolve's uniform (RESOLVE): whether there is a history, the exposure's change since it was drawn, this frame's
+    // offset within the march's pixels (the R2 sequence, as the image pass draws it), the march's pixels per display
+    // pixel, the samples the history may count (paused, as many as it settles over), the gather's sharpness, the march's
+    // size, and the collision ball's footprint if it moved since the last frame.
+    const [mw, mh] = this.frameMarch
     const n = this.renderFrame % 4096
     const frac = (v: number) => v - Math.floor(v)
     const sub = [frac(0.7548777 * n + 0.5) - 0.5, frac(0.5698403 * n + 0.5) - 0.5]
-    const most = this.paused ? TAA_SETTLE : t.up ? this.upMost : 1 / TAA_WEIGHT
-    // (Upsampling, the history is the last frame's exposure: in its place, the change, which it is scaled by.)
-    const second = t.up ? this.exposure / Math.max(this.lastExposure, 1e-30) : weight
-    this.device.queue.writeBuffer(this.taaBuf, 0, new Float32Array([this.taaCount > 0 ? 1 : 0, second, ...sub, t.mw / t.w, t.mh / t.h, most, this.upSharp]))
+    const most = this.paused ? TAA_SETTLE : RUNNING_SAMPLES
+    const exposureChange = this.exposure / Math.max(this.lastExposure, 1e-30)
+    const full = Math.min(Math.max((Math.min(mw / t.w, mh / t.h) - 0.5) / 0.5, 0), 1)
+    const sharpness = GATHER_SHARPNESS[0] + (GATHER_SHARPNESS[1] - GATHER_SHARPNESS[0]) * full
+    const relight = this.paused ? 0 : RELIGHT
+    this.device.queue.writeBuffer(this.taaBuf, 0, new Float32Array([this.taaCount > 0 ? 1 : 0, exposureChange, ...sub, mw / t.w, mh / t.h, most, sharpness, mw, mh, relight, 0, ...this.ballFootprint(t)]))
     // Paused, the fire's escape tables marched afresh for the frame (after its uniforms, which they read). (Not before
     // a restart's first step, which reads the sums, the bed's area among them, as the restart left them, empty: summed
     // then, they changed the whole run.)
@@ -2397,6 +2426,8 @@ export class PyroEngine {
     const pass = enc.beginRenderPass({
       colorAttachments: [{ view: t.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
     })
+    pass.setViewport(0, 0, mw, mh, 0, 1)
+    pass.setScissorRect(0, 0, mw, mh)
     pass.setPipeline(p.render)
     pass.setBindGroup(0, this.upresActive() && this.upres ? this.upres.render : f.render)
     pass.draw(3)
@@ -2405,8 +2436,32 @@ export class PyroEngine {
     this.device.queue.submit([enc.finish()])
     this.taaCount++
     this.renderFrame++
+    this.ballDrawn = this.state.ball ? [...this.ballPos] : null
     // Paused, keep drawing until the history has settled (and then, tracing, go on to the traced frames).
-    if (this.paused && (this.taaCount < TAA_SETTLE || (this.pt.on && this.ptPipe))) this.needsRender = true
+    if (this.paused) {
+      this.settle++
+      if (this.settle < this.settleFrames() || (this.pt.on && this.ptPipe)) this.needsRender = true
+    }
+  }
+
+  // The collision ball's footprint in the display's pixels, when it has moved since the last frame drew it (a drag):
+  // a circle around where it was and where it is, with a margin for its soft edge (centre x, y, radius, and 1), which
+  // the resolve starts afresh. (The flames and the floor's shadow that move with it the history's clip deals with.)
+  private ballFootprint(t: Targets): number[] {
+    const was = this.ballDrawn
+    if (!this.state.ball || !was || was.every((v, i) => v === this.ballPos[i])) return [0, 0, 0, 0]
+    const c = this.cam
+    const at = (p: Vec3) => {
+      const d = sub(p, c.pos)
+      const z = Math.max(dot(d, c.fwd), 1e-3)
+      const x = dot(d, c.right) / (z * c.tanY * c.aspect)
+      const y = dot(d, c.up) / (z * c.tanY)
+      return { x: ((x + 1) / 2) * t.w, y: ((1 - y) / 2) * t.h, r: (this.state.ballRadius / (z * c.tanY)) * (t.h / 2) }
+    }
+    const a = at(was)
+    const b = at(this.ballPos)
+    const r = Math.hypot(a.x - b.x, a.y - b.y) / 2 + 1.25 * Math.max(a.r, b.r) + 4
+    return [(a.x + b.x) / 2, (a.y + b.y) / 2, r, 1]
   }
 
   // The path-traced reference, while paused: one more path per pixel into the running average, then the wipe (the
@@ -2415,7 +2470,9 @@ export class PyroEngine {
   private renderTraced(screen: GPUTexture, t: Targets) {
     const p = this.pipes!
     const pt = this.ensurePt(t)
-    const key = `${this.stateVersion}|${this.simTime}|${this.ballPos.join(',')}|${t.w}x${t.h}|${this.upresActive()}|${this.envLight ? 1 : 0}`
+    const key = `${this.stateVersion}|${this.simTime}|${this.ballPos.join(',')}|${t.w}x${t.h}|${this.camVersion}|${this.upresActive()}|${this.envLight ? 1 : 0}`
+    // (Traced at the display's own size, whatever the march's.)
+    this.device.queue.writeBuffer(this.renderBuf, 32 * 4, new Float32Array([t.w, t.h]))
     if (key !== this.pt.key) {
       this.pt.key = key
       this.pt.n = 0
@@ -2604,11 +2661,12 @@ export class PyroEngine {
 
 
   // When the simulation falls behind real time, or the display's frames come slower than 40 a second, for a second
-  // while simulating (the GPU is the bottleneck), render fewer pixels, down to two thirds of the full scale. Frames
-  // back above 55 a second raise it again, but never above the scale the simulation last fell behind at (until a
-  // restart: a new starting point or resolution judges afresh). (Whether a step down helped is not judged from the
-  // rate it gives: a starting fire grows for its first ten seconds or so, costing more to draw as it does, so its rate
-  // falls whatever the scale.)
+  // while simulating (the GPU is the bottleneck), march fewer pixels, down to RENDER_SCALE_MIN. Frames back above 55 a
+  // second raise it again, but never above the scale the simulation last fell behind at (until a restart: a new
+  // starting point or resolution judges afresh), and past the starting scale, toward the display's own size, only while
+  // the simulation keeps real time too (SIM_REAL_RATE): a GPU with room to spare. (Whether a step down helped is not
+  // judged from the rate it gives: a starting fire grows for its first ten seconds or so, costing more to draw as it
+  // does, so its rate falls whatever the scale.)
   private adapt() {
     const now = this.frameTimes[this.frameTimes.length - 1]
     const since = Math.min(now - this.lastAdapt, 100)
@@ -2637,10 +2695,16 @@ export class PyroEngine {
       this.renderScale = Math.max(RENDER_SCALE_MIN, this.renderScale * 0.85)
       this.frameTimes = []
       this.applySize()
-    } else if (fps > 55 && this.renderScale < this.scaleCeiling) {
-      this.renderScale = Math.min(this.scaleCeiling, this.renderScale / 0.85)
-      this.frameTimes = []
-      this.applySize()
+    } else if (fps > 55) {
+      let rate = 0
+      for (const t of this.stepTimes) if (now - t <= 1000) rate++
+      const realTime = now - this.steadySince > SIM_SETTLE_MS && rate >= SIM_REAL_RATE
+      const top = Math.min(this.scaleCeiling, realTime ? this.scaleMax() : Math.max(RENDER_SCALE_START, this.renderScale))
+      if (this.renderScale < top) {
+        this.renderScale = Math.min(top, this.renderScale / 0.85)
+        this.frameTimes = []
+        this.applySize()
+      }
     }
     // A default resolution too heavy for this GPU: one step down, judged once (it restarts the simulation).
     if (this.autoResolution && this.runClock >= AUTO_RES_TO_S) {
@@ -2809,8 +2873,9 @@ export class PyroEngine {
   }
 
   // Development profiler: one step and one frame, each kernel in its own pass with GPU timestamps; milliseconds per
-  // kernel (all SOR sweeps together). Needs the timestamp-query feature.
-  async profileStep(): Promise<Record<string, number> | null> {
+  // kernel (all SOR sweeps together). Needs the timestamp-query feature. The frame's march at a given size, or this
+  // frame's.
+  async profileStep(march?: [number, number]): Promise<Record<string, number> | null> {
     if (!this.grids || !this.device.features.has('timestamp-query')) return null
     const screen = this.canvasTexture()
     if (!screen) return null
@@ -2823,6 +2888,8 @@ export class PyroEngine {
     const resolve = d.createBuffer({ size: slots * 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC })
     const read = d.createBuffer({ size: slots * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     this.writeSim()
+    if (march) this.frameMarch = march
+    else this.chooseMarch()
     this.writeRender()
     const enc = d.createCommandEncoder()
     const [nx, ny, nz] = g.n
@@ -2954,6 +3021,8 @@ export class PyroEngine {
       colorAttachments: [{ view: t.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
       timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 },
     })
+    rp.setViewport(0, 0, ...this.frameMarch, 0, 1)
+    rp.setScissorRect(0, 0, ...this.frameMarch)
     rp.setPipeline(p.render)
     rp.setBindGroup(0, g.frame!.render)
     rp.draw(3)
@@ -3300,26 +3369,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (!this.grids) return null
     this.canvas.width = w
     this.canvas.height = h
-    this.marchW = w
-    this.marchH = h
     this.layoutCamera()
-    // A still meters at once (no easing) and accumulates as a paused frame does.
+    // A still meters at once (no easing) and accumulates as a paused frame does, from a fresh history, marched at its
+    // own size from the first frame.
     await this.readFire()
     // Disposed, or the device lost, while metering: no still.
     if (this.disposed || this.lost) return null
     this.meterEV = this.targetEV()
     const paused = this.paused
     this.paused = true
+    this.forceMarch = [w, h]
+    this.taaCount = 0
     for (let i = 0; i < TAA_SETTLE; i++) this.render()
+    this.forceMarch = null
     this.paused = paused
     const blob = await new Promise<Blob | null>(resolve => this.canvas.toBlob(resolve, type, quality))
     this.applySize()
     return blob
   }
 
-  // (Prototype, development only: the running view, exactly. Frames of `steps` solver steps and a render each, as the
-  // running loop draws them (the running blend, the running render scale), metered at once as a still is; then the
-  // canvas as an image file, taken before the frame is presented, and the engine left paused.)
+  // (Development: the running view, exactly. Frames of `steps` solver steps and a render each, as the running loop draws
+  // them (the running history, the running render scale), metered at once as a still is; then the canvas as an image
+  // file, taken before the frame is presented, and the engine left paused.)
   async runView(frames: number, steps = 1, type = 'image/png', quality = 0.95): Promise<Blob | null> {
     if (!this.grids) return null
     // (A reading already under way may be of the grids before a restart: wait it out, and read afresh.)
@@ -3344,6 +3415,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     return blob
   }
   lastView: { canvas: number[]; march: number[]; t: number; ev: number } | null = null
+
+  // (Development: the paused view as a visitor sees it once it has settled. Paused where it stands, every frame drawn as
+  // the frame loop would draw them until it stops; then the canvas. Frames drawn, for the probes.)
+  async pausedView(type = 'image/png', quality = 0.95): Promise<Blob | null> {
+    if (!this.grids) return null
+    this.setPaused(true)
+    let frames = 0
+    while (this.needsRender && frames < 1000) {
+      this.render()
+      frames++
+    }
+    this.lastView = { canvas: [this.canvas.width, this.canvas.height], march: [...this.frameMarch], t: this.simTime, ev: frames }
+    return new Promise<Blob | null>(resolve => this.canvas.toBlob(resolve, type, quality))
+  }
 
   dispose() {
     this.disposed = true

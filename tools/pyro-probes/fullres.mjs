@@ -34,7 +34,7 @@ const o = options(
   },
   `
 fullres.mjs: the running and paused views and their cost.
-  --mode emulate|live|cost|compile|loop|drag
+  --mode emulate|live|cost|compile|loop|drag|trace
   --window 1600,765,1     the window's CSS width and height and its device pixels per CSS pixel
   --at 10                 simulated second to capture or profile at (emulate, cost)
   --frames 45 --steps 1   running frames drawn before the capture (emulate), and solver steps a frame (0 holds the fire
@@ -217,6 +217,26 @@ try {
     )
     saveBase64(`${dir}/drag-${o.tag}.png`, b64)
     note(`drag: ${frames} frames, the ball now at ${JSON.stringify(await page.evaluate(() => window.__pyro.ballPos.map(v => +v.toFixed(3))))}`)
+  } else if (o.mode === 'trace') {
+    // The path-traced reference, paused at --at: its pipeline compiled, then --seconds of tracing; the paths a pixel it
+    // reached, and a screenshot of the frame with the wipe in the middle.
+    const page = await openLab(browser, o.scenario, view)
+    await runTo(page, Number(o.at), o.scenario)
+    const r = await page.evaluate(async secs => {
+      const e = window.__pyro
+      e.setPathTrace(true)
+      const t0 = performance.now()
+      while ((e.ptCompiling || !e.ptPipe) && performance.now() - t0 < 120000) await new Promise(r => setTimeout(r, 250))
+      const compileS = (performance.now() - t0) / 1000
+      // (The live frame settles first; the traced paths start after it.)
+      while (e.pt.n === 0 && performance.now() - t0 < 180000) await new Promise(r => setTimeout(r, 100))
+      const n0 = e.pt.n
+      const t1 = performance.now()
+      await new Promise(r => setTimeout(r, secs * 1000))
+      return { compileS, size: [e.canvas.width, e.canvas.height], paths: e.pt.n, rate: (e.pt.n - n0) / ((performance.now() - t1) / 1000), on: e.pt.on }
+    }, Number(o.seconds))
+    await page.locator('#lab-panel-pyro .lab-frame').screenshot({ path: `${dir}/trace-${o.tag}.png` })
+    note(`trace: compiled in ${r.compileS.toFixed(1)} s, at ${r.size.join('x')}: ${r.paths} paths a pixel, ${r.rate.toFixed(1)} a second, on ${r.on}`)
   } else if (o.mode === 'loop') {
     // Frames for a pre-rendered loop: from --at, every step for --seconds plus --fade (rendered on, for the cross-fade
     // that closes the loop), each settled at --size as the stills are (motion blur included).

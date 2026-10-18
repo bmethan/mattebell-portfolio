@@ -210,7 +210,10 @@ export default function PyroLab() {
   // The device check (components/pyro/DeviceCheck.tsx), for testing the lab on other devices: only with ?check.
   const checkOn = useSyncExternalStore(noSubscribe, () => new URLSearchParams(location.search).has('check'), () => false)
   const statusRef = useRef<PyroStatus | null>(null)
-  const shown = mode === 'live' && !!status && status.simTime > 0
+  // The still covers the frame until the engine has drawn, and again only while a lost device's replacement starts:
+  // not on a restart, whose time goes back to 0 (it flashed in and out on every starting point).
+  const [drawn, setDrawn] = useState(false)
+  const shown = mode === 'live' && drawn
 
   useEffect(() => {
     pyroRef.current = pyro
@@ -219,6 +222,7 @@ export default function PyroLab() {
   const onStatus = (s: PyroStatus) => {
     statusRef.current = s
     setStatus(s)
+    if (s.simTime > 0) setDrawn(true)
     if (s.autoStepped) setPyro(p => (p.resolution === s.resolution ? p : { ...p, resolution: s.resolution }))
   }
 
@@ -271,6 +275,7 @@ export default function PyroLab() {
       engine?.dispose()
       engine = null
       engineRef.current = null
+      setDrawn(false)
       if (++losses > 2) {
         setMode('fallback')
         return

@@ -18,11 +18,15 @@ const o = options(
     flame: { type: 'string', default: '0' },
     radius: { type: 'string', default: '0.22' },
     dir: { type: 'string', default: '0,0,1' },
+    after: { type: 'string', default: '12.4' },
+    'air-speed': { type: 'string', default: '0' },
   },
   `
 woodcone.mjs: the ball's wood under a fixed exposure.
   --cases 18,25,38,55,iso   radiant fluxes (kW/m2, the sample flaming), air<flux> (its flame out), iso (the furnace),
                             chatani (as Chatani and Harada: flaming at 20 kW/m2 for 12 min, then 12.4 with the flame out)
+  --after 12.4              the chatani case's flux once its flame is out (they measured 12.4 and 8.4)
+  --air-speed 0             m/s of air blown over the sample with its flame out (air cases, and chatani's second part)
   --minutes 40              how long, in the wood's own time
   --speed 30                how many times faster than the gas the wood's clock runs
   --every 5                 minutes between readings
@@ -38,7 +42,7 @@ try {
   for (const c of cases) {
     const page = await openLab(browser, { preset: 'Smoke plume', patch: { resolution: 'low', ballRadius: Number(o.radius), ballBurns: true }, ballAt: [1.4, 0.7], pullAt: null, pullTo: null })
     const out = await page.evaluate(
-      async ([c, minutes, speed, every, flame, dir]) => {
+      async ([c, minutes, speed, every, flame, dir, after, airSpeed]) => {
         const e = window.__pyro
         const iso = c === 'iso'
         const chatani = c === 'chatani'
@@ -46,6 +50,7 @@ try {
         let flux = iso ? 0 : chatani ? 20000 : Number(air ? c.slice(3) : c) * 1000
         e.woodSpeed = speed
         e.woodTest = iso ? -1 : air ? -flux : flux
+        e.woodAir = air ? airSpeed : 0
         e.newBall()
         const rows = []
         let flamedAt = null
@@ -64,8 +69,9 @@ try {
           if (at644 === null && ts >= 644) at644 = w.clock
           if (chatani && !air && w.clock >= 720) {
             air = true
-            flux = 12400
+            flux = after * 1000
             e.woodTest = -flux
+            e.woodAir = airSpeed
           }
           if (!iso && !air) e.woodTest = flux + (fuel >= 0.001 ? flame * 1000 : 0)
           // The char line: the 300 C isotherm, between cell centres, by depth below the surface as made.
@@ -112,9 +118,9 @@ try {
         }
         return { flamedAt, at644, reached36, rows }
       },
-      [c, Number(o.minutes), Number(o.speed), Number(o.every), Number(o.flame), o.dir.split(',').map(Number)],
+      [c, Number(o.minutes), Number(o.speed), Number(o.every), Number(o.flame), o.dir.split(',').map(Number), Number(o.after), Number(o['air-speed'])],
     )
-    const label = c === 'iso' ? 'ISO 834 furnace' : c === 'chatani' ? 'Chatani and Harada (20 kW/m2 flaming 12 min, then 12.4 flame out)' : c.startsWith('air') ? `${c.slice(3)} kW/m2, flame out` : `${c} kW/m2 flaming${Number(o.flame) ? ` (+${o.flame} its flame)` : ''}`
+    const label = c === 'iso' ? 'ISO 834 furnace' : c === 'chatani' ? `Chatani and Harada (20 kW/m2 flaming 12 min, then ${o.after} flame out${Number(o['air-speed']) ? `, air at ${o['air-speed']} m/s` : ''})` : c.startsWith('air') ? `${c.slice(3)} kW/m2, flame out` : `${c} kW/m2 flaming${Number(o.flame) ? ` (+${o.flame} its flame)` : ''}`
     const avg36 = out.reached36 ? (36 / (out.reached36 / 60)).toFixed(2) : 'not reached'
     console.log(`${label}: flaming fuel (2 g/m2/s) at ${out.flamedAt?.toFixed(0) ?? 'never'} s, surface 644 K at ${out.at644?.toFixed(0) ?? 'never'} s, char line to 36 mm: ${avg36} mm/min`)
     console.log(`  (the column read: its wood ${out.rows[0]?.density} times the mean density)`)

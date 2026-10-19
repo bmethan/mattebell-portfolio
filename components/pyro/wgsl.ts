@@ -4920,8 +4920,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let ro = R.camPos.xyz;
   let frame = R.camRight.w;
   let jitter = jitterAt(fc.xy, frame);
-  // The ray's moment within the shutter (the motion blur): blue noise of its own, apart from the march's offset, so
-  // where the flow along the ray matches the step the two do not land every pixel on the same points.
+  // The ray's moment within the shutter (the motion blur, in a paused frame only: the engine opens no shutter while
+  // the fire runs): blue noise of its own, apart from the march's offset, so where the flow along the ray matches the
+  // step the two do not land every pixel on the same points.
   let shutterTau = (jitterAt(fc.xy + vec2<f32>(32.0, 32.0), frame) - 0.5) * R.camera.x;
 
   // The stage under and behind the fire: the floor's plane, or the cyc (and the normal where the ray meets it).
@@ -4988,20 +4989,19 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
           T *= tf;
         }
       }
-      // Motion blur: the gas that was here at a moment within the shutter, carried back along the flow. Paused, the
-      // ray's moment, one for all its samples (a different one each pixel and frame, which the accumulation averages):
+      // Motion blur (paused): the gas that was here at the ray's moment within the shutter, carried back along the
+      // flow, one moment for all its samples (a different one each pixel and frame, which the accumulation averages):
       // a sheet of soot that moves across the ray covers it for part of the shutter, as the path-traced reference's
       // paths (a moment each) find it; with a moment for each sample it dimmed the light behind it at every sample
-      // instead, and the moving flames came out a tenth to two fifths off the reference's where they move most. While
-      // the fire runs, each sample's own moment, stratified along the ray: one moment a ray shifts all the flames the
-      // ray sees at once, a grain clumped a few pixels across that the running accumulation, its history giving way
-      // to the moving flames, kept as speckle all over them (twice the grain of a moment a sample, on the bonfire as
-      // the lab opens; accumulated, the two differ by 2% on average). (The velocity in one lookup: each component
-      // lives on its own faces, a quarter cell either way of where this reads it, near enough for a blur.)
+      // instead, and the moving flames came out a tenth to two fifths off the reference's where they move most.
+      // (While the fire runs there is none: a moment a ray there left a grain clumped a few pixels across, and a moment
+      // a sample a finer one, both kept by the running accumulation as its history gives way to the moving flames.)
+      // (The velocity in one lookup: each component lives on its own faces, a quarter cell either way of where this
+      // reads it, near enough for a blur.)
       var wm = w;
       if (R.camera.x > 0.0) {
         let u = textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
-        wm = w - u * select((fract(jitter + f32(i) * 0.618034) - 0.5) * R.camera.x, shutterTau, R.camera.w > 0.5);
+        wm = w - u * shutterTau;
       }
       let uvm = uvwOf(wm);
       let s4 = scalSmooth(uvm);
@@ -5739,19 +5739,38 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `
 
-// 11. Temporal accumulation, then the camera. Each frame's march is blended into a running history, which averages
-// away the sampling noise (and, with the motion blur, the shutter's moments); the history is first clamped to the range
-// of the current frame's 3 x 3 neighbourhood (found in a luminance-compressed space, so a bright flame does not set it),
-// so what moves or flickers is not smeared behind it, and the blend is in linear light. (Blended compressed, a
-// flickering flame averaged a sixth darker than its frames do.) Then the lens's glare (GLARE), and DISPLAY: the white
-// balance, the view transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and a dither against
-// banding.
+// 11. Temporal upsampling, then the camera. The march draws fewer pixels than the display has (its render scale), its
+// rays through a different point of their pixels each frame (the R2 sequence), and this pass gathers each frame's
+// samples into a history at the display's own size, which averages away the sampling noise (and, paused, the shutter's
+// moments) and builds up the detail no single frame has. The camera never moves while a history lasts (a new framing
+// starts it afresh), so a point of the set, the floor or a resting ball stays on the same display pixel from frame to
+// frame and needs no motion vectors. The history is first clipped to the frame's 3 x 3 neighbourhood of samples (their
+// mean, give or take 1.25 standard deviations, within their range, in a luminance-compressed space, so a bright flame
+// does not set it), and the further the clip moves it, the fewer samples it counts for (its count is the alpha), so
+// what moves or flickers is not smeared behind it. A history that counts for several takes in the samples that landed
+// near the display pixel's centre this frame (a narrow Gaussian, GATHER_SHARPNESS in engine.ts), which is what sharpens
+// the still set; one that counts for few (just started, or where the flames move) takes the frame's smooth
+// reconstruction (a Gaussian over its samples, about a march pixel wide) instead, so the moving flames are drawn soft
+// rather than as a mosaic of single samples. While the fire runs, its flicker relights the set from frame to frame; a
+// display pixel takes in a near sample only every few frames, each on its own schedule, so left alone neighbours would
+// hold different moments of the flicker, a fine pattern over a lit surface. So the history is first relit, a share of
+// the way each frame, by the frame's brightness over the history's, both smoothed over the same footprint (the wide
+// Gaussian over the frame's samples, and the history read at the same places): every pixel follows the light alike.
+// (Not paused: nothing flickers, and the shutter's moments would only add noise to it.) The blend is in linear light.
+// (Blended compressed, a flickering flame averaged a sixth darker than its frames do.) Then the lens's glare (GLARE), and DISPLAY: the white balance, the view
+// transform (the Lookdev lab's own, viewTransforms.ts: ACES 2.0 by default) and a dither against banding.
 export const RESOLVE = /* wgsl */ `
 ${SIM_COMMON}
 ${RENDER_COMMON}
-@group(0) @binding(2) var current: texture_2d<f32>;
+@group(0) @binding(2) var current: texture_2d<f32>; // the march, in its top left corner
 @group(0) @binding(3) var history: texture_2d<f32>;
-@group(0) @binding(4) var<uniform> T: vec4<f32>; // history valid (0 or 1), weight of the current frame
+// Whether there is a history (0 or 1), the exposure's change since it was drawn (the auto exposure eases every frame,
+// and the march is exposed), this frame's offset within the march's pixels (x, y); the march's pixels per display
+// pixel (x, y), the samples the history may count, the narrow gather's 1 / (2 sigma^2) in display pixels; the march's
+// size (x, y), the share of the way the history is relit each frame; the collision ball's footprint when it moved since
+// the last frame (centre x, y and radius in display pixels, and 1), where the history starts afresh.
+@group(0) @binding(4) var<uniform> T: array<vec4<f32>, 4>;
+@group(0) @binding(5) var smp: sampler; // (linear)
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -5765,22 +5784,68 @@ fn unsquash(c: vec3<f32>) -> vec3<f32> { return c / max(1.0 - ap1Lum(c), 1e-4); 
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let p = vec2<i32>(fc.xy);
-  let last = vec2<i32>(textureDimensions(current)) - 1;
-  let cur = squash(max(textureLoad(current, p, 0).xyz, vec3<f32>(0.0)));
-  var lo = cur;
-  var hi = cur;
+  let k = T[1].xy;
+  let sub = T[0].zw;
+  let most = T[1].z;
+  let last = vec2<i32>(T[2].xy) - 1;
+  // This display pixel's centre in the march's pixels; march pixel i's sample sits at i + 0.5 + sub.
+  let q = fc.xy * k;
+  let c0 = vec2<i32>(floor(q - sub));
+  var narrow = vec3<f32>(0.0);
+  var wN = 0.0;
+  var wide = vec3<f32>(0.0);
+  var wW = 0.0;
+  var lo = vec3<f32>(1e9);
+  var hi = vec3<f32>(-1e9);
+  var m1 = vec3<f32>(0.0);
+  var m2 = vec3<f32>(0.0);
+  var wideHist = 0.0;
+  let dims = vec2<f32>(textureDimensions(history));
   for (var dy = -1; dy <= 1; dy++) {
     for (var dx = -1; dx <= 1; dx++) {
-      let q = squash(max(textureLoad(current, clamp(p + vec2<i32>(dx, dy), vec2<i32>(0), last), 0).xyz, vec3<f32>(0.0)));
-      lo = min(lo, q);
-      hi = max(hi, q);
+      let ip = c0 + vec2<i32>(dx, dy);
+      let c = max(textureLoad(current, clamp(ip, vec2<i32>(0), last), 0).xyz, vec3<f32>(0.0));
+      let s = squash(c);
+      lo = min(lo, s);
+      hi = max(hi, s);
+      m1 += s;
+      m2 += s * s;
+      let dm = vec2<f32>(ip) + 0.5 + sub - q;
+      let dd = dm / k;
+      let wn = exp(-T[1].w * dot(dd, dd));
+      let ww = exp(-1.4 * dot(dm, dm));
+      narrow += c * wn;
+      wN += wn;
+      wide += c * ww;
+      wW += ww;
+      // (The history's luminance at the same sample's place, for the relighting.)
+      wideHist += ap1Lum(textureSampleLevel(history, smp, (vec2<f32>(ip) + 0.5 + sub) / k / dims, 0.0).xyz) * ww;
     }
   }
-  if (T.x > 0.5) {
-    let h = clamp(squash(textureLoad(history, p, 0).xyz), lo, hi);
-    return vec4<f32>(mix(unsquash(h), unsquash(cur), T.y), 1.0);
+  let soft = wide / max(wW, 1e-6);
+  let mu = m1 / 9.0;
+  let sd = sqrt(max(m2 / 9.0 - mu * mu, vec3<f32>(0.0)));
+  let blo = max(lo, mu - 1.25 * sd);
+  let bhi = min(hi, mu + 1.25 * sd);
+  var h = vec3<f32>(0.0);
+  var n = 0.0;
+  let underBall = T[3].w > 0.5 && distance(fc.xy, T[3].xy) < T[3].z;
+  if (T[0].x > 0.5 && !underBall) {
+    let hv = textureLoad(history, p, 0);
+    let was = wideHist * T[0].y;
+    let now = ap1Lum(wide);
+    let relight = select(1.0, 1.0 + T[2].z * (clamp(now / max(was, 1e-6), 0.5, 2.0) - 1.0), was > 1e-5 * wW);
+    let hs = squash(max(hv.xyz * T[0].y * relight, vec3<f32>(0.0)));
+    let hc = clamp(hs, blo, bhi);
+    h = unsquash(hc);
+    // (A small move is the fire's flicker relighting what is still there, and costs it little.)
+    n = min(hv.w, most) * (1.0 - smoothstep(0.03, 0.12, length(hc - hs)));
   }
-  return vec4<f32>(unsquash(cur), 1.0);
+  let trust = smoothstep(0.5, 3.0, n);
+  let wSoft = 1.0 - trust;
+  let total = n + wN * trust + wSoft;
+  let col = (h * n + narrow * trust + soft * wSoft) / max(total, 1e-6);
+  return vec4<f32>(col, min(total, most));
 }
 `
 

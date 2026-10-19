@@ -42,6 +42,7 @@ paused and stepped exactly, so a given scenario gives the same run every time.
 | `validate.mjs` | The fire against McCaffrey's centreline temperatures, Heskestad's flame height and Cetegen and Ahmed's puffing frequency. About 8 minutes a case. |
 | `stills.mjs` | Settled renders at chosen moments, or every step for a clip. |
 | `profile.mjs` | GPU time per kernel (median of several), and the live steps a second. |
+| `fullres.mjs` | The running and paused views as a visitor sees them, exactly (frames drawn as the running loop draws them, then paused), against the settled full-size still of the same moment; live screenshots; GPU time of the image pass and the passes after it; the path-traced reference's rate; a dragged ball; frames for a pre-rendered loop. |
 
 ## Recipes
 
@@ -74,4 +75,4 @@ node tools/pyro-probes/detail.mjs --patch '{"velocity":"lfm"}' --tag lfm
 The probes read the engine through its development readouts, which can also be called from the browser console on
 the dev server: `readScalars()` (the raw fields and heat release), `readFields()` (density, temperature, velocity
 per cell), `readBall()` then `ballStatus`, `readRatio()` (the mass-keeping ratios), `readIvock()`,
-`measureDivergence()`, `profileStep()`, `snapshot(w, h)`, and `advance(steps)` to step it while paused.
+`measureDivergence()`, `profileStep()`, `snapshot(w, h)`, `runView(frames)` and `pausedView()` (the running and paused views, exactly), and `advance(steps)` to step it while paused.

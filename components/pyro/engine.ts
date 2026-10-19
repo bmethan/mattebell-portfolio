@@ -191,6 +191,9 @@ const norm = (a: Vec3): Vec3 => {
   const l = Math.hypot(a[0], a[1], a[2]) || 1
   return [a[0] / l, a[1] / l, a[2] / l]
 }
+type Camera = { pos: Vec3; fwd: Vec3; tanY: number; aspect: number }
+// Whether a camera differs from another: its position, direction, field of view or aspect.
+const camMoved = (a: Camera, b: Camera) => [...a.pos, ...a.fwd, a.tanY, a.aspect].some((v, i) => Math.abs(v - [...b.pos, ...b.fwd, b.tanY, b.aspect][i]) > 1e-6)
 
 // The frame's targets and the bind groups of the passes over them (see ensureTargets, postGroups).
 interface Targets {
@@ -1333,12 +1336,25 @@ export class PyroEngine {
     this.kick()
   }
 
+  private layoutCamera() {
+    const next = this.cameraFor(this.closeOn)
+    if (!next) return
+    // A new camera starts the history afresh, and the path-traced reference (it no longer shows the same points).
+    if (camMoved(next.cam, this.cam)) {
+      this.camVersion++
+      this.taaCount = 0
+      this.needsRender = true
+    }
+    this.cam = next.cam
+    this.framing = next.framing
+  }
+
   // A camera a little below the plume's middle, looking along -z, as close as framing the domain's height allows, and
   // closer still on wide frames, until the domain spans the frame's width (smoke then leaves through the frame's
-  // edges, never a side of the box in view). Close on the ball, the same camera moved in (closePos); the lab's framing
-  // stays the lab's (the reference set is placed by it).
-  private layoutCamera() {
-    if (!this.grids) return
+  // edges, never a side of the box in view). Close on the ball (aimed at `on`), the same camera moved in (closePos);
+  // the lab's framing stays the lab's (the reference set is placed by it).
+  private cameraFor(on: Vec3) {
+    if (!this.grids) return null
     const [nx, ny] = this.grids.n
     const dx = DOMAIN_WIDTH / nx
     const h = ny * dx
@@ -1350,27 +1366,19 @@ export class PyroEngine {
     const fwd = norm(sub(target, lab))
     const right = norm(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
-    const pos = this.closeUp() ? this.closePos(lab, fwd, right, up, tanY, aspect) : lab
-    // A new camera starts the history afresh, and the path-traced reference (it no longer shows the same points).
-    const was = this.cam
-    if ([...pos, ...fwd, tanY, aspect].some((v, i) => Math.abs(v - [...was.pos, ...was.fwd, was.tanY, was.aspect][i]) > 1e-6)) {
-      this.camVersion++
-      this.taaCount = 0
-      this.needsRender = true
-    }
-    this.cam = { pos, fwd, right, up, tanY, aspect }
-    this.framing = { z: lab[2], tanY, aspect }
+    const pos = this.closeUp() ? this.closePos(on, lab, fwd, right, up, tanY, aspect) : lab
+    return { cam: { pos, fwd, right, up, tanY, aspect }, framing: { z: lab[2], tanY, aspect } }
   }
 
   private closeUp() {
     return this.view === 'close' && this.state.ball
   }
 
-  // The close camera: back along the lab camera's direction from a little above where the ball was when it aimed, far
-  // enough that the ball's diameter takes CLOSE_FILL of the frame (its height, or its width were the frame ever taller
-  // than wide). Held where its frame shows no more of the box than the lab's does (where its corners meet the box's
-  // middle plane: within 49% of its width either side, no higher than the lab frame's top), and above the floor.
-  private closePos(lab: Vec3, fwd: Vec3, right: Vec3, up: Vec3, tanY: number, aspect: number): Vec3 {
+  // The close camera: back along the lab camera's direction from a little above `on`, where the ball was when it aimed,
+  // far enough that the ball's diameter takes CLOSE_FILL of the frame (its height, or its width were the frame ever
+  // taller than wide). Held where its frame shows no more of the box than the lab's does (where its corners meet the
+  // box's middle plane: within 49% of its width either side, no higher than the lab frame's top), and above the floor.
+  private closePos(on: Vec3, lab: Vec3, fwd: Vec3, right: Vec3, up: Vec3, tanY: number, aspect: number): Vec3 {
     const r = this.state.ballRadius
     const dist = r / (CLOSE_FILL * tanY * Math.min(aspect, 1))
     const from = (aim: Vec3): Vec3 => [aim[0] - fwd[0] * dist, aim[1] - fwd[1] * dist, aim[2] - fwd[2] * dist]
@@ -1389,8 +1397,8 @@ export class PyroEngine {
     const half = Math.max(...own.map(c => Math.abs(c[0])))
     const above = Math.max(...own.map(c => c[1]))
     const side = Math.max(DOMAIN_WIDTH * 0.49 - half, 0)
-    const x = Math.max(-side, Math.min(side, this.closeOn[0]))
-    const y = Math.max(Math.min(this.closeOn[1] + CLOSE_LIFT * r, labTop - above), CLOSE_MIN_HEIGHT + fwd[1] * dist)
+    const x = Math.max(-side, Math.min(side, on[0]))
+    const y = Math.max(Math.min(on[1] + CLOSE_LIFT * r, labTop - above), CLOSE_MIN_HEIGHT + fwd[1] * dist)
     return from([x, y, 0])
   }
 
@@ -1406,16 +1414,22 @@ export class PyroEngine {
     return this.camVersion !== was
   }
 
-  // After a drag or a run of nudges, close up: aims again at the ball if it has gone more than CLOSE_REAIM of the way
-  // from the frame's middle to its edge (or out of the frame). Whether the camera moved (held at the box's limits, it
-  // may not).
-  reframe() {
+  // Close up, after a drag or a run of nudges: whether the ball has gone more than CLOSE_REAIM of the way from the
+  // frame's middle to its edge (or out of the frame) and aiming at it again would move the camera (held at the box's
+  // limits, it may not). The lab asks first, so it fades the frame only for a cut that happens.
+  wouldReframe() {
     if (!this.closeUp()) return false
     const c = this.cam
     const d = sub(this.ballPos, c.pos)
     const z = dot(d, c.fwd)
     if (z > 0 && Math.abs(dot(d, c.right) / (z * c.tanY * c.aspect)) <= CLOSE_REAIM && Math.abs(dot(d, c.up) / (z * c.tanY)) <= CLOSE_REAIM) return false
-    return this.setView('close')
+    const next = this.cameraFor(this.ballPos)
+    return !!next && camMoved(next.cam, c)
+  }
+
+  // Aims again at the ball, if wouldReframe(). Whether the camera moved.
+  reframe() {
+    return this.wouldReframe() && this.setView('close')
   }
 
   // Resolves once this many more frames have been drawn, or after maxMs (the loop may be stopped, or paused and

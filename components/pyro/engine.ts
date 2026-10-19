@@ -35,6 +35,15 @@ const BIMOCQ_REINIT = 16
 const MG_COARSE_OMEGA = 1.6
 const SPEED_LIMIT = 8 // m/s
 const FOV_Y = (32 * Math.PI) / 180
+// The close view (setView): a camera looking the lab camera's way, near enough that the ball's diameter takes this
+// share of the frame's height, aimed this many ball radii above its centre (room for its flames); after a drag it aims
+// again once the ball has gone this share of the way from the frame's middle to its edge; never lower than this (m).
+// Tuned on the running view at five stages of the burn: three fifths puts a 1.3 mm crack at 1.36 of the Envy's screen
+// pixels (1.09 at half) and leaves 23 cm above the 22 cm ball for its flames; seven tenths cut the ball's foot off.
+const CLOSE_FILL = 0.6
+const CLOSE_LIFT = 0.4
+const CLOSE_REAIM = 1 / 3
+const CLOSE_MIN_HEIGHT = 0.05
 const RENDER_SCALE_MIN = 0.5
 const RENDER_SCALE_START = 0.75
 // The simulation falling behind real time while the page's frames still come (the GPU is the bottleneck, and the
@@ -160,7 +169,10 @@ export interface PyroStatus {
   exposureEV: number // the camera's exposure now (metered when auto)
   ball: BallStatus | null // the wooden ball, when there is one
   pathTrace: { on: boolean; samples: number; compiling: boolean } // the path-traced reference (paused)
+  view: PyroView // the camera: the lab's framing, or close on the ball (setView)
 }
+
+export type PyroView = 'whole' | 'close'
 
 // The wooden ball, as read back a few times a second: its hottest surface (K), the heat its flames release (kW, from
 // the volatiles it gives off fast enough to burn) and the share of its surface charred.
@@ -206,6 +218,9 @@ const norm = (a: Vec3): Vec3 => {
   const l = Math.hypot(a[0], a[1], a[2]) || 1
   return [a[0] / l, a[1] / l, a[2] / l]
 }
+type Camera = { pos: Vec3; fwd: Vec3; tanY: number; aspect: number }
+// Whether a camera differs from another: its position, direction, field of view or aspect.
+const camMoved = (a: Camera, b: Camera) => [...a.pos, ...a.fwd, a.tanY, a.aspect].some((v, i) => Math.abs(v - [...b.pos, ...b.fwd, b.tanY, b.aspect][i]) > 1e-6)
 
 // The frame's targets and the bind groups of the passes over them (see ensureTargets, postGroups).
 interface Targets {
@@ -780,6 +795,14 @@ export class PyroEngine {
   private cam = { pos: [0, 0, 0] as Vec3, fwd: [0, 0, -1] as Vec3, right: [1, 0, 0] as Vec3, up: [0, 1, 0] as Vec3, tanY: 0, aspect: 1 }
   // The lab's framing (layoutCamera): the camera's distance along z, the tangent of half its field of view, its aspect.
   private framing = { z: 0, tanY: 0, aspect: 1 }
+  // The view (setView): the whole fire, or close on the ball where it was when the view last aimed at it, so the camera
+  // moves only when the view does, never while the ball is dragged; and the frames drawn that callers wait for
+  // (framesDrawn).
+  private view: PyroView = 'whole'
+  private closeOn: Vec3 = [0, 0, 0]
+  closeFill = CLOSE_FILL // (development: the close view's framing, for tuning)
+  closeLift = CLOSE_LIFT
+  private drawWaits: { at: number; done: () => void }[] = []
 
   private constructor(
     private canvas: HTMLCanvasElement,
@@ -1367,6 +1390,11 @@ export class PyroEngine {
     }
     // (A ball of another size is a new ball: its cells are laid out by its radius.)
     if ((this.state.ball && !prev.ball) || (this.state.ballBurns && !prev.ballBurns) || this.state.ballRadius !== prev.ballRadius) this.resetSkin()
+    // The close view frames the ball by its size, and without a ball there is nothing to be close on.
+    if (this.view === 'close' && (!this.state.ball || this.state.ballRadius !== prev.ballRadius)) {
+      if (!this.state.ball) this.view = 'whole'
+      this.layoutCamera()
+    }
     if (this.state.env !== prev.env) this.syncEnv()
     // Shading changes redraw (and relight) at once, even while paused, and accumulate afresh (traced too).
     this.stateVersion++
@@ -1465,11 +1493,26 @@ export class PyroEngine {
     const quick = !this.paused || (this.settle < PAUSED_QUICK && !this.forceMarch)
     this.frameMarch = quick ? [this.marchW, this.marchH] : this.pausedMarch()
   }
+
+  private layoutCamera() {
+    const next = this.cameraFor(this.closeOn)
+    if (!next) return
+    // A new camera starts the history afresh, and the path-traced reference (it no longer shows the same points).
+    if (camMoved(next.cam, this.cam)) {
+      this.camVersion++
+      this.taaCount = 0
+      this.needsRender = true
+    }
+    this.cam = next.cam
+    this.framing = next.framing
+  }
+
   // A camera a little below the plume's middle, looking along -z, as close as framing the domain's height allows, and
   // closer still on wide frames, until the domain spans the frame's width (smoke then leaves through the frame's
-  // edges, never a side of the box in view).
-  private layoutCamera() {
-    if (!this.grids) return
+  // edges, never a side of the box in view). Close on the ball (aimed at `on`), the same camera moved in (closePos);
+  // the lab's framing stays the lab's (the reference set is placed by it).
+  private cameraFor(on: Vec3) {
+    if (!this.grids) return null
     const [nx, ny] = this.grids.n
     const dx = DOMAIN_WIDTH / nx
     const h = ny * dx
@@ -1477,18 +1520,87 @@ export class PyroEngine {
     const tanY = Math.tan(FOV_Y / 2)
     const dist = Math.min((h * 0.525) / tanY, (DOMAIN_WIDTH * 0.49) / (tanY * aspect))
     const target: Vec3 = [0, h * 0.47, 0]
-    const pos: Vec3 = [0, h * 0.3, dist]
-    const fwd = norm(sub(target, pos))
+    const lab: Vec3 = [0, h * 0.3, dist]
+    const fwd = norm(sub(target, lab))
     const right = norm(cross(fwd, [0, 1, 0]))
     const up = cross(right, fwd)
-    // A new framing starts the history afresh (it is in the display's pixels, which no longer show the same points).
-    const was = this.cam
-    if ([...pos, ...fwd, tanY, aspect].some((v, i) => Math.abs(v - [...was.pos, ...was.fwd, was.tanY, was.aspect][i]) > 1e-6)) {
-      this.camVersion++
-      this.taaCount = 0
-    }
-    this.cam = { pos, fwd, right, up, tanY, aspect }
-    this.framing = { z: pos[2], tanY, aspect }
+    const pos = this.closeUp() ? this.closePos(on, lab, fwd, right, up, tanY, aspect) : lab
+    return { cam: { pos, fwd, right, up, tanY, aspect }, framing: { z: lab[2], tanY, aspect } }
+  }
+
+  private closeUp() {
+    return this.view === 'close' && this.state.ball
+  }
+
+  // The close camera: back along the lab camera's direction from a little above `on`, where the ball was when it aimed,
+  // far enough that the ball's diameter takes CLOSE_FILL of the frame (its height, or its width were the frame ever
+  // taller than wide). Held where its frame shows no more of the box than the lab's does (where its corners meet the
+  // box's middle plane: within 49% of its width either side, no higher than the lab frame's top), and above the floor.
+  private closePos(on: Vec3, lab: Vec3, fwd: Vec3, right: Vec3, up: Vec3, tanY: number, aspect: number): Vec3 {
+    const r = this.state.ballRadius
+    const dist = r / (this.closeFill * tanY * Math.min(aspect, 1))
+    const from = (aim: Vec3): Vec3 => [aim[0] - fwd[0] * dist, aim[1] - fwd[1] * dist, aim[2] - fwd[2] * dist]
+    // Where the frame's corners, seen from p, meet the plane z = 0 (x, y).
+    const corners = (p: Vec3) =>
+      [-1, 1].flatMap(sx =>
+        [-1, 1].map(sy => {
+          const d = [0, 1, 2].map(i => fwd[i] + right[i] * sx * tanY * aspect + up[i] * sy * tanY)
+          const t = -p[2] / d[2]
+          return [p[0] + d[0] * t, p[1] + d[1] * t]
+        }),
+      )
+    const labTop = Math.max(...corners(lab).map(c => c[1]))
+    // (The aim moves only in x and y, which moves the corners with it: they are found once, about an aim at the origin.)
+    const own = corners(from([0, 0, 0]))
+    const half = Math.max(...own.map(c => Math.abs(c[0])))
+    const above = Math.max(...own.map(c => c[1]))
+    const side = Math.max(DOMAIN_WIDTH * 0.49 - half, 0)
+    const x = Math.max(-side, Math.min(side, on[0]))
+    const y = Math.max(Math.min(on[1] + this.closeLift * r, labTop - above), CLOSE_MIN_HEIGHT + fwd[1] * dist)
+    return from([x, y, 0])
+  }
+
+  // The view: the whole fire, or close on the ball where it is now (only with a ball). Whether the camera moved.
+  setView(view: PyroView) {
+    if (view === 'close' && !this.state.ball) return false
+    const was = this.camVersion
+    this.view = view
+    if (view === 'close') this.closeOn = [...this.ballPos]
+    this.layoutCamera()
+    this.kick()
+    this.report(true)
+    return this.camVersion !== was
+  }
+
+  // Close up, after a drag or a run of nudges: whether the ball has gone more than CLOSE_REAIM of the way from the
+  // frame's middle to its edge (or out of the frame) and aiming at it again would move the camera (held at the box's
+  // limits, it may not). The lab asks first, so it fades the frame only for a cut that happens.
+  wouldReframe() {
+    if (!this.closeUp()) return false
+    const c = this.cam
+    const d = sub(this.ballPos, c.pos)
+    const z = dot(d, c.fwd)
+    if (z > 0 && Math.abs(dot(d, c.right) / (z * c.tanY * c.aspect)) <= CLOSE_REAIM && Math.abs(dot(d, c.up) / (z * c.tanY)) <= CLOSE_REAIM) return false
+    const next = this.cameraFor(this.ballPos)
+    return !!next && camMoved(next.cam, c)
+  }
+
+  // Aims again at the ball, if wouldReframe(). Whether the camera moved.
+  reframe() {
+    return this.wouldReframe() && this.setView('close')
+  }
+
+  // Resolves once this many more frames have been drawn, or after maxMs (the loop may be stopped, or paused and
+  // settled): the lab's cut between views waits on it.
+  framesDrawn(frames: number, maxMs: number) {
+    return new Promise<void>(resolve => {
+      const wait = { at: this.renderFrame + frames, done: resolve }
+      this.drawWaits.push(wait)
+      setTimeout(() => {
+        this.drawWaits = this.drawWaits.filter(w => w !== wait)
+        resolve()
+      }, maxMs)
+    })
   }
 
   // A drag on the image: ndc (x, y in -1..1, y up) and how far it moved (ndc units) in dtMs. The stir pushes the
@@ -1593,9 +1705,11 @@ export class PyroEngine {
       c.fwd[1] + c.right[1] * x * c.tanY * c.aspect + c.up[1] * y * c.tanY,
       c.fwd[2] + c.right[2] * x * c.tanY * c.aspect + c.up[2] * y * c.tanY,
     ])
-    // World metres per ndc unit at the domain's centre plane.
+    const o = c.pos
+    const t = Math.max(0, -(o[0] * dir[0] + o[2] * dir[2]) / Math.max(dir[0] * dir[0] + dir[2] * dir[2], 1e-6))
+    // World metres per ndc unit at the domain's centre plane (close up, at the stir's own distance).
     const [nx, ny] = this.grids.n
-    const dist = Math.hypot(c.pos[0], c.pos[1] - (ny * DOMAIN_WIDTH) / nx * 0.47, c.pos[2])
+    const dist = this.closeUp() ? Math.max(t, 0.3) : Math.hypot(c.pos[0], c.pos[1] - (ny * DOMAIN_WIDTH) / nx * 0.47, c.pos[2])
     const mx = dxNdc * dist * c.tanY * c.aspect
     const my = dyNdc * dist * c.tanY
     const secs = Math.max(dtMs, 8) / 1000
@@ -1603,8 +1717,6 @@ export class PyroEngine {
     let vel: Vec3 = [(c.right[0] * mx + c.up[0] * my) / secs * gain, (c.right[1] * mx + c.up[1] * my) / secs * gain, (c.right[2] * mx + c.up[2] * my) / secs * gain]
     const speed = Math.hypot(...vel)
     if (speed > 3) vel = vel.map(v => (v * 3) / speed) as Vec3
-    const o = c.pos
-    const t = Math.max(0, -(o[0] * dir[0] + o[2] * dir[2]) / Math.max(dir[0] * dir[0] + dir[2] * dir[2], 1e-6))
     this.stir = { centre: [o[0] + dir[0] * t, o[1] + dir[1] * t, o[2] + dir[2] * t], vel }
     this.kick()
   }
@@ -1658,6 +1770,7 @@ export class PyroEngine {
         this.inFlight--
       })
     }
+    if (this.drawWaits.length) this.drawWaits = this.drawWaits.filter(w => (this.renderFrame >= w.at ? (w.done(), false) : true))
     if (!this.paused) {
       this.frameTimes.push(now)
       this.adapt()
@@ -2985,6 +3098,7 @@ export class PyroEngine {
       exposureEV: this.state.exposureMode === 'manual' ? this.state.exposure : (this.meterEV ?? this.targetEV()) - this.state.exposureComp,
       ball: this.ballBurning() ? this.ballStatus : null,
       pathTrace: { on: this.pt.on, samples: this.pt.on && this.ptPipe ? this.pt.n : 0, compiling: this.ptCompiling },
+      view: this.closeUp() ? 'close' : 'whole',
     })
   }
 

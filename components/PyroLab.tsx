@@ -20,6 +20,14 @@ const ENV_EV: Record<Exclude<Env, 'none'>, number> = { midday: 15.5, overcast: 1
 const LIGHTINGS: PyroState['env'][] = ['none', 'rig', ...ENV_ORDER.filter((e): e is Exclude<Env, 'none'> => e !== 'none')]
 
 const TOUCH_SLOP = 8 // px a finger must travel sideways before it stirs (a vertical swipe scrolls the page)
+// A cut between the whole fire and the close view: the frame fades out (ms, as .lab-frame-cut's fade in the CSS), the
+// camera changes, and it fades back once the new view has drawn this many frames (its history, as the running view
+// keeps it), or after at most this long (ms). After the arrow keys move the ball, this long without one before the
+// close view aims at it again.
+const CUT_OUT_MS = 150
+const CUT_FRAMES = 8
+const CUT_HOLD_MS = 600
+const NUDGE_SETTLE_MS = 400
 const noSubscribe = () => () => {}
 
 type PyroTab = 'source' | 'forces' | 'fire' | 'shading' | 'solver'
@@ -87,11 +95,11 @@ const TECH_NOTES: [string, string][] = [
   ],
   [
     'Rendering',
-    'Each pixel marches through the volume and integrates each step in closed form, in photometric units (cd/m²), each colour channel on its own. Sunlight reaches every point through the optical depth toward the sun, recomputed each frame on a half-resolution grid from the smoke the camera sees (with the smoke upres on, its finer grid, averaged over the coarse grid’s cells); multiple-scattering octaves stand in for light bouncing inside the smoke, each weighted by the chance that light scattered once meets more smoke (toward the sun, up and down) and is scattered again rather than absorbed (its albedo), so pale steam takes far more of it than soot. The sky lights the smoke through the smoke around it (its mean transmittance in five directions), by the share of the scattering the sky fills (smoke that scatters forward, seen from below, takes more than half), and bounces inside it too; the floor lights it from below, as the floor straight under it is lit (the fire’s light on it as the floor itself takes it), and bounces inside it too. The floor takes the smoke’s shadow and the fire’s light. Between cells the smoke and soot are sampled with a cubic B-spline (eight trilinear fetches placed so the hardware’s blend gives the spline’s weights, after Sigg and Hadwiger), smooth where trilinear interpolation creases at every cell face; the Shading tab switches back to trilinear, which renders in about two thirds of the time. Each frame starts its march at an offset from spatiotemporal blue noise (Wolfe, Morrical, Akenine-Möller and Ramamoorthi 2022), made for the lab by void and cluster: each frame’s offsets are blue noise in space, and each pixel’s offsets from frame to frame are blue noise in time, which cuts the noise of the first one to four accumulated frames by 9 to 16% against blue noise stepped by the golden ratio. Frames accumulate, and are upsampled as they do: the march draws fewer pixels than the display has (from half as many each way, on a GPU that needs it, to all of them), each frame’s rays through a different point of their pixels, and each frame’s samples are gathered into a running history at the display’s own size, which averages the sampling noise away and builds up detail no single frame has. The camera does not move, so what stands still lands on the same pixel frame after frame. The history is first clamped to the range of the new frame’s neighbourhood so what moves is not smeared behind it (where the flames move, the frame’s own smooth reconstruction stands in), and relit toward each frame’s light, so the fire’s flicker does not leave neighbouring pixels at different moments of it. The blend is in linear light (blended in a compressed one, as is common to keep bright pixels from flickering, a flame averaged a sixth darker than its own frames). A paused frame keeps accumulating, marched at the display’s full size, until it settles.',
+    'Each pixel marches through the volume and integrates each step in closed form, in photometric units (cd/m²), each colour channel on its own. Sunlight reaches every point through the optical depth toward the sun, recomputed each frame on a half-resolution grid from the smoke the camera sees (with the smoke upres on, its finer grid, averaged over the coarse grid’s cells); multiple-scattering octaves stand in for light bouncing inside the smoke, each weighted by the chance that light scattered once meets more smoke (toward the sun, up and down) and is scattered again rather than absorbed (its albedo), so pale steam takes far more of it than soot. The sky lights the smoke through the smoke around it (its mean transmittance in five directions), by the share of the scattering the sky fills (smoke that scatters forward, seen from below, takes more than half), and bounces inside it too; the floor lights it from below, as the floor straight under it is lit (the fire’s light on it as the floor itself takes it), and bounces inside it too. The floor takes the smoke’s shadow and the fire’s light. Between cells the smoke and soot are sampled with a cubic B-spline (eight trilinear fetches placed so the hardware’s blend gives the spline’s weights, after Sigg and Hadwiger), smooth where trilinear interpolation creases at every cell face; the Shading tab switches back to trilinear, which renders in about two thirds of the time. Each frame starts its march at an offset from spatiotemporal blue noise (Wolfe, Morrical, Akenine-Möller and Ramamoorthi 2022), made for the lab by void and cluster: each frame’s offsets are blue noise in space, and each pixel’s offsets from frame to frame are blue noise in time, which cuts the noise of the first one to four accumulated frames by 9 to 16% against blue noise stepped by the golden ratio. Frames accumulate, and are upsampled as they do: the march draws fewer pixels than the display has (from half as many each way, on a GPU that needs it, to all of them), each frame’s rays through a different point of their pixels, and each frame’s samples are gathered into a running history at the display’s own size, which averages the sampling noise away and builds up detail no single frame has. The camera does not move between cuts to and from Close up, so what stands still lands on the same pixel frame after frame. The history is first clamped to the range of the new frame’s neighbourhood so what moves is not smeared behind it (where the flames move, the frame’s own smooth reconstruction stands in), and relit toward each frame’s light, so the fire’s flicker does not leave neighbouring pixels at different moments of it. The blend is in linear light (blended in a compressed one, as is common to keep bright pixels from flickering, a flame averaged a sixth darker than its own frames). A paused frame keeps accumulating, marched at the display’s full size, until it settles. A new camera, a cut to or from Close up, starts the history afresh, behind the cut’s fade.',
   ],
   [
     'Camera',
-    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. The shutter is a film camera’s at 24 frames a second, 180 degrees by default (open 1/48 s), in a paused frame: each ray takes one moment within it for all its samples, as the path-traced reference’s paths do, and reads the gas where the flow had it then, so fast flames streak as they do on film. While the fire runs, the image shows each moment as it is: the few frames it has of a moment are too few to average the shutter over, and its moments drawn at random left the moving flames grainy. The lens scatters a few percent of the light it passes (4% by default) into a wide, soft glare, by a chain of blurs that keeps the light’s energy (Jimenez’s, from Call of Duty), which shows only around what is far brighter than its surroundings, as the flames’ cores are. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (read from its flames as they are drawn: EV 7.5 to 8.5 for an 80 kW campfire as it puffs, a third of a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze, or the Lookdev lab’s cyc in its charcoal or gray, the floor sweeping up into a wall behind the fire, lit by the fire too. The cyc’s wall hides the half of the sky behind it from the smoke in front of it, which sees the wall’s light there instead, and from the cyc itself, which sees the rest of the cyc there: a map of the cyc’s light, across the view and along its floor and wall, gathers at each point what the rest of the cyc sends it, through the smoke on the way, an order of the bounce more each update, so the fire-lit floor lights the wall behind the fire and the wall the floor.',
+    'Exposed like a real camera. Light is set as a light meter reads it, the sun and sky as incident readings (2.5 × 2^EV lux), and the exposure is the camera’s EV at ISO 100, saturating at 1.2 × 2^EV cd/m² (Frostbite’s physically based camera). The white balance is a Bradford chromatic adaptation from a blackbody of the chosen temperature to the display’s white, the step Nguyen and colleagues took for fire; then the Lookdev lab’s own view transforms: ACES 2.0 (baked from OpenColorIO 2.5) by default, or AgX, Khronos PBR Neutral or a plain sRGB curve. The shutter is a film camera’s at 24 frames a second, 180 degrees by default (open 1/48 s), in a paused frame: each ray takes one moment within it for all its samples, as the path-traced reference’s paths do, and reads the gas where the flow had it then, so fast flames streak as they do on film. While the fire runs, the image shows each moment as it is: the few frames it has of a moment are too few to average the shutter over, and its moments drawn at random left the moving flames grainy. The lens scatters a few percent of the light it passes (4% by default) into a wide, soft glare, by a chain of blurs that keeps the light’s energy (Jimenez’s, from Call of Duty), which shows only around what is far brighter than its surroundings, as the flames’ cores are. Auto exposure meters the scene as a camera in program mode would: the sun and sky as an incident meter reads them, but never brighter than the fire allows (read from its flames as they are drawn: EV 7.5 to 8.5 for an 80 kW campfire as it puffs, a third of a stop more for each doubling of its light), eased over a second so the flames’ puffing does not pump it; its brightest flames saturate to yellow-white, as they do in photographs. The background is a studio’s black, or the sky (its radiance the sky’s illuminance over π, a little brighter toward the horizon) over a floor that runs into the horizon’s haze, or the Lookdev lab’s cyc in its charcoal or gray, the floor sweeping up into a wall behind the fire, lit by the fire too. The cyc’s wall hides the half of the sky behind it from the smoke in front of it, which sees the wall’s light there instead, and from the cyc itself, which sees the rest of the cyc there: a map of the cyc’s light, across the view and along its floor and wall, gathers at each point what the rest of the cyc sends it, through the smoke on the way, an order of the bounce more each update, so the fire-lit floor lights the wall behind the fire and the wall the floor. Close up, a button over the image while there is a ball, moves the same camera in along its own line until the ball’s diameter takes three fifths of the frame’s height (1.3 m from the 22 cm ball), the ball a little below the middle to leave room for its flames. It holds still between cuts: it aims at the ball again only when a drag or the arrow keys have taken it more than a third of the way to the frame’s edge, and it never shows more of the box than the whole view does, so the smoke still leaves through the frame’s edges. A cut fades the image out and back in over the eight frames the new view takes to settle.',
   ],
   [
     'Environments',
@@ -198,10 +206,32 @@ export default function PyroLab() {
       localStorage.setItem('pyro-wood-ball-callout', 'done')
     } catch {}
   }
+  // The camera: the whole fire, or close on the ball (the engine's setView). A cut between them fades the frame to its
+  // dark ground, changes the camera, and fades back once the new view has settled; one cut at a time.
+  const [cutting, setCutting] = useState(false)
+  const cutBusy = useRef(false)
+  const cut = async (change: (engine: PyroEngine) => boolean) => {
+    if (!engineRef.current || cutBusy.current) return
+    cutBusy.current = true
+    setCutting(true)
+    await new Promise(r => setTimeout(r, CUT_OUT_MS))
+    const engine = engineRef.current
+    if (engine && change(engine)) await engine.framesDrawn(CUT_FRAMES, CUT_HOLD_MS)
+    setCutting(false)
+    cutBusy.current = false
+  }
+  const view = status?.view ?? 'whole'
+  // Close up, once the ball has been dragged or nudged well off-centre: a cut to it again.
+  const reaim = () => {
+    if (engineRef.current?.wouldReframe()) void cut(engine => engine.reframe())
+  }
+  const nudgeTimer = useRef(0)
   const tryBall = () => {
     dismissCallout()
     update({ ball: true, ballBurns: true })
     setTool('ball')
+    // (The whole fire, to drag the ball into.)
+    if (view === 'close') void cut(engine => engine.setView('whole'))
     engineRef.current?.ballBeside()
   }
   const [renderer, setRenderer] = useState('')
@@ -337,9 +367,14 @@ export default function PyroLab() {
       setExporting(null)
     }
   }
+  // A restart, or a new starting point, starts from the whole fire.
+  const restart = () => {
+    engineRef.current?.setView('whole')
+    engineRef.current?.restart()
+  }
   const applyPreset = (state: Partial<PyroState>) => {
     update(state)
-    engineRef.current?.restart()
+    restart()
   }
   const pickTool = (t: 'stir' | 'source' | 'ball') => {
     setTool(t)
@@ -432,7 +467,9 @@ export default function PyroLab() {
     d.t = e.timeStamp
   }
   const endDrag = () => {
+    const ball = !!drag.current && tool === 'ball'
     drag.current = null
+    if (ball) reaim()
   }
   // The arrow keys push the smoke sideways or up from the middle of the frame.
   const onKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
@@ -440,8 +477,11 @@ export default function PyroLab() {
     const p = push[e.key]
     if (!p) return
     e.preventDefault()
-    if (tool === 'ball') engineRef.current?.nudgeBall(p[0] * 2, p[1] * 2)
-    else if (tool === 'source') {
+    if (tool === 'ball') {
+      engineRef.current?.nudgeBall(p[0] * 2, p[1] * 2)
+      window.clearTimeout(nudgeTimer.current)
+      nudgeTimer.current = window.setTimeout(reaim, NUDGE_SETTLE_MS)
+    } else if (tool === 'source') {
       const sx = Math.max(-2, Math.min(2, pyro.srcX + p[0] * 2))
       update({ srcX: sx })
     } else engineRef.current?.stirAt(0, 0, p[0], p[1], 33)
@@ -449,6 +489,9 @@ export default function PyroLab() {
 
   const dims = status?.dims ?? RESOLUTIONS[pyro.resolution].dims
   const inputOn = mode === 'live'
+  // The view's button, over the image while there is a ball to be close on (not while path tracing, whose wipe covers
+  // the frame).
+  const viewButton = mode === 'live' && shown && pyro.ball && !tracing
 
   return (
     <div>
@@ -477,7 +520,7 @@ export default function PyroLab() {
         <span className="sr-only">. </span>Every control below is live
       </p>
 
-      <div ref={frameRef} className="lab-frame">
+      <div ref={frameRef} className={`lab-frame${cutting ? ' lab-frame-cut' : ''}`}>
         {mode === 'fallback' ? (
           <PyroStill alt="A fire burning on the floor beside a colour chart, a grey ball and a chrome ball, its flames yellow at the base and red at the tips, its smoke rising, rendered by the pyro lab's solver" />
         ) : (
@@ -532,6 +575,13 @@ export default function PyroLab() {
                 Not now
               </Pill>
             </div>
+          </div>
+        )}
+        {viewButton && (
+          <div className="lab-view">
+            <button type="button" className={`lab-pill${view === 'close' ? ' on' : ''}`} onClick={() => void cut(engine => engine.setView(view === 'close' ? 'whole' : 'close'))}>
+              {view === 'close' ? 'Whole fire' : 'Close up'}
+            </button>
           </div>
         )}
         {mode === 'live' && tracing && status && (
@@ -598,7 +648,7 @@ export default function PyroLab() {
             <Pill on={paused} onClick={togglePause}>
               {paused ? 'Resume' : 'Pause'}
             </Pill>
-            <Pill on={false} onClick={() => engineRef.current?.restart()}>
+            <Pill on={false} onClick={restart}>
               Restart
             </Pill>
             <Pill

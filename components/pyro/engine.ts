@@ -38,8 +38,10 @@ const FOV_Y = (32 * Math.PI) / 180
 // The close view (setView): a camera looking the lab camera's way, near enough that the ball's diameter takes this
 // share of the frame's height, aimed this many ball radii above its centre (room for its flames); after a drag it aims
 // again once the ball has gone this share of the way from the frame's middle to its edge; never lower than this (m).
-const CLOSE_FILL = 0.5
-const CLOSE_LIFT = 0.25
+// Tuned on the running view at five stages of the burn: three fifths puts a 1.3 mm crack at 1.36 of the Envy's screen
+// pixels (1.09 at half) and leaves 23 cm above the 22 cm ball for its flames; seven tenths cut the ball's foot off.
+const CLOSE_FILL = 0.6
+const CLOSE_LIFT = 0.4
 const CLOSE_REAIM = 1 / 3
 const CLOSE_MIN_HEIGHT = 0.05
 const RENDER_SCALE_MIN = 0.5
@@ -798,6 +800,8 @@ export class PyroEngine {
   // (framesDrawn).
   private view: PyroView = 'whole'
   private closeOn: Vec3 = [0, 0, 0]
+  closeFill = CLOSE_FILL // (development: the close view's framing, for tuning)
+  closeLift = CLOSE_LIFT
   private drawWaits: { at: number; done: () => void }[] = []
 
   private constructor(
@@ -1534,7 +1538,7 @@ export class PyroEngine {
   // box's middle plane: within 49% of its width either side, no higher than the lab frame's top), and above the floor.
   private closePos(on: Vec3, lab: Vec3, fwd: Vec3, right: Vec3, up: Vec3, tanY: number, aspect: number): Vec3 {
     const r = this.state.ballRadius
-    const dist = r / (CLOSE_FILL * tanY * Math.min(aspect, 1))
+    const dist = r / (this.closeFill * tanY * Math.min(aspect, 1))
     const from = (aim: Vec3): Vec3 => [aim[0] - fwd[0] * dist, aim[1] - fwd[1] * dist, aim[2] - fwd[2] * dist]
     // Where the frame's corners, seen from p, meet the plane z = 0 (x, y).
     const corners = (p: Vec3) =>
@@ -1552,7 +1556,7 @@ export class PyroEngine {
     const above = Math.max(...own.map(c => c[1]))
     const side = Math.max(DOMAIN_WIDTH * 0.49 - half, 0)
     const x = Math.max(-side, Math.min(side, on[0]))
-    const y = Math.max(Math.min(on[1] + CLOSE_LIFT * r, labTop - above), CLOSE_MIN_HEIGHT + fwd[1] * dist)
+    const y = Math.max(Math.min(on[1] + this.closeLift * r, labTop - above), CLOSE_MIN_HEIGHT + fwd[1] * dist)
     return from([x, y, 0])
   }
 

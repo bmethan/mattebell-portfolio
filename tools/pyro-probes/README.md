@@ -34,6 +34,9 @@ paused and stepped exactly, so a given scenario gives the same run every time.
 | `hotcells.mjs` | The highest cells of a field, where they are (and how far from the ball's surface), and the rest of the gas's state there. |
 | `cellprobe.mjs` | One cell and its six neighbours, step by step: the gas, the fire's mass-keeping ratio (`readRatio`), the velocity. |
 | `ballburn.mjs` | The burning ball held in the bonfire and pulled out: its surface temperature, burning power and char every few seconds, and when it first flames. |
+| `embers.mjs` | The ball's embers once pulled out: still, stirred beside it and still again, each second its hottest faces and cracks, how much of it glows, and its flames' power. |
+| `woodcone.mjs` | The ball's wood as fire scientists test wood: a cone calorimeter's flux (flaming, or with its flame out, optionally blown), or the standard furnace fire, one column read as its char line advances. |
+| `charsphere.mjs` | The char's surface model solved for a small char sphere burning in air, against measured 1 cm wood-char spheres. No GPU. |
 | `stability.mjs` | The fastest gas and where, the kinetic energy and the total smoke over a run, optionally while stirring or sweeping the ball. A blow-up shows as speeds in the hundreds. |
 | `detail.mjs` | Smoke detail: sharpness, enstrophy, kinetic energy, where the smoke sits, and stills. |
 | `validate.mjs` | The fire against McCaffrey's centreline temperatures, Heskestad's flame height and Cetegen and Ahmed's puffing frequency. About 8 minutes a case. |

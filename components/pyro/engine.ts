@@ -1,7 +1,7 @@
 // The pyro lab's engine: a WebGPU gas solver (see wgsl.ts) stepped at a fixed 30 steps per simulated second,
 // and a volume renderer drawn after each step (or when a shading control changes, so a paused simulation can be
 // relit). WebGPU only: browsers without it get the lab's still frame.
-import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_N, SKIN_TEXELS, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR, WOOD_CELLS, WOOD_LAYERS } from './wgsl'
+import { ADVECT_DETAIL, ADVECT_SCAL, ADVECT_VEL, BALL_HEAT, BIMOCQ_ACCUM, BIMOCQ_MAPS, BIMOCQ_RECON, LFM_CELLVEL, LFM_MARCH_BWD, LFM_MARCH_FWD, LFM_N, LFM_PULL, IVOCK_APPLY, IVOCK_CURL, IVOCK_SMOOTH, IVOCK_TARGET, VORT_BEFORE, PROJECT_REFLECT, RESOLVE, SKIN_N, SKIN_TEXELS, UPRES, UPRES_BLOCK, UPRES_COARSE, CURL_GEN, VEL_COMBINE, COMBINE, CONSERVE_RATIO, CONSERVE_SPREAD, CURL, DIFFUSE, DISPLAY, DIVERGENCE, CYC_BOUNCE, CYC_DIRECT, CYC_MAP, FLAME_NEAR, FLOOR_NEAR, ESCAPE_PHASES, FIRE_LIGHT_ENTRIES, FIRE_SUM, FIRE_SUM_TOTAL, FORCES, GLARE, GLARE_LEVELS, LIGHT, MG_PROLONG, MG_RESIDUAL, MG_RESTRICT, MG_SMOOTH, NOISE_GEN, PATH_TRACE, PROJECT, PT_COMPOSITE, RENDER, SOR, SPARK_DRAW, SPARK_N, SPARK_POOL_BYTES, SPARK_STEP, SPARK_VIEW, WOOD_CELLS, WOOD_LAYERS } from './wgsl'
 import { planckTable, whiteBalance } from './blackbody'
 import { BLUE_NOISE_SIZE, blueNoise } from './bluenoise'
 import { FIRE_BANDS, FUEL, G, METER_AMBIENT, METER_FIRE_CD, METER_FIRE_EV, METER_FIRE_SLOPE, RHO_T, SOOT_CHROMA, SOOT_EXTINCTION, T_AMBIENT, exposureOfEV, fireTurbulence, luxOfEV } from './physics'
@@ -88,6 +88,9 @@ const RELIGHT = 0.5
 const STATUS_MS = 250
 const NO_WEAR = new Float32Array(12) // (the grey ball's: wornRadius's fit, all zero)
 const STIR_RADIUS = 0.3 // m
+// The sparks go on being stepped and drawn for this many steps after the ball stops throwing them (their glow lasts 2 or
+// 3 s at most).
+const SPARK_TAIL_STEPS = 300
 const DETAIL_PERIOD = 1 // s of simulation between resets of each upres layer (half a period apart); the plume stretches them fast
 const NOISE_SIZE = 64 // texels along each side of the tileable detail noise
 // Spatiotemporal blue noise for the march's offsets: 64 x 64 x 16, made by void and cluster with Wolfe et al.'s energy
@@ -230,6 +233,7 @@ interface Targets {
   hist: [GPUTexture, GPUTexture]
   glare: GPUTexture
   glareViews: GPUTextureView[]
+  sparks: GPUTexture // the sparks (SPARK_DRAW), drawn after the upsampling each frame, which the glare and the display add
   resolve: [GPUBindGroup, GPUBindGroup]
   glareFirst: [GPUBindGroup, GPUBindGroup]
   glareDown: (GPUBindGroup | null)[]
@@ -291,10 +295,13 @@ interface Pipes {
   upres: GPUComputePipeline
   upresCoarse: GPUComputePipeline
   ptComposite: GPURenderPipeline
+  sparkStep: GPUComputePipeline
+  sparkView: GPUComputePipeline
+  sparkDraw: GPURenderPipeline
 }
 // The pipelines only drawing needs (the light volume, the flames' and the floor's near light, the cyc's maps, the image
 // pass and what follows it), and the solver's: everything else.
-type FrameKey = 'light' | 'cycDirect' | 'cycBounce' | 'flameNear' | 'floorNear' | 'render' | 'resolve' | 'display' | 'glareFirst' | 'glareDown' | 'glareUp' | 'ptComposite'
+type FrameKey = 'light' | 'cycDirect' | 'cycBounce' | 'flameNear' | 'floorNear' | 'render' | 'resolve' | 'display' | 'glareFirst' | 'glareDown' | 'glareUp' | 'ptComposite' | 'sparkView' | 'sparkDraw'
 type FramePipes = Pick<Pipes, FrameKey>
 type SolverPipes = Omit<Pipes, FrameKey>
 
@@ -327,6 +334,11 @@ interface Grids {
   woodTemps: GPUBuffer
   woodCells: GPUBuffer
   woodCols: GPUBuffer
+  // The sparks (burn-6): the pool (the ring's head, the loose char on each patch, the sparks), and each frame's list of
+  // those to draw with its indirect draw's arguments.
+  sparkPool: GPUBuffer
+  sparkDraws: GPUBuffer
+  sparkArgs: GPUBuffer
   flame: GPUTexture // a fire's heat release rate per cell (MW/m3), for the renderer
   // IVOCK: the three components of the vector potential, each with its own finest multigrid level.
   // BiMocq2: the maps (the backward one's current level, ping-ponged; its previous level; the forward one,
@@ -409,6 +421,7 @@ interface Grids {
     advDetail: GPUBindGroup
     fireSum: GPUBindGroup
     fireTotal: GPUBindGroup
+    sparkStep: GPUBindGroup
   }
   // The frame's bind groups, made once its pipelines are (frameGroups).
   frame: FrameGroups | null
@@ -421,6 +434,8 @@ interface FrameGroups {
   flameNear: GPUBindGroup
   floorNear: GPUBindGroup
   render: GPUBindGroup
+  sparkView: GPUBindGroup
+  sparkDraw: GPUBindGroup
 }
 
 // The device and the compiled pipelines can be made ahead of time (prewarmPyro), while the page rests on the Lab:
@@ -456,6 +471,7 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat, onSolver?: (
   const displayModule = d.createShaderModule({ code: DISPLAY })
   const glareModule = d.createShaderModule({ code: GLARE })
   const compositeModule = d.createShaderModule({ code: PT_COMPOSITE })
+  const sparkDrawModule = d.createShaderModule({ code: SPARK_DRAW })
   // The longest compiles are asked for first: the browser compiles a few at a time in the order asked, and the image
   // pass's alone takes a third of all the compiling, so started last it set the wait (a second more on the bonfire).
   const renderP = d.createRenderPipelineAsync({
@@ -523,6 +539,8 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat, onSolver?: (
     diffuse: compute(DIFFUSE),
     upres: compute(UPRES),
     upresCoarse: compute(UPRES_COARSE),
+    // (Asked for last: small, some 0.05 s.)
+    sparkStep: compute(SPARK_STEP),
   }
   const frameP: Pending<FramePipes> = {
     light: lightP,
@@ -552,6 +570,18 @@ async function compilePipes(d: GPUDevice, format: GPUTextureFormat, onSolver?: (
     cycBounce: compute(CYC_BOUNCE),
     flameNear: flameNearP,
     floorNear: floorNearP,
+    // (Asked for last: small, some 0.02 s each.)
+    sparkView: compute(SPARK_VIEW),
+    sparkDraw: d.createRenderPipelineAsync({
+      layout: 'auto',
+      vertex: { module: sparkDrawModule, entryPoint: 'vs' },
+      fragment: {
+        module: sparkDrawModule,
+        entryPoint: 'fs',
+        targets: [{ format: 'rgba16float', blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } }],
+      },
+      primitive: { topology: 'triangle-list' },
+    }),
   }
   const frame = settle(frameP)
   // (A failure among the frame's surfaces below, after the solver's; caught here too, so it is not reported early.)
@@ -657,7 +687,7 @@ export class PyroEngine {
   private simBuf: GPUBuffer
   private renderBuf: GPUBuffer
   private parityBufs: [GPUBuffer, GPUBuffer]
-  private simData = new ArrayBuffer(384)
+  private simData = new ArrayBuffer(400)
   private renderData = new Float32Array(112)
   private wb: { kelvin: number; m: number[][] } | null = null
   private bbBuf: GPUBuffer
@@ -712,6 +742,20 @@ export class PyroEngine {
   private ballVel: Vec3 = [0, 0, 0]
   private ballDragAt = 0
   private ballBuf: GPUBuffer
+  // The sparks (burn-6): the view pass's uniform and the draw's, the steps they go on being stepped and drawn once the
+  // ball stops throwing them (the last are gone within a few seconds), the ball's largest jolt since the wood last
+  // stepped (m/s2) and its velocity a step ago, and whether their texture has been cleared since the last drew them.
+  private sparkViewBuf: GPUBuffer
+  private sparkSizeBuf: GPUBuffer
+  private sparkTail = 0
+  private jolt = 0
+  private lastBallVel: Vec3 = [0, 0, 0]
+  private sparksClear = false
+  // The time the carbon monoxide a spark's char gives off takes to burn beside it (s): a few milliseconds at the
+  // temperatures sparks burn at, against the millisecond it takes to cross a millimetre spark's boundary layer, so a
+  // millimetre spark gets some 0.3 of its heat (SPARK_STEP). (Development: 0 gives every spark all of it, as burn-3's
+  // embers take it, for comparison.)
+  sparkCoTime = 0.003
   // Wavelet-turbulence upres for a smoke source: its two textures (twice the grid's resolution), made when first
   // needed; the blocks of it that held smoke last step and this; the pass's bind group and uniform; the render bind
   // group that reads it; and whether it must refill from the coarse density on its next step.
@@ -871,6 +915,8 @@ export class PyroEngine {
       .catch(() => {})
     this.taaBuf = d.createBuffer({ size: 64, usage: U.UNIFORM | U.COPY_DST })
     this.ballBuf = d.createBuffer({ size: 160, usage: U.UNIFORM | U.COPY_DST })
+    this.sparkViewBuf = d.createBuffer({ size: 96, usage: U.UNIFORM | U.COPY_DST })
+    this.sparkSizeBuf = d.createBuffer({ size: 16, usage: U.UNIFORM | U.COPY_DST })
     this.upresBuf = d.createBuffer({ size: 32, usage: U.UNIFORM | U.COPY_DST })
     this.dummy3d = d.createTexture({ size: [1, 1, 1], dimension: '3d', format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING })
     this.envTex = d.createTexture({ size: [BACKDROP_W, BACKDROP_H], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
@@ -890,7 +936,7 @@ export class PyroEngine {
       this.lut.destroy()
       this.lut = lut
       this.lutReady = true
-      if (this.targets && this.pipes) Object.assign(this.targets, this.postGroups(this.targets.hdr, this.targets.hist, this.targets.glareViews))
+      if (this.targets && this.pipes) Object.assign(this.targets, this.postGroups(this.targets.hdr, this.targets.hist, this.targets.glareViews, this.targets.sparks))
       this.needsRender = true
       this.taaCount = 0
       this.kick()
@@ -1208,6 +1254,14 @@ export class PyroEngine {
     const woodCells = d.createBuffer({ size: WOOD_CELLS * 16, usage: woodUsage })
     const woodCols = d.createBuffer({ size: 2 * SKIN_TEXELS * 32, usage: woodUsage })
     buffers.push(skin, skinNext, ballSheet, woodTemps, woodCells, woodCols)
+    // The sparks' pool (zeroed: no sparks, no loose char) and each frame's list of those to draw, with the indirect
+    // draw's arguments (six vertices a spark; the count the view pass writes).
+    const sparkPool = d.createBuffer({ size: SPARK_POOL_BYTES, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC })
+    const sparkDraws = d.createBuffer({ size: SPARK_N * 48, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const sparkArgs = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, mappedAtCreation: true })
+    new Uint32Array(sparkArgs.getMappedRange()).set([6, 0, 0, 0])
+    sparkArgs.unmap()
+    buffers.push(sparkPool, sparkDraws, sparkArgs)
     // The kernels that read the skin (binding 31: the ball's volatiles feed the fire, and the renderer draws it).
     const withSkin = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[], extra: GPUBindGroupEntry[] = []) =>
       d.createBindGroup({
@@ -1267,6 +1321,8 @@ export class PyroEngine {
         }),
       ) as [GPUBindGroup, GPUBindGroup],
       render: withSkin(p.render, [P, R, s, v(scal[0]), v(light), v(detA[0]), v(detB[0]), this.noiseTex.createView(), this.noiseSampler, { buffer: this.bbBuf }, { buffer: fireLight }, this.blueTex.createView({ dimension: '2d-array' }), this.dummy3d.createView(), v(flame)], [{ binding: 32, resource: { buffer: ballSheet } }, { binding: 33, resource: this.envTex.createView() }, { binding: 34, resource: v(light2) }, { binding: 35, resource: v(vel[0]) }, { binding: 39, resource: v(cycBounce[0]) }, { binding: 43, resource: v(cycDirect) }, { binding: 44, resource: v(flameNear) }, { binding: 45, resource: v(flameNearDir) }, { binding: 46, resource: v(floorNear) }]),
+      sparkView: group(p.sparkView, [P, s, v(scal[0]), { buffer: sparkPool }, { buffer: sparkDraws }, { buffer: sparkArgs }, { buffer: this.sparkViewBuf }]),
+      sparkDraw: group(p.sparkDraw, [{ buffer: sparkDraws }, { buffer: this.sparkSizeBuf }, { buffer: this.bbBuf }]),
     })
     this.grids = {
       n,
@@ -1285,6 +1341,9 @@ export class PyroEngine {
       woodTemps,
       woodCells,
       woodCols,
+      sparkPool,
+      sparkDraws,
+      sparkArgs,
       flame,
       bimocq,
       ivockRhs,
@@ -1341,7 +1400,7 @@ export class PyroEngine {
         combine: withSkin(p.combine, [P, s, v(vel[0]), v(scal[0]), v(scal[1]), v(scal[2]), v(scal[3]), { buffer: fireLight }, { buffer: hrr }, { buffer: ratio }, v(flame)]),
         conserveSpread: group(p.conserveSpread, [P, s, v(vel[0]), { buffer: spread }]),
         conserveRatio: withSkin(p.conserveRatio, [P, v(scal[0]), { buffer: fireLight }, { buffer: hrr }, { buffer: spread }, { buffer: ratio }, s, v(vel[0])]),
-        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }, v(flame), v(vel[0])]),
+        ballHeat: withSkin(p.ballHeat, [P, s, v(scal[0]), { buffer: fireLight }, { buffer: skinNext }, { buffer: ballSheet }, this.noiseTex.createView(), this.noiseSampler, { buffer: woodTemps }, { buffer: woodCells }, { buffer: woodCols }, v(flame), v(vel[0]), { buffer: sparkPool }]),
         diffuse: group(p.diffuse, [P, v(vel[0]), v(scal[3]), v(scal[1])]),
         advDetail: group(p.advDetail, [P, s, v(vel[0]), v(detA[0]), v(detB[0]), v(detA[1]), v(detB[1])]),
         fireSum: d.createBindGroup({
@@ -1359,9 +1418,12 @@ export class PyroEngine {
           ],
         }),
         fireTotal: group(p.fireTotal, [{ buffer: fireCount }, { buffer: firePartial }, { buffer: fireLight }]),
+        sparkStep: group(p.sparkStep, [P, s, v(vel[0]), v(scal[0]), { buffer: sparkPool }, this.curlTex.createView(), this.noiseSampler, { buffer: fireLight }]),
       },
     }
     this.resetSkin()
+    this.sparkTail = 0
+    this.sparksClear = false
     this.bimocqReset = true
     this.lfmStep = 0
     this.simTime = 0
@@ -1799,6 +1861,7 @@ export class PyroEngine {
       skinPass.end()
       enc.copyBufferToBuffer(g.skinNext, 0, g.skin, 0, SKIN_TEXELS * 16)
       this.woodStepped()
+      this.jolt = 0
     }
     const [nx, ny, nz] = g.n
     const cv: Vec3 = [Math.ceil((nx + 1) / 4), Math.ceil((ny + 1) / 4), Math.ceil((nz + 1) / 4)]
@@ -1912,6 +1975,15 @@ export class PyroEngine {
       enc.clearBuffer(g.fireLight)
     }
     this.fireLit = fire
+    // The sparks through the gas this step has made; for a few seconds after the ball stops throwing them, until the
+    // last are gone.
+    if (this.ballBurning() && this.woodTest === 0) this.sparkTail = SPARK_TAIL_STEPS
+    if (this.sparkTail > 0) {
+      pass = enc.beginComputePass()
+      run(pass, p.sparkStep, g.bg.sparkStep, [SPARK_N / 64, 1, 1])
+      pass.end()
+      this.sparkTail--
+    }
     this.device.queue.submit([enc.finish()])
     this.simTime += SIM_DT
     this.frame++
@@ -2152,6 +2224,13 @@ export class PyroEngine {
     const wear = s.ball && s.ballBurns ? this.wear : NO_WEAR
     f.set(wear, 84)
     f[95] = this.woodAir
+    // The sparks: the gas's time between wood steps, the ball's largest jolt since the wood last stepped (its velocity's
+    // change over a step, a drag starting, stopping or turning), whether the wood throws them (not under the wood's
+    // development tests), and the time the monoxide takes to burn beside a spark.
+    const jolt = Math.hypot(...this.ballVel.map((v, i) => v - this.lastBallVel[i])) / SIM_DT
+    this.lastBallVel = [...this.ballVel]
+    this.jolt = Math.max(this.jolt, jolt)
+    f.set([SIM_DT * WOOD_EVERY, this.jolt, this.ballBurning() && this.woodTest === 0 ? 1 : 0, this.sparkCoTime], 96)
     this.device.queue.writeBuffer(this.simBuf, 0, this.simData)
     this.device.queue.writeBuffer(this.ballBuf, 0, new Float32Array([...this.ballPos, radius, (-nx * dx) / 2, 0, (-nz * dx) / 2, dx, ...set, ...wear]))
   }
@@ -2315,6 +2394,7 @@ export class PyroEngine {
       this.targets.hdr.destroy()
       this.targets.hist.forEach(t => t.destroy())
       this.targets.glare.destroy()
+      this.targets.sparks.destroy()
     }
     const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
     const tex = (more = 0) => this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: usage | more })
@@ -2326,14 +2406,17 @@ export class PyroEngine {
     const levels = Math.max(1, Math.min(GLARE_LEVELS, Math.floor(Math.log2(Math.min(gw, gh))) + 1))
     const glare = this.device.createTexture({ size: [gw, gh], format: 'rgba16float', usage, mipLevelCount: levels })
     const glareViews = Array.from({ length: levels }, (_, i) => glare.createView({ baseMipLevel: i, mipLevelCount: 1 }))
-    this.targets = { w, h, hdr, hist, glare, glareViews, ...this.postGroups(hdr, hist, glareViews) }
+    // (The sparks' texture starts zeroed, as a new texture is; readable, for the probes.)
+    const sparks = tex(GPUTextureUsage.COPY_SRC)
+    this.targets = { w, h, hdr, hist, glare, glareViews, sparks, ...this.postGroups(hdr, hist, glareViews, sparks) }
+    this.sparksClear = true
     this.taaCount = 0
     return this.targets
   }
   // The bind groups of the passes after the march, for each history they read (made again when the ACES 2.0 LUT
   // arrives): the accumulation, the glare's first downsample (from the history just written), its levels each from the
   // one before (down) or after (up), and the display.
-  private postGroups(hdr: GPUTexture, hist: [GPUTexture, GPUTexture], glareViews: GPUTextureView[]) {
+  private postGroups(hdr: GPUTexture, hist: [GPUTexture, GPUTexture], glareViews: GPUTextureView[], sparks: GPUTexture) {
     const p = this.pipes!
     const d = this.device
     const group = (pipe: GPURenderPipeline, entries: GPUBindGroupEntry[]) => d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries })
@@ -2342,7 +2425,8 @@ export class PyroEngine {
     const both = <T>(f: (k: number) => T): [T, T] => [f(0), f(1)]
     return {
       resolve: both(k => group(p.resolve, [{ binding: 2, resource: hdr.createView() }, { binding: 3, resource: hist[k].createView() }, { binding: 4, resource: { buffer: this.taaBuf } }, { binding: 5, resource: this.glareSampler }])),
-      glareFirst: both(k => src(p.glareFirst, hist[k].createView())),
+      // (The first downsample takes in the sparks too.)
+      glareFirst: both(k => group(p.glareFirst, [{ binding: 0, resource: hist[k].createView() }, { binding: 1, resource: this.glareSampler }, { binding: 2, resource: sparks.createView() }])),
       glareDown: glareViews.map((_, i) => (i > 0 ? src(p.glareDown, glareViews[i - 1]) : null)),
       glareUp: glareViews.map((_, i) => (i < glareViews.length - 1 ? src(p.glareUp, glareViews[i + 1]) : null)),
       display: both(k =>
@@ -2353,12 +2437,31 @@ export class PyroEngine {
           { binding: 4, resource: this.glareSampler },
           { binding: 5, resource: this.lut.createView() },
           { binding: 6, resource: this.lutSampler },
+          { binding: 7, resource: sparks.createView() },
         ]),
       ),
     }
   }
-  // After the march: the accumulation into the next history, the glare's chain (if any), and the display to the
-  // screen. stamps: for the profiler, GPU timestamps around each of them in turn from query base on.
+  // Whether the sparks are drawn this frame: while the ball throws them, and until the last are gone.
+  private sparksOn() {
+    return this.sparkTail > 0 && !!this.grids?.frame
+  }
+  // The sparks' view uniform (SPARK_VIEW) and the draw's: the camera, the exposure, the display's size, the camera's
+  // shutter (a film camera's at 24 frames a second, by its angle; the sparks keep it while the fire runs, their blur
+  // being exact), and the soot's extinction as the image pass takes it.
+  private writeSparkView(t: Targets) {
+    const c = this.cam
+    const s = this.state
+    const fire = s.sourceType === 'fire'
+    const ext = fire ? (SOOT_EXTINCTION * RHO_T) / T_AMBIENT / 1000 : s.densityScale
+    const chroma = fire ? SOOT_CHROMA : [1, 1, 1]
+    this.device.queue.writeBuffer(this.sparkViewBuf, 0, new Float32Array([...c.pos, c.tanY, ...c.fwd, c.aspect, ...c.right, 0, ...c.up, this.exposure, t.w, t.h, s.shutter / 360 / 24, 0, ext, ...chroma]))
+    this.device.queue.writeBuffer(this.sparkSizeBuf, 0, new Float32Array([t.w, t.h, 0, 0]))
+  }
+
+  // After the march: the accumulation into the next history, the sparks (when there are any), the glare's chain (if
+  // any), and the display to the screen. stamps: for the profiler, GPU timestamps around each of them in turn from query
+  // base on.
   private post(enc: GPUCommandEncoder, screen: GPUTexture, t: Targets, stamps?: { qs: GPUQuerySet; base: number }) {
     const p = this.pipes!
     const next = 1 - this.histIndex
@@ -2380,6 +2483,26 @@ export class PyroEngine {
       return w
     }
     draw(t.hist[next].createView(), p.resolve, t.resolve[this.histIndex], false, stamp(true, true))
+    // The sparks, after the upsampling (never in its history), at the display's pixels, into their own texture.
+    if (this.sparksOn()) {
+      this.writeSparkView(t)
+      enc.clearBuffer(this.grids!.sparkArgs, 4, 4)
+      const sparkStamps = stamp(true, false)
+      const cp = enc.beginComputePass(sparkStamps ? { timestampWrites: { querySet: sparkStamps.querySet, beginningOfPassWriteIndex: sparkStamps.beginningOfPassWriteIndex } } : undefined)
+      cp.setPipeline(p.sparkView)
+      cp.setBindGroup(0, this.grids!.frame!.sparkView)
+      cp.dispatchWorkgroups(SPARK_N / 64)
+      cp.end()
+      const rp = enc.beginRenderPass({ colorAttachments: [{ view: t.sparks.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }], timestampWrites: stamp(false, true) })
+      rp.setPipeline(p.sparkDraw)
+      rp.setBindGroup(0, this.grids!.frame!.sparkDraw)
+      rp.drawIndirect(this.grids!.sparkArgs, 0)
+      rp.end()
+      this.sparksClear = false
+    } else if (!this.sparksClear) {
+      enc.beginRenderPass({ colorAttachments: [{ view: t.sparks.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }] }).end()
+      this.sparksClear = true
+    }
     if (this.state.glare > 0) {
       const L = t.glareViews.length
       draw(t.glareViews[0], p.glareFirst, t.glareFirst[next], false, stamp(true, L === 1))
@@ -2698,6 +2821,7 @@ export class PyroEngine {
         { binding: 4, resource: this.glareSampler },
         { binding: 5, resource: this.lut.createView() },
         { binding: 6, resource: this.lutSampler },
+        { binding: 7, resource: t.sparks.createView() },
       ],
     })
     this.ptT = { targets: t, upres, accum, comp, trace, composite, display }
@@ -2947,7 +3071,8 @@ export class PyroEngine {
     for (let i = 0; i < SKIN_TEXELS; i++) fresh.set([T_AMBIENT, 0, 0, 0], i * 4)
     this.device.queue.writeBuffer(g.skin, 0, fresh)
     const enc = this.device.createCommandEncoder()
-    for (const b of [g.ballSheet, g.woodTemps, g.woodCells, g.woodCols]) enc.clearBuffer(b)
+    // (And the sparks with it: the pool, its loose char and its ring's head.)
+    for (const b of [g.ballSheet, g.woodTemps, g.woodCells, g.woodCols, g.sparkPool]) enc.clearBuffer(b)
     this.device.queue.submit([enc.finish()])
     this.woodParity = 0
     this.woodClock = 0
@@ -3030,6 +3155,31 @@ export class PyroEngine {
     read.destroy()
     sheet?.destroy()
     this.readingBall = false
+  }
+
+  // (Development: the sparks as they stand, for the probes: how many the wood has thrown, and each in the pool that is in
+  // the air (thrown and not yet gone), ten floats each: its place (m), diameter (m), velocity (m/s), temperature (K),
+  // age (s) and its number in the order thrown.)
+  async readSparks(): Promise<{ thrown: number; sparks: Float32Array } | null> {
+    if (!this.grids) return null
+    const d = this.device
+    const read = d.createBuffer({ size: SPARK_POOL_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const enc = d.createCommandEncoder()
+    enc.copyBufferToBuffer(this.grids.sparkPool, 0, read, 0, SPARK_POOL_BYTES)
+    d.queue.submit([enc.finish()])
+    await read.mapAsync(GPUMapMode.READ)
+    const all = read.getMappedRange()
+    const thrown = new Uint32Array(all, 0, 1)[0]
+    const f = new Float32Array(all, 16 + SKIN_TEXELS * 4, SPARK_N * 16)
+    const out: number[] = []
+    for (let i = 0; i < SPARK_N; i++) {
+      const k = i * 16
+      if (f[k + 3] <= 0 || f[k + 11] < 0) continue
+      out.push(f[k], f[k + 1], f[k + 2], f[k + 3], f[k + 4], f[k + 5], f[k + 6], f[k + 7], f[k + 11], f[k + 12])
+    }
+    read.unmap()
+    read.destroy()
+    return { thrown, sparks: new Float32Array(out) }
   }
 
   // Development: one column of the wooden ball's wood, the one under the surface facing dir (from the ball's centre):
@@ -3235,6 +3385,7 @@ export class PyroEngine {
       one(p.fireSum, g.bg.fireSum, cc)(pass)
       one(p.fireTotal, g.bg.fireTotal, [1 + FIRE_BANDS, 1, 1])(pass)
     })
+    if (this.sparkTail > 0) timed('sparks: step', one(p.sparkStep, g.bg.sparkStep, [SPARK_N / 64, 1, 1]))
     enc.copyTextureToTexture({ texture: g.scal[1] }, { texture: g.scal[0] }, [nx, ny, nz])
     timed('light', one(p.light, this.upresActive() && this.upres ? this.upres.light : g.frame!.light, [Math.ceil(g.lightDims[0] / 4), Math.ceil(g.lightDims[1] / 4), Math.ceil(g.lightDims[2] / 4)]))
     timed('flameNear', one(p.flameNear, g.frame!.flameNear, [Math.ceil(g.nearDims[0] / 4), Math.ceil(g.nearDims[1] / 4), Math.ceil(g.nearDims[2] / 4)]))
@@ -3259,6 +3410,7 @@ export class PyroEngine {
     rp.draw(3)
     rp.end()
     labels.push('accumulate')
+    if (this.sparksOn()) labels.push('sparks')
     if (this.state.glare > 0) labels.push('glare')
     labels.push('display')
     this.post(enc, screen, t, { qs, base: 2 * k + 2 })

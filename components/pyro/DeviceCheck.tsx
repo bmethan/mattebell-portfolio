@@ -120,6 +120,23 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
           ? `Burning ball at ${s!.simTime.toFixed(1)} s: ${Math.round(b.surfaceK - 273)} C, burning ${b.burningKW.toFixed(1)} kW, ${Math.round(b.charred * 100)}% charred: ${b.burningKW >= 0.5 ? 'caught, as it should' : 'not alight yet (it should be by about 12 s)'}`
           : `Burning ball: no reading by ${(s?.simTime ?? 0).toFixed(1)} s`,
       )
+      // Its sparks: thrown once it flames, some in the air, none with a value not finite.
+      const sp = await e.readSparks().catch(() => null)
+      if (sp) {
+        const n = sp.sparks.length / 10
+        let glowing = 0
+        let hottest = 0
+        let bad = 0
+        for (let k = 0; k < n; k++) {
+          const f = sp.sparks.subarray(k * 10, k * 10 + 10)
+          if (!f.every(Number.isFinite)) bad++
+          else {
+            if (f[7] > 798) glowing++
+            hottest = Math.max(hottest, f[7])
+          }
+        }
+        lines.push(`Sparks by then: ${sp.thrown} thrown, ${n} in the air, ${glowing} glowing, hottest ${Math.round(hottest - 273)} C, ${bad} not finite: ${sp.thrown > 0 && bad === 0 ? 'as they should be' : bad ? 'values not finite' : 'none thrown yet'}`)
+      }
       lines.push(`WebGPU errors in all: ${e.gpuErrors.length}${e.gpuErrors.length ? `; first: ${e.gpuErrors[0]}` : ''}`)
       lines.push(`Values not finite in all: ${notFinite}${badWhere.size ? ` (${[...badWhere].slice(0, 6).join('; ')})` : ''}`)
     } finally {

@@ -36,6 +36,7 @@ paused and stepped exactly, so a given scenario gives the same run every time.
 | `ballburn.mjs` | The burning ball held in the bonfire and pulled out: its surface temperature, burning power and char every few seconds, and when it first flames. |
 | `embers.mjs` | The ball's embers once pulled out: still, stirred beside it and still again, each second its hottest faces and cracks, how much of it glows, and its flames' power. |
 | `woodcone.mjs` | The ball's wood as fire scientists test wood: a cone calorimeter's flux (flaming, or with its flame out, optionally blown), or the standard furnace fire, one column read as its char line advances. |
+| `sparks.mjs` | The burning ball's sparks followed step by step: how many it throws a second against its flames' power, how many are in the air and glowing, their temperatures, how long each glows, which way they go, optionally stirred or dragged. |
 | `charsphere.mjs` | The char's surface model solved for a small char sphere burning in air, against measured 1 cm wood-char spheres. No GPU. |
 | `stability.mjs` | The fastest gas and where, the kinetic energy and the total smoke over a run, optionally while stirring or sweeping the ball. A blow-up shows as speeds in the hundreds. |
 | `detail.mjs` | Smoke detail: sharpness, enstrophy, kinetic energy, where the smoke sits, and stills. |
@@ -74,5 +75,5 @@ node tools/pyro-probes/detail.mjs --patch '{"velocity":"lfm"}' --tag lfm
 
 The probes read the engine through its development readouts, which can also be called from the browser console on
 the dev server: `readScalars()` (the raw fields and heat release), `readFields()` (density, temperature, velocity
-per cell), `readBall()` then `ballStatus`, `readRatio()` (the mass-keeping ratios), `readIvock()`,
+per cell), `readBall()` then `ballStatus`, `readSparks()` (the sparks in the air, ten floats each), `readRatio()` (the mass-keeping ratios), `readIvock()`,
 `measureDivergence()`, `profileStep()`, `snapshot(w, h)`, `runView(frames)` and `pausedView()` (the running and paused views, exactly), and `advance(steps)` to step it while paused.

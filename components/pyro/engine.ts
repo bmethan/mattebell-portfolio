@@ -1206,7 +1206,7 @@ export class PyroEngine {
     const woodUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
     const woodTemps = d.createBuffer({ size: 2 * WOOD_CELLS * 4, usage: woodUsage })
     const woodCells = d.createBuffer({ size: WOOD_CELLS * 16, usage: woodUsage })
-    const woodCols = d.createBuffer({ size: 2 * SKIN_TEXELS * 32, usage: woodUsage })
+    const woodCols = d.createBuffer({ size: 2 * SKIN_TEXELS * 48, usage: woodUsage })
     buffers.push(skin, skinNext, ballSheet, woodTemps, woodCells, woodCols)
     // The kernels that read the skin (binding 31: the ball's volatiles feed the fire, and the renderer draws it).
     const withSkin = (pipe: GPUComputePipeline | GPURenderPipeline, resources: GPUBindingResource[], extra: GPUBindGroupEntry[] = []) =>
@@ -3033,18 +3033,20 @@ export class PyroEngine {
   }
 
   // Development: one column of the wooden ball's wood, the one under the surface facing dir (from the ball's centre):
-  // each cell's depth below the surface as made (mm), thickness (mm), temperature (K), wood left, char, water left and
-  // ash; the skin there (surface temperature K, volatiles kg/m2/s, char depth mm, ash cover), the rest of the surface
-  // (fuel flow up it, wear mm, char halfway down and at its base K), the column's patch of the grain (its wood's density
-  // against the mean, before the rings), the share of it under cracks, the soot on it (kg/m2) and how much of it is
-  // covered, how much the fire's flame lies against it, and the wear's fit as the gas sees it (fitWear).
+  // each cell's depth below the surface as made (mm), thickness (mm), temperature (K), wood left, char, water left, the
+  // hottest it has been once dry (K) and ash; the skin there (surface temperature K, volatiles kg/m2/s, char depth mm,
+  // ash cover), the rest of the surface (fuel flow up it, wear mm, char halfway down and at its base K), the column's
+  // patch of the grain (its wood's density against the mean, before the rings), the share of it under cracks, the soot
+  // on it (kg/m2) and how much of it is covered, how much the fire's flame lies against it, its crack's width at the
+  // mouth and depth (mm), its walls' temperature (K) and how far they have burned back (mm), the air's speed past it
+  // and the heat transfer coefficient, and the wear's fit as the gas sees it (fitWear).
   async readWood(dir: Vec3 = [0, 0, 1]) {
     if (!this.grids) return null
     const g = this.grids
     const d = this.device
     const t = skinTexel(dir)
     const half = this.woodParity
-    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 64, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const read = d.createBuffer({ size: WOOD_LAYERS * 20 + 80, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = d.createCommandEncoder()
     for (let k = 0; k < WOOD_LAYERS; k++) {
       enc.copyBufferToBuffer(g.woodTemps, (half * WOOD_CELLS + k * SKIN_TEXELS + t) * 4, read, k * 4, 4)
@@ -3053,7 +3055,8 @@ export class PyroEngine {
     enc.copyBufferToBuffer(g.skin, t * 16, read, WOOD_LAYERS * 20, 16)
     enc.copyBufferToBuffer(g.ballSheet, t * 32, read, WOOD_LAYERS * 20 + 16, 16)
     enc.copyBufferToBuffer(g.ballSheet, t * 32 + 16, read, WOOD_LAYERS * 20 + 48, 16)
-    enc.copyBufferToBuffer(g.woodCols, ((half * SKIN_TEXELS + t) * 2 + 1) * 16, read, WOOD_LAYERS * 20 + 32, 16)
+    enc.copyBufferToBuffer(g.woodCols, ((half * SKIN_TEXELS + t) * 3 + 1) * 16, read, WOOD_LAYERS * 20 + 32, 16)
+    enc.copyBufferToBuffer(g.woodCols, ((half * SKIN_TEXELS + t) * 3 + 2) * 16, read, WOOD_LAYERS * 20 + 64, 16)
     d.queue.submit([enc.finish()])
     await read.mapAsync(GPUMapMode.READ)
     const a = new Float32Array(read.getMappedRange().slice(0))
@@ -3071,11 +3074,18 @@ export class PyroEngine {
       soot: a[WOOD_LAYERS * 5 + 10],
       flameAgainst: a[WOOD_LAYERS * 5 + 11],
       sootCover: a[WOOD_LAYERS * 5 + 12],
-      airSpeed: a[WOOD_LAYERS * 5 + 13],
-      heatTransfer: a[WOOD_LAYERS * 5 + 14],
+      crackWidth: a[WOOD_LAYERS * 5 + 13],
+      crackDepth: a[WOOD_LAYERS * 5 + 14],
       crackTemp: a[WOOD_LAYERS * 5 + 15],
+      crackBurned: a[WOOD_LAYERS * 5 + 16] * 1000,
+      airSpeed: a[WOOD_LAYERS * 5 + 17],
+      heatTransfer: a[WOOD_LAYERS * 5 + 18],
       wearFit: Array.from(this.wear),
-      cells: layers.map((l, k) => ({ top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: a[WOOD_LAYERS + k * 4 + 2], ash: a[WOOD_LAYERS + k * 4 + 3] })),
+      // (A cell's water slot holds, once it is dry, minus a thousandth of the hottest it has been.)
+      cells: layers.map((l, k) => {
+        const z = a[WOOD_LAYERS + k * 4 + 2]
+        return { top: l.top * 1000, thick: l.thick * 1000, T: a[k], wood: a[WOOD_LAYERS + k * 4], char: a[WOOD_LAYERS + k * 4 + 1], water: Math.max(z, 0), peakK: z < 0 ? -z * 1000 : null, ash: a[WOOD_LAYERS + k * 4 + 3] }
+      }),
     }
   }
 

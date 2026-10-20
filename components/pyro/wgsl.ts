@@ -2159,8 +2159,8 @@ ${CHAR_CRACKS}
 @group(0) @binding(4) var<storage, read_write> skinOut: array<vec4<f32>>;
 // For the renderer, per texel, two: the fuel flowing up along the surface past it (kg per metre of width per second,
 // for the drawn flames), how far the surface has worn back (mm), and the char's temperature halfway down and at its
-// base (K); then how much of the surface soot covers, the air's speed past it (m/s), the heat transfer coefficient
-// that sets (W/m2 K) and the temperature of its cracks' walls (K).
+// base (K); then how much of the surface soot covers, how wide its crack is at the mouth and how deep (mm; where a
+// crack runs through it), and the temperature of its cracks' walls (K).
 @group(0) @binding(5) var<storage, read_write> sheetOut: array<vec4<f32>>;
 @group(0) @binding(6) var noiseTex: texture_3d<f32>;
 @group(0) @binding(7) var noiseSamp: sampler;
@@ -2168,17 +2168,21 @@ ${CHAR_CRACKS}
 // (P.fire2.w says which is which). A cell whose wood and char are gone holds 0.
 @group(0) @binding(8) var<storage, read_write> temps: array<f32>;
 // The cells' wood, char, water and ash, layer by layer: x the share of its wood left, y its char, z the share of its
-// water left, w its ash (y and w in kg per kg of the cell's wood as made).
+// water left or, once that is gone, minus a thousandth of the hottest it has been (K; peakOf), w its ash (y and w in kg
+// per kg of the cell's wood as made).
 @group(0) @binding(9) var<storage, read_write> cells: array<vec4<f32>>;
 // Each column's state, this step's and the next's (as the temperatures): the deepest layer heat has reached, the
 // surface's temperature (K), how much of the surface below it is alight (for its flame's heat) and how far it has worn
-// back (m); then the wood's density there against its mean (0 until the column is set up), the share of the column
-// under cracks, the soot on its surface (kg/m2), and how much the fire's flame lies against it.
+// back, burned and shrunk (m); then the wood's density there against its mean (0 until the column is set up), the share
+// of the column under cracks, the soot on its surface (kg/m2), and how much the fire's flame lies against it; then how
+// far its crack's walls have burned back (m), and for the development readouts the air's speed past it (m/s) and the
+// heat transfer coefficient that sets (W/m2 K).
 @group(0) @binding(10) var<storage, read_write> cols: array<vec4<f32>>;
 @group(0) @binding(11) var flameTex: texture_3d<f32>; // the gas's heat release last step (MW/m3), COMBINE's
 @group(0) @binding(12) var vel: texture_3d<f32>; // the gas's velocity (m/s)
 const WOOD_LAYERS = ${WOOD_LAYERS}u;
 const WOOD_CELLS = ${WOOD_CELLS}u;
+const COLS = 3u; // vec4s per column in cols
 const GRADED = 9u;
 const IMPLICIT = 16u; // the cells worked implicitly, from the surface
 const DEEP = 30u;
@@ -2191,7 +2195,6 @@ const CHAR_YIELD = 0.16;
 const ASH_YIELD = 0.004;
 const H_PYRO = 1.4e5; // J per kg of wood broken down
 const L_EVAP = 2.26e6;
-const FISSURE = 0.0015; // m, a crack's width in the char
 // The ash on the surface (kg/m2) that covers most of it (1 - 1/e). Its grains, taken as some 10 micrometres across (an
 // estimate: the finest of the ash, the potassium salts that vaporise, leaves with the gas as a fume) and as dense as
 // calcite (2700 kg/m3; calcium is most of pine's ash, left as its carbonate, or where hotter its oxide; Werkelin and
@@ -2199,6 +2202,26 @@ const FISSURE = 0.0015; // m, a crack's width in the char
 // covers most of it: the ash of some 9 mm of the wood burned away. (Taken before as 2 g/m2, the ash covered the char
 // before it had cracked, and the charred ball read as pale wood.)
 const ASH_COVER = 0.018;
+// The ash as a skin: its bulk density (wildfire ash runs 180 to 620 kg/m3, 60 to 90% of it pores; Bodi and colleagues'
+// review, 2014), so 18 g/m2 is a skin some 0.05 mm thick, and the most a crust holds before plates of it fall away, 0.3
+// mm, the thickest Kim and Sunderland saw on embers (2019). Its oxygen passes by diffusion through the pores (a quarter
+// of the way blocked, the rest twice as long a path).
+const ASH_BULK = 400.0;
+const ASH_CRUST = 0.0003;
+// Char shrinks as it heats past 300 C, most of it by 450 C and nearly all by 700 (carbonised softwood: Rinta-Paavola,
+// Sukhomlinov and Hostikka 2023, spruce under the microscope; Byrne and Nagle 1997; Wang and colleagues 2024), by the
+// hottest it has been, as it does not swell back as it cools: radially SHRINK of it, along the grain two thirds of that,
+// along the rings four thirds. Radially 30% makes Scots pine's char layer 28% thinner than the wood it came from in a
+// cone calorimeter in nitrogen, as Rinta-Paavola and colleagues measured (southern pine's in a furnace, 41%; White and
+// Nordheim 1992). Its cracks open by its shrinkage along the surface, over CRACK_SPAN of the char layer's thickness:
+// cracks in a shrinking layer space out as the layer thickens, each taking a wider share, so a crack is a hairline at
+// first and some 5 mm wide across 38 mm of char, as Schaffer found (3 to 6 mm, 1967).
+const SHRINK = 0.30;
+const CRACK_SPAN = 0.6;
+const CRACK_MOST = 0.008; // m, a crack's widest at its mouth (a block's own shrinkage, 30% of its 2.5 cm)
+fn shrinkOf(peak: f32) -> f32 { return 1.0 - exp(-max(peak - 573.15, 0.0) / 90.0); }
+// A cell's hottest temperature (K): kept, once its water is gone, as minus a thousandth of it in the water's slot.
+fn peakOf(m: vec4<f32>) -> f32 { return max(-m.z, 0.0) * 1000.0; }
 const SIGMA = 5.670374e-8;
 const RG = 8.314;
 const H_CONV = 10.0;
@@ -2259,6 +2282,11 @@ var<private> colGrain: vec2<f32>;
 var<private> colRad: f32; // the grain's factor on the wood's conductivity through the column, and along the surface
 var<private> colLat: f32;
 var<private> colCrack: f32; // the share of the column's char split by cracks
+var<private> colShrinkN: f32; // the char's shrinkage through the depth, fully shrunk (by the grain's direction here)
+var<private> colWLayer: f32; // a crack's width per unit of its char's shrinkage (m), from last step's char layer
+var<private> colGap: f32; // the depth the cells from the surface down have lost to burning and shrinking (m)
+var<private> colLayer: f32; // the char layer's thickness, shrunk (m)
+var<private> colTopG: f32; // how far the char nearest the surface has shrunk (0 to 1)
 var<private> colNb: vec4<u32>; // the columns beside it
 var<private> colSide: f32; // 1 / its area at the surface as made, for the heat from beside it
 var<private> colOx: f32; // the char still to burn this step, kg per m2 of the surface as made, from the surface down
@@ -2283,16 +2311,21 @@ fn cellStep(k: u32) -> Cell {
   let dens = colPatch * ringDensity(colGrain, mid);
   let m0 = WOOD_RHO * dens * layerVol(k, r);
   let dt = colDt;
-  let dWater = m.z * (1.0 - exp(-8.37e12 * exp(-121000.0 / (RG * t)) * dt));
+  // (Its water while it has any; once dry, the hottest it has been, which sets how far its char has shrunk.)
+  let water = max(m.z, 0.0);
+  let dWater = water * (1.0 - exp(-8.37e12 * exp(-121000.0 / (RG * t)) * dt));
+  let peak = select(max(peakOf(m), t), 0.0, m.z > 1e-4);
+  let shrunk = shrinkOf(peakOf(m));
   var w1 = 0.0;
   if (m.x > 1e-5) { w1 = pow(pow(m.x, -0.89) + 0.89 * 2.007e13 * exp(-185100.0 / (RG * t)) * dt, -1.0 / 0.89); }
   let dWood = m.x - w1;
-  let phi = clamp(m.x + m.y / CHAR_YIELD, 1e-3, 1.0);
-  let heat = m0 * (m.x * cWood(t) + m.y * cChar(t) + m.z * MOISTURE * 4186.0);
+  // The cell's wood, and its char shrunk through the depth, take this share of its depth.
+  let phi = clamp(m.x + m.y / CHAR_YIELD * (1.0 - colShrinkN * shrunk), 1e-3, 1.0);
+  let heat = m0 * (m.x * cWood(t) + m.y * cChar(t) + water * MOISTURE * 4186.0);
   // Through the cell toward the centre: its char (outermost) over its wood, in series; where cracks split the char,
-  // the fissures' radiation alongside it.
+  // the fissures' radiation alongside it, across a crack as wide at this depth as the char here has shrunk.
   let fc = max(phi - m.x, 0.0) / phi;
-  let kc = mix(kChar(t), 4.0 * SIGMA * t * t * t * FISSURE, colCrack);
+  let kc = mix(kChar(t), 4.0 * SIGMA * t * t * t * max(colWLayer * shrunk, 1e-5), colCrack);
   let res = fc / kc + (1.0 - fc) / (kWood(t) * dens * colRad);
   let rHalf = 0.5 * phi * h * res / (mid * mid);
   // From the four columns beside it (an empty cell, at 0, passes nothing).
@@ -2309,10 +2342,16 @@ fn cellStep(k: u32) -> Cell {
     colOx -= burnt * m0;
     a1 += burnt * ASH_YIELD / CHAR_YIELD;
   }
-  cells[idx] = vec4<f32>(w1, c1, m.z - dWater, a1);
+  cells[idx] = vec4<f32>(w1, c1, select(-0.001 * peak, water - dWater, m.z > 1e-4), a1);
   sumFuel += m0 * (1.0 - CHAR_YIELD) * dWood / dt;
   sumChar += min(c1 / CHAR_YIELD, 1.0 - w1) * h;
   sumAsh += a1 * m0;
+  // What the cell has lost of its depth (burned, or shrunk), its char layer shrunk, and how far the char nearest the
+  // surface has shrunk.
+  let g1 = shrinkOf(peak);
+  colGap += (1.0 - min(w1 + c1 / CHAR_YIELD * (1.0 - colShrinkN * g1), 1.0)) * h;
+  colLayer += min(c1 / CHAR_YIELD, 1.0 - w1) * h * (1.0 - colShrinkN * g1);
+  if (colTopG < 0.0 && c1 > 0.01 * CHAR_YIELD) { colTopG = g1; }
   return Cell(t, heat, rHalf, heat / dt * t + g * dot(open, tn) - m0 * (dWood * H_PYRO + dWater * MOISTURE * L_EVAP) / dt, side);
 }
 fn fillOf(m: vec4<f32>) -> f32 { return min(m.x + m.y / CHAR_YIELD, 1.0); }
@@ -2366,10 +2405,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   colT = t;
   colRead = par * WOOD_CELLS;
   let write = (1u - par) * WOOD_CELLS;
-  let cRead = (par * SKIN_TEXELS + t) * 2u;
-  let cWrite = ((1u - par) * SKIN_TEXELS + t) * 2u;
+  let cRead = (par * SKIN_TEXELS + t) * COLS;
+  let cWrite = ((1u - par) * SKIN_TEXELS + t) * COLS;
   var cA = cols[cRead];
   var cB = cols[cRead + 1u];
+  var cC = cols[cRead + 2u];
   // A fresh ball: wood at the air's temperature with its water, and the column's grain and cracks, worked out once.
   if (cB.x <= 0.0) {
     for (var k = 0u; k < WOOD_LAYERS; k++) {
@@ -2383,6 +2423,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     cA = vec4<f32>(2.0, T_AMB, 0.0, 0.0);
     cB = vec4<f32>(grainPatch(n), crack / 9.0, 0.0, 0.0);
+    cC = vec4<f32>(0.0);
   }
   let prev = skin[t];
   colR = r;
@@ -2395,6 +2436,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   colLat = 1.0 + 0.23 * (1.0 - along);
   // (Cracks open once the char is a millimetre or two deep.)
   colCrack = cB.y * smoothstep(0.8, 2.5, prev.z);
+  // The char shrinks through the depth as the grain runs here: the ball's centre is on the log's axis, so the depth runs
+  // partly along the grain and partly radially (along the rings never); along the surface, the mean of the rings' way
+  // and the rest.
+  colShrinkN = SHRINK * (1.0 - along / 3.0);
+  let shrinkAlong = SHRINK * (1.0 + along / 6.0);
+  let crackPrev = sheetOut[2u * t + 1u];
+  colWLayer = shrinkAlong * CRACK_SPAN * 0.001 * crackPrev.z;
   colNb = vec4<u32>(texelNear(face, i32(ti) - 1, i32(tj)), texelNear(face, i32(ti) + 1, i32(tj)), texelNear(face, i32(ti), i32(tj) - 1), texelNear(face, i32(ti), i32(tj) + 1));
   // (A random number for this column this step, for the sums along the surface below.)
   let jitter = hash3(vec3<i32>(i32(t), i32(P.forces.y / dt + 0.5), 7));
@@ -2407,8 +2455,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   sumFuel = 0.0;
   sumChar = 0.0;
   sumAsh = 0.0;
+  colGap = 0.0;
+  colLayer = 0.0;
+  colTopG = -1.0;
 
-  // The surface: the first cell with wood or char left.
+  // The surface: the first cell with wood or char left. It stands as far in as the cells from it down have lost of
+  // their depth, burned or shrunk (last step's, cA.w).
   var s = 0u;
   loop {
     if (s >= WOOD_LAYERS - 1u || fillOf(cells[s * SKIN_TEXELS + t]) > 0.0) { break; }
@@ -2416,7 +2468,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   let hs = layerThick(s, r);
   let fill = max(fillOf(cells[s * SKIN_TEXELS + t]), 1e-3);
-  let rs = r - layerTop(s, r) - (1.0 - fill) * hs;
+  // (In the depths of the wood as made, as the char's depth is counted, where its burning has reached.)
+  let wornMade = layerTop(s, r) + (1.0 - fill) * hs;
+  let rs = r - max(cA.w, wornMade);
   let surface = P.ball.xyz + n * rs;
   let areaS = (rs / r) * (rs / r);
   let dx = P.grid.x;
@@ -2520,7 +2574,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       let a = f32(k) * stepA;
       if (th0 + a > 3.1415927) { break; }
       let tb = texelOf(normalize(n * cos(a) + down * sin(a) + e));
-      below += max(smoothstep(0.0015, 0.0025, skin[tb].y), cols[(par * SKIN_TEXELS + tb) * 2u + 1u].w) / 8.0;
+      below += max(smoothstep(0.0015, 0.0025, skin[tb].y), cols[(par * SKIN_TEXELS + tb) * COLS + 1u].w) / 8.0;
     }
     below = mix(cA.z, max(below, contact), 0.5);
     belowOut = below;
@@ -2563,10 +2617,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // wood burned.
   let tsPrev = cA.y;
   let fireF = charFire(tsPrev);
-  let byOxygen = hConv / 1100.0 * Y_O2_AIR * o2 * fireF.cPerO2;
+  // The oxygen passes the ash's skin too (last step's, from its cover), by diffusion through its pores, in series with
+  // the air's film: the char under a thick skin burns slower and cooler, as Kim and Sunderland found under ash.
+  let ashM = -log(max(1.0 - prev.w, 1e-6)) * ASH_COVER;
+  let rhoDs = 353.0 / tsPrev * 2.0e-5 * pow(tsPrev / 293.0, 1.75);
+  let byOxygen = Y_O2_AIR * o2 * fireF.cPerO2 / (1100.0 / hConv + ashM / ASH_BULK / (0.375 * rhoDs));
   let nbAt = par * SKIN_TEXELS;
   let worn = r - rs;
-  let nbWorn = vec4<f32>(cols[(nbAt + colNb.x) * 2u].w, cols[(nbAt + colNb.y) * 2u].w, cols[(nbAt + colNb.z) * 2u].w, cols[(nbAt + colNb.w) * 2u].w);
+  let nbWorn = vec4<f32>(cols[(nbAt + colNb.x) * COLS].w, cols[(nbAt + colNb.y) * COLS].w, cols[(nbAt + colNb.z) * COLS].w, cols[(nbAt + colNb.w) * COLS].w);
   let proud = clamp(1.0 + dot(nbWorn - worn, vec4<f32>(1.0)) * sqrt(colSide) * r / rs, 0.25, 3.0);
   // The char the burning reaches: the surface cell's and, through a cell its burning has emptied of char (left with a
   // sliver of wood its pyrolysis has not quite finished, which oxygen passes through), the char of the two beneath.
@@ -2589,17 +2647,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // temperature at its mid-depth, a couple of millimetres in from the walls), a layer of char half a millimetre deep
   // holding their heat. So once the flames die back the walls stay as hot as the char inside, while the faces between
   // them cool, and a breeze that cools the faces feeds the cracks: the glow lingers along the cracks, and flares there
-  // when the air moves, as it does in embers. (Implicit, its radiation and burning linearised about last step's.)
+  // when the air moves, as it does in embers. (Implicit, its radiation and burning linearised about last step's.) A
+  // crack is as wide at its mouth, and as deep, as last step left it (the char's shrinkage, and its walls burned back).
   // (The share of the column's top a crack's mouth takes: its width across the column where one runs through it.)
   // How deep to work: a layer past the deepest heat has reached here or beside it.
   var reach = u32(cA.x);
-  reach = max(max(reach, u32(cols[(nbAt + colNb.x) * 2u].x)), max(u32(cols[(nbAt + colNb.y) * 2u].x), max(u32(cols[(nbAt + colNb.z) * 2u].x), u32(cols[(nbAt + colNb.w) * 2u].x))));
+  reach = max(max(reach, u32(cols[(nbAt + colNb.x) * COLS].x)), max(u32(cols[(nbAt + colNb.y) * COLS].x), max(u32(cols[(nbAt + colNb.z) * COLS].x), u32(cols[(nbAt + colNb.w) * COLS].x))));
   reach = min(max(reach, s + 2u), WOOD_LAYERS - 1u);
   let last = min(reach, s + IMPLICIT - 1u);
-  let crack = colCrack * min(FISSURE * sqrt(colSide) * r / rs, 1.0);
-  let crackD = max(0.001 * prev.z, 1e-4);
-  let aw = 1.0 + 2.0 * crackD / FISSURE;
-  let eCav = 0.838 / (0.838 + 0.162 * FISSURE / (FISSURE + 2.0 * crackD));
+  let crackW = max(0.001 * crackPrev.y, 1e-5);
+  let crack = colCrack * min(crackW * sqrt(colSide) * r / rs, 1.0);
+  let crackD = max(0.001 * crackPrev.z, 1e-4);
+  let aw = 1.0 + 2.0 * crackD / crackW;
+  let eCav = 0.838 / (0.838 + 0.162 * crackW / (crackW + 2.0 * crackD));
   var tc = sheetOut[2u * t + 1u].w;
   if (tc < 200.0 || crack < 0.01) { tc = tsPrev; }
   // (The char around the walls: the cell at the char's mid-depth, below the surface cell, within the cells worked
@@ -2693,7 +2753,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   loop {
     temps[write + k * SKIN_TEXELS + t] = tn;
     if (warm == s && tn > T_AMB + 0.5) { warm = k; }
-    let start = select(layerTop(k, r) - worn, 0.0, k == s);
+    let start = select(layerTop(k, r) - wornMade, 0.0, k == s);
     if (tMid == 0.0 && start <= 0.5 * sumChar) { tMid = tn; }
     if (tBase == 0.0 && start <= sumChar) { tBase = tn; }
     if (k == s) { break; }
@@ -2729,7 +2789,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       tAbove = tj;
       temps[write + j * SKIN_TEXELS + t] = tj;
       if (tj > T_AMB + 0.5) { warm = j; }
-      let start = layerTop(j, r) - worn;
+      let start = layerTop(j, r) - wornMade;
       if (start <= 0.5 * sumChar) { tMid = tj; }
       if (start <= sumChar) { tBase = tj; }
       above = cur;
@@ -2737,8 +2797,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   }
   let ts = (areaS * q0 + gs * tTop) / (areaS * lam + gs);
+  // The ash: a crust holds ASH_CRUST of it on the ball's top, less on its sides and none on faces turned down, and
+  // none while the ball is swung about; past that it falls away in plates over a few seconds. (Kim and Sunderland saw
+  // ash gather on embers and fall away; how much holds on a slope, or what shakes it loose, nobody has measured.)
+  let ashHold = ASH_CRUST * ASH_BULK * smoothstep(-0.2, 0.9, n.y) * (1.0 - smoothstep(0.5, 2.0, length(P.ballVel.xyz)));
+  let ashOn = sumAsh / areaS;
+  if (ashOn > ashHold) {
+    let shed = (1.0 - ashHold / ashOn) * (1.0 - exp(-dt / 3.0));
+    for (var k = s; k <= min(s + 3u, reach); k++) {
+      let ia = k * SKIN_TEXELS + t;
+      cells[ia].w = cells[ia].w * (1.0 - shed);
+    }
+    sumAsh *= 1.0 - shed;
+  }
   // A surface cell burned to nothing but ash passes its ash (and any char left) to the cell beneath, and empties.
-  var top = s;
   let mTop = cells[s * SKIN_TEXELS + t];
   if (fillOf(mTop) < 0.02 && mTop.x < 0.02 && s + 1u < WOOD_LAYERS) {
     let i1 = (s + 1u) * SKIN_TEXELS + t;
@@ -2747,9 +2819,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     cells[s * SKIN_TEXELS + t] = vec4<f32>(0.0);
     temps[s * SKIN_TEXELS + t] = 0.0;
     temps[WOOD_CELLS + s * SKIN_TEXELS + t] = 0.0;
-    top = s + 1u;
   }
-  let wear = layerTop(top, r) + (1.0 - fillOf(cells[top * SKIN_TEXELS + t])) * layerThick(top, r);
+  // How far the surface has gone back: the depth the cells have lost, burned or shrunk, from the surface cell down.
+  let wear = max(layerTop(s, r) + colGap, wornMade);
+  // A crack: its mouth opens by the shrinkage along the surface of the char nearest it, over CRACK_SPAN of the char
+  // layer's thickness, and by what its two walls have burned back (char as dense as it has shrunk to); the faces burning
+  // down through its upper part take that with them. It reaches the char's base.
+  let charG = max(colTopG, 0.0);
+  let rhoChar = WOOD_RHO * colPatch * CHAR_YIELD / max(1.0 - colShrinkN * charG, 0.3);
+  let wBurn = select(0.0, max(cC.x + 2.0 * burnC * capK * dt / (aw * rhoChar) - cC.x * max(wear - cA.w, 0.0) / max(colLayer, 1e-3), 0.0), colCrack > 0.0);
+  let wMouth = min(shrinkAlong * charG * CRACK_SPAN * colLayer + wBurn, CRACK_MOST);
 
   // The volatiles burn as they flow up the surface, so the flame at a texel carries all the fuel that came off below
   // it, per metre of width (the circles of latitude narrow toward the poles): down the surface to the bottom in steps.
@@ -2767,9 +2846,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   sheet = mix(sheetOut[2u * t].x, sheet * r * dth / max(sin(th0), 0.15), 0.15);
   skinOut[t] = vec4<f32>(ts, sumFuel, 1000.0 * sumChar, 1.0 - exp(-sumAsh / (areaS * ASH_COVER)));
   sheetOut[2u * t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
-  sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), uRel, hConv, tcNew);
-  cols[cWrite] = vec4<f32>(f32(max(u32(cA.x), min(warm + 1u, WOOD_LAYERS - 1u))), ts, belowOut, worn);
+  sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), 1000.0 * wMouth, 1000.0 * colLayer, tcNew);
+  cols[cWrite] = vec4<f32>(f32(max(u32(cA.x), min(warm + 1u, WOOD_LAYERS - 1u))), ts, belowOut, wear);
   cols[cWrite + 1u] = vec4<f32>(cB.x, cB.y, soot, contact);
+  cols[cWrite + 2u] = vec4<f32>(wBurn, uRel, hConv, 0.0);
 }
 `
 
@@ -3656,15 +3736,15 @@ fn ballFireNear(ph: vec3<f32>, nb: vec3<f32>, ch: vec3<f32>) -> vec3<f32> {
 const BALL_FLAME_REACH = 0.45; // m above the surface
 const SHEET_REF = 0.002; // kg of fuel per metre of width per second, some 35 kW/m: a ball well alight
 // The ball's maps where the outward normal n meets the surface, bilinear like skinAt, from one set of taps: its skin,
-// the rest of it (BALL_HEAT's sheet: the fuel flowing up, the wear, the char's temperatures), its soot, and the
-// temperature of its cracks' walls.
-struct BallMaps { skin: vec4<f32>, sheet: vec4<f32>, soot: f32, crackT: f32 }
+// the rest of it (BALL_HEAT's sheet: the fuel flowing up, the wear, the char's temperatures), its soot, the width of its
+// cracks at the mouth and their depth (mm), and the temperature of their walls.
+struct BallMaps { skin: vec4<f32>, sheet: vec4<f32>, soot: f32, crack: vec2<f32>, crackT: f32 }
 fn ballMapsAt(n: vec3<f32>) -> BallMaps {
   let t = skinTaps(n);
   let i = 2u * t.i;
   let more = t.w.x * ballSheet[i.x + 1u] + t.w.y * ballSheet[i.y + 1u] + t.w.z * ballSheet[i.z + 1u] + t.w.w * ballSheet[i.w + 1u];
   return BallMaps(t.w.x * skin[t.i.x] + t.w.y * skin[t.i.y] + t.w.z * skin[t.i.z] + t.w.w * skin[t.i.w],
-    t.w.x * ballSheet[i.x] + t.w.y * ballSheet[i.y] + t.w.z * ballSheet[i.z] + t.w.w * ballSheet[i.w], more.x, more.w);
+    t.w.x * ballSheet[i.x] + t.w.y * ballSheet[i.y] + t.w.z * ballSheet[i.z] + t.w.w * ballSheet[i.w], more.x, more.yz, more.w);
 }
 // The fuel flow where the outward normal n meets the surface (in SHEET_REF).
 fn sheetAt(n: vec3<f32>) -> f32 {
@@ -3709,7 +3789,7 @@ fn ballFlame(w: vec3<f32>) -> vec2<f32> {
       let h = z / (2.1 * (0.02 + 0.10 * smoothstep(0.0, 1.0, s2)));
       let edge = cap * (1.0 - 0.5 * h);
       if (h < 1.0 && rho < edge) {
-        let q = vec3<f32>(w.x * 7.0, w.y * 1.8 - R.size.z * 1.6, w.z * 7.0);
+        let q = vec3<f32>(w.x * 7.0, (w.y - R.size.z * 1.6) * 1.8, w.z * 7.0);
         let n = textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x + 0.5 * (textureSampleLevel(noiseTex, noiseSamp, q * 2.3 + 0.37, 0.0).y - 0.5);
         let k = flameSoot(s2) * smoothstep(0.0, 0.15, n - 0.25 - 0.6 * h) * (1.0 - smoothstep(0.6, 1.0, rho / edge));
         if (k > out.x) { out = vec2<f32>(k, mix(1400.0, 1050.0, h)); }
@@ -3734,10 +3814,11 @@ fn offBallShell(w: vec3<f32>) -> f32 {
 // pale and the late wood darker. Then, by the char's depth: scorched brown, black char, the char's cracks (CHAR_CRACKS),
 // and grey ash in plates. (Colours authored in Rec.709, carried into ACEScg.)
 ${CHAR_CRACKS}
-// The cracks have depth: each runs down to the char's base there (BALL_HEAT's char depth, deeper under the cracks
-// themselves), its walls closing in to a third of its width at the floor, and it opens, to some 1.3 mm across on a 22 cm
-// ball on average (each to its own width, crackEdge's), as the char deepens past a millimetre or two. A line of sight into a crack meets one of its walls or its floor,
-// the crack taken as straight across its width (the pattern's slope there). Returns how far down it met the char (0 at
+// The cracks have depth: each runs down to the char's base there, its walls closing in to a point, and is as wide at
+// its mouth as BALL_HEAT's crack map has it (the char's shrinkage and its walls burned back: a hairline at first, 1.3 mm
+// across 10 mm of char, some 5 mm across 38), each to its own width (crackEdge's, a hairline to twice the mean), once
+// the char is a millimetre or two deep. A line of sight into a crack meets one of its walls or its floor, the crack
+// taken as straight across its width (the pattern's slope there). Returns how far down it met the char (0 at
 // the surface, 1 at the floor; -1 outside a crack), the surface's normal there, the crack's opening over its walls and
 // opening together, W / (W + 2 D), and how much of the light from outside reaches that far down: the view factor out of
 // a slot, sqrt(1 + x^2) - x, x its depth there over its width.
@@ -3746,13 +3827,14 @@ struct CrackHit { depth: f32, n: vec3<f32>, slot: f32, view: f32, cover: f32 }
 // comes) takes its share of the pixel, cover: the overlap of a box the pixel's width with the crack's width. Drawn as
 // a groove only where a line of sight hits it, a crack under a pixel wide sparkles as the rays happen to hit it or
 // not; covering its share, the cracks read from afar as a faint darkening of the char, and as a glow when they glow.
-fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, fp: f32) -> CrackHit {
+fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, cw: vec2<f32>, fp: f32) -> CrackHit {
   var out = CrackHit(-1.0, nb, 1.0, 1.0, 0.0);
   let open = smoothstep(0.8, 2.5, sk.z);
-  if (open <= 0.0) { return out; }
+  if (open <= 0.0 || cw.x <= 0.0) { return out; }
   let e = crackEdge(normalize(lp));
   let e0 = e.x;
-  if (e0 >= 0.035 + 0.055 * e.y + 6.0 * fp / P.ball.w) { return out; }
+  // (Far from any crack, in the pattern's units: its half-width at no more than 120 of them a metre.)
+  if (e0 >= 0.035 + 0.06 * cw.x * e.y + 6.0 * fp / P.ball.w) { return out; }
   let F = tangentFrame(nb);
   let de = 0.004;
   // How fast the pattern rises away from the crack's line, per metre along the surface.
@@ -3760,13 +3842,13 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, fp: f32)
   let gl = max(length(g), 1e-3);
   let across = (g.x * F[0] + g.y * F[1]) / gl;
   let x0 = e0 / gl;
-  let w = 0.055 * e.y / gl * open;
+  let w = 0.0005 * cw.x * e.y * open;
   let cover = select(select(0.0, 1.0, x0 < w), clamp((min(x0 + 0.5 * fp, w) - max(x0 - 0.5 * fp, -w)) / max(fp, 1e-9), 0.0, 1.0), fp > 0.0);
   if (cover <= 0.0) { return out; }
   // (Into the crack, at the nearest point of it where the crack is finer than the pixel.)
   let xc = min(x0, 0.95 * w);
-  let floorD = 0.001 * sk.z;
-  let k = 0.67 * w / floorD;
+  let floorD = max(0.001 * cw.y, 1e-4);
+  let k = 0.95 * w / floorD;
   let s = dot(rd, across) / max(-dot(rd, nb), 0.05);
   var z = floorD;
   var nn = nb;
@@ -3781,7 +3863,14 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, fp: f32)
   let x = z / (2.0 * (w - k * z));
   return CrackHit(z / floorD, nn, w / (w + floorD), sqrt(1.0 + x * x) - x, cover);
 }
-fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32) -> vec3<f32> {
+// The ash as plates that are there or have fallen, not a grey wash: its cover (the share of the surface BALL_HEAT has it
+// covering) sets how much of a pattern of plates some 2 cm across, ragged at a few millimetres, it fills.
+fn ashPlates(lp: vec3<f32>, cover: f32) -> f32 {
+  let pn = textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y + 0.35 * (textureSampleLevel(noiseTex, noiseSamp, lp * 6.0 + 0.2, 0.0).x - 0.5);
+  let th = 0.66 - 0.32 * cover;
+  return smoothstep(th, th + 0.015, pn) * smoothstep(0.02, 0.15, cover);
+}
+fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32, ash: f32) -> vec3<f32> {
   let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
   let wave = textureSampleLevel(noiseTex, noiseSamp, normalize(lp) * 0.3 + 0.5, 0.0).x - 0.5;
   let ring = fract(length(lp - dot(lp, axis) * axis) * 16.0 + 0.6 * wave);
@@ -3793,8 +3882,7 @@ fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32) -> vec3<f32> 
   a = mix(a, vec3<f32>(0.035, 0.03, 0.028), smoothstep(0.03, 0.4, sk.z));
   // Soot over it (its own black, a few percent), but not down a crack, opened since.
   a = mix(a, vec3<f32>(0.03), soot * (1.0 - crack));
-  let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
-  return REC709_TO_AP1 * mix(a, vec3<f32>(0.42, 0.41, 0.39), sk.w * mix(0.55, 1.0, plates) * (1.0 - crack));
+  return REC709_TO_AP1 * mix(a, vec3<f32>(0.48, 0.47, 0.44), ash * (1.0 - crack));
 }
 // The burning ball as an OpenPBR surface (the subset it needs, as the Lookdev lab's materials are): a dielectric
 // specular layer (GGX) over the diffuse base, the ash as OpenPBR's fuzz on top (the Lookdev lab's own code, Zeltner,
@@ -3814,14 +3902,13 @@ struct BallMat {
   fuzzColor: vec3<f32>,
   fuzzRough: f32,
 }
-fn ballMat(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32) -> BallMat {
+fn ballMat(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32, plates: f32) -> BallMat {
   let charred = smoothstep(0.03, 0.4, sk.z);
   let ior = mix(1.5, 1.9, charred);
-  let plates = smoothstep(0.4, 0.6, textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y);
-  let ash = sk.w * mix(0.55, 1.0, plates) * (1.0 - crack);
+  let ash = plates * (1.0 - crack);
   // (Soot is matte: the wood's sheen fades under it.)
-  return BallMat(woodAlbedo(lp, sk, crack, soot), (1.0 - crack) * (1.0 - 0.7 * ash) * (1.0 - 0.8 * soot), mix(0.6, 0.4, charred), sq((ior - 1.0) / (ior + 1.0)),
-    0.8 * ash, REC709_TO_AP1 * vec3<f32>(0.42, 0.41, 0.39), 0.7);
+  return BallMat(woodAlbedo(lp, sk, crack, soot, plates), (1.0 - crack) * (1.0 - 0.7 * ash) * (1.0 - 0.8 * soot), mix(0.6, 0.4, charred), sq((ior - 1.0) / (ior + 1.0)),
+    0.8 * ash, REC709_TO_AP1 * vec3<f32>(0.48, 0.47, 0.44), 0.7);
 }
 // Columns: two tangents and the normal.
 fn tangentFrame(n: vec3<f32>) -> mat3x3<f32> {
@@ -3868,13 +3955,15 @@ fn fuzzLobe(F: mat3x3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32) -> f32 {
   return fuzzD(vl, ll, rough);
 }
 // Kirchhoff again: the surface glows at the blackbody radiance of its temperature, at its emissivity (wood 0.9, char
-// 0.838, as BALL_HEAT has them), and ash over it glows less. Down a crack the char glows at its own temperature at that
+// 0.838, as BALL_HEAT has them). A plate of ash hides it: Kim and Sunderland's embers looked black under their ash in
+// their own light, and their ash's extinction (0.229 m2/g) lets through under 2% at 18 g/m2; the plate glows itself,
+// a little cooler and pale, at some 15% of the char's glow. Down a crack the char glows at its own temperature at that
 // depth (the surface's, halfway down's and the char base's, through them a parabola), and more nearly as a blackbody,
 // since its walls see one another: a slot glows at e / (e + (1 - e) W / (W + 2 D)), some 0.95 for a crack 1.3 mm wide
 // and 2 mm deep.
-fn charGlow(sk: vec4<f32>, bs: vec4<f32>, c: CrackHit, crackT: f32) -> vec3<f32> {
+fn charGlow(sk: vec4<f32>, bs: vec4<f32>, c: CrackHit, crackT: f32, plates: f32) -> vec3<f32> {
   let e = mix(0.9, 0.838, smoothstep(0.0, 0.3, sk.z));
-  let face = e * (1.0 - 0.5 * sk.w) * planck(sk.x);
+  let face = e * (1.0 - 0.85 * plates) * planck(sk.x);
   if (c.cover <= 0.0) { return face; }
   let q = c.depth;
   var t = sk.x * (2.0 * q * q - 3.0 * q + 1.0) + bs.z * 4.0 * q * (1.0 - q) + bs.w * q * (2.0 * q - 1.0);
@@ -3906,10 +3995,11 @@ fn woodAt(p: vec3<f32>, rd: vec3<f32>, pixel: f32) -> WoodHit {
   let maps = ballMapsAt(dir);
   let lp = (p - P.ball.xyz) / P.ball.w;
   let sk = maps.skin;
-  let c = crackHit(lp, nb, rd, sk, pixel * distance(p, R.camPos.xyz) / max(-dot(rd, nb), 0.25));
-  var m = ballMat(lp, sk, c.cover, maps.soot);
+  let c = crackHit(lp, nb, rd, sk, maps.crack, pixel * distance(p, R.camPos.xyz) / max(-dot(rd, nb), 0.25));
+  let plates = ashPlates(lp, sk.w);
+  var m = ballMat(lp, sk, c.cover, maps.soot, plates);
   m.base *= mix(1.0, c.view, c.cover);
-  return WoodHit(p, nb, m, normalize(mix(nb, c.n, c.cover)), charGlow(sk, maps.sheet, c, maps.crackT));
+  return WoodHit(p, nb, m, normalize(mix(nb, c.n, c.cover)), charGlow(sk, maps.sheet, c, maps.crackT, plates));
 }
 
 @vertex

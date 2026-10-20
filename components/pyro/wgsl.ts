@@ -2211,13 +2211,15 @@ const ASH_CRUST = 0.0003;
 // Char shrinks as it heats past 300 C, most of it by 450 C and nearly all by 700 (carbonised softwood: Rinta-Paavola,
 // Sukhomlinov and Hostikka 2023, spruce under the microscope; Byrne and Nagle 1997; Wang and colleagues 2024), by the
 // hottest it has been, as it does not swell back as it cools: radially SHRINK of it, along the grain two thirds of that,
-// along the rings four thirds. Radially 30% makes Scots pine's char layer 28% thinner than the wood it came from in a
-// cone calorimeter in nitrogen, as Rinta-Paavola and colleagues measured (southern pine's in a furnace, 41%; White and
-// Nordheim 1992). Its cracks open by its shrinkage along the surface, over CRACK_SPAN of the char layer's thickness:
-// cracks in a shrinking layer space out as the layer thickens, each taking a wider share, so a crack is a hairline at
-// first and some 5 mm wide across 38 mm of char, as Schaffer found (3 to 6 mm, 1967).
-const SHRINK = 0.30;
-const CRACK_SPAN = 0.6;
+// along the rings four thirds. SHRINK is set by fire tests: 42% makes Scots pine's char layer 28% thinner than the wood
+// it came from under a cone calorimeter in nitrogen, as Rinta-Paavola and colleagues measured, and southern pine's 0.6
+// of it in the standard furnace, as White and Nordheim measured (0.589, 1992). (Charcoal made slowly shrinks less,
+// radially some 30% by 550 C: fire's char loses more of its depth than it.) Its cracks open by its shrinkage along the
+// surface, over CRACK_SPAN of the char layer's thickness: cracks in a shrinking layer space out as the layer thickens,
+// each taking a wider share, so a crack is a hairline at first and some 4 mm wide across 38 mm of char, as Schaffer
+// found in the furnace (3 to 6 mm, 1967).
+const SHRINK = 0.42;
+const CRACK_SPAN = 0.45;
 const CRACK_MOST = 0.008; // m, a crack's widest at its mouth (a block's own shrinkage, 30% of its 2.5 cm)
 fn shrinkOf(peak: f32) -> f32 { return 1.0 - exp(-max(peak - 573.15, 0.0) / 90.0); }
 // A cell's hottest temperature (K): kept, once its water is gone, as minus a thousandth of it in the water's slot.

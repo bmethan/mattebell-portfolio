@@ -135,7 +135,7 @@ export default function DeviceCheck({ engineRef, statusRef, frameRef, applyPrese
             hottest = Math.max(hottest, f[7])
           }
         }
-        lines.push(`Sparks by then: ${sp.thrown} thrown, ${n} in the air, ${glowing} glowing, hottest ${Math.round(hottest - 273)} C, ${bad} not finite: ${sp.thrown > 0 && bad === 0 ? 'as they should be' : bad ? 'values not finite' : 'none thrown yet'}`)
+        lines.push(`Sparks by then: ${sp.thrown} thrown, ${n} in the air, ${glowing} glowing${n ? `, hottest ${Math.round(hottest - 273)} C` : ''}, ${bad} not finite: ${sp.thrown > 0 && bad === 0 ? 'as they should be' : bad ? 'values not finite' : 'none thrown yet'}`)
       }
       lines.push(`WebGPU errors in all: ${e.gpuErrors.length}${e.gpuErrors.length ? `; first: ${e.gpuErrors[0]}` : ''}`)
       lines.push(`Values not finite in all: ${notFinite}${badWhere.size ? ` (${[...badWhere].slice(0, 6).join('; ')})` : ''}`)

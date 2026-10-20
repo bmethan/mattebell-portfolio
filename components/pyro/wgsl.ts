@@ -2148,8 +2148,11 @@ fn crackLine(n: vec3<f32>) -> f32 {
 //
 // The volatiles leave through the char at once, so the surface gives off what its column makes, which COMBINE adds to
 // the gas as fuel: the ball's flames are the solver's own combustion. Where the char burns away, its cell empties and
-// the surface steps in: the shape wears back where it is hottest. Down a crack in the char, heat crosses the open
-// fissure by radiation as well as through the char, 4 sigma T^3 times its width, so the char goes deeper under a crack.
+// the surface steps in: the shape wears back where it is hottest. The char shrinks as it heats (SHRINK), so the
+// surface steps in as the wood chars too, underneath as well, and the char's cracks open with it, wide at their mouths
+// and closing to a point at the char's base (CRACK_SPAN). Down a crack in the char, heat crosses the open fissure by
+// radiation as well as through the char, 4 sigma T^3 times its width there, so the char goes deeper under a crack. The
+// ash builds into a skin that falls from the underside and the steep sides, and holds back the char's oxygen.
 export const BALL_HEAT = /* wgsl */ `
 ${SIM_COMMON}
 ${CHAR_CRACKS}
@@ -3865,12 +3868,14 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, cw: vec2
   let x = z / (2.0 * (w - k * z));
   return CrackHit(z / floorD, nn, w / (w + floorD), sqrt(1.0 + x * x) - x, cover);
 }
-// The ash as plates that are there or have fallen, not a grey wash: its cover (the share of the surface BALL_HEAT has it
-// covering) sets how much of a pattern of plates some 2 cm across, ragged at a few millimetres, it fills.
+// The ash: a thin dusting of grains at first, greying the char evenly as far as it covers it, then, as it thickens into
+// a crust, plates that are there or have fallen. Its cover (the share of the surface BALL_HEAT has it covering) sets how
+// much of a pattern of plates some 2 cm across, ragged at a few millimetres, it fills; the plates form as the cover
+// passes a quarter to three fifths, so the char shows black and crazed before the ash greys it.
 fn ashPlates(lp: vec3<f32>, cover: f32) -> f32 {
   let pn = textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y + 0.35 * (textureSampleLevel(noiseTex, noiseSamp, lp * 6.0 + 0.2, 0.0).x - 0.5);
   let th = 0.66 - 0.32 * cover;
-  return smoothstep(th, th + 0.015, pn) * smoothstep(0.02, 0.15, cover);
+  return mix(0.6 * cover, smoothstep(th, th + 0.015, pn), smoothstep(0.25, 0.6, cover));
 }
 fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32, ash: f32) -> vec3<f32> {
   let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));

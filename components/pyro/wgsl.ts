@@ -2398,7 +2398,7 @@ fn crackBurn(tc: f32, aw: f32, o2: f32, h: f32, d: f32) -> f32 {
 // over the gas's time until the next wood step.
 const SPARK_SHARE = 0.0063;
 const LOOSE_SHARE = 0.0106;
-const LOOSE_MAX = 0.0002; // kg/m2, times 0.3 plus the column's crack share
+const LOOSE_MAX = 0.001; // kg/m2 (a few micrometres of char's worth), times 0.3 plus the column's crack share
 const SPARK_CRACKS = 4.0;
 const SHEAR_FROM = 0.6; // m/s
 const SHEAR_RATE = 0.5; // 1/s per (m/s)^2 over it

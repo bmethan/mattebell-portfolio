@@ -185,6 +185,36 @@ export const SKIN_TEXELS = 6 * SKIN_N * SKIN_N
 export const WOOD_LAYERS = 40
 export const WOOD_CELLS = SKIN_TEXELS * WOOD_LAYERS
 
+// Sparks (burn-6): the pool's size, and the sizes they are thrown at. Petersen and Banerjee (2024) collected some 86,000
+// embers from a burning pile of pine and fir: from 0.1 mm to 10 cm across, a power law with no typical size (brittle
+// fragmentation's), about 3% of them over a millimetre. The same law here, p(d) ~ d^-2.5, which puts 3% over 1 mm from
+// 0.1 mm; from 0.25 mm (smaller ones burn out within a hundredth of a second, too faint to see) to 5 mm (larger pieces are
+// breaks, burn-5), so 11.5% over a millimetre. Char 360 kg/m3, as their embers measured (pine's char made at 500 to 800 C
+// runs 320 to 380; Elder, Booker and Cutter 1985). The count is worked out from the mass thrown over the law's mean mass.
+export const SPARK_N = 4096
+export const SPARK_D_MIN = 0.00025 // m
+export const SPARK_D_MAX = 0.005
+export const SPARK_ALPHA = 2.5
+export const SPARK_RHO = 360 // kg/m3
+const SPARK_K = 1 - SPARK_ALPHA
+export const SPARK_MEAN_MASS =
+  ((SPARK_RHO * Math.PI) / 6) * (((SPARK_D_MAX ** (4 - SPARK_ALPHA) - SPARK_D_MIN ** (4 - SPARK_ALPHA)) / (4 - SPARK_ALPHA)) / ((SPARK_D_MAX ** SPARK_K - SPARK_D_MIN ** SPARK_K) / SPARK_K))
+// The pool: the ring's head (where the next spark goes), the loose char on each patch of the ball (kg/m2), then the
+// sparks, four vec4s each: position (m) and diameter (m; 0, an empty slot); velocity (m/s) and temperature (K); spare,
+// and age (s; negative until it is thrown); its random seed, and spare.
+export const SPARK_POOL_BYTES = 16 + SKIN_TEXELS * 4 + SPARK_N * 64
+const sparkPool = (access: 'read_write' | 'read', binding: number) => /* wgsl */ `
+const SPARK_N = ${SPARK_N}u;
+struct Spark { p: vec4<f32>, v: vec4<f32>, q: vec4<f32>, s: vec4<f32> }
+struct SparkPool { head: ${access === 'read_write' ? 'atomic<u32>' : 'u32'}, spare0: u32, spare1: u32, spare2: u32, loose: array<f32, ${SKIN_TEXELS}>, sparks: array<Spark, ${SPARK_N}> }
+@group(0) @binding(${binding}) var<storage, ${access}> pool: SparkPool;
+fn sparkHash(a: u32, b: u32, c: u32) -> f32 {
+  var x = a * 747796405u + b * 2891336453u + c * 277803737u + 1442695041u;
+  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+  x = (x >> 22u) ^ x;
+  return f32(x) / 4294967296.0;
+}`
+
 // The on-set reference as a solid (engine.ts referenceSet), from a uniform S holding its fields: its two balls, and
 // its chart as a card one cell (h) thick, which a thinner card would let the gas through between cell centres. Its
 // stands, thinner than a cell, are left out.
@@ -259,6 +289,7 @@ struct Params {
   wear1: vec4<f32>,     // the wooden ball's wear (m) as the gas sees it (wornBall): along x, y and z
   wear2: vec4<f32>,     // along x2, y2 and z2
   wear3: vec4<f32>,     // along xy, yz and zx; the air blown over the wood under a test exposure (m/s; BALL_HEAT)
+  spark: vec4<f32>,     // sparks (BALL_HEAT, SPARK_STEP): the gas's time from one wood step to the next (s), the ball's largest jolt since the last (m/s2), whether the wood throws them (0 or 1), the time the monoxide takes to burn beside a spark (s)
 }
 @group(0) @binding(0) var<uniform> P: Params;
 
@@ -2177,6 +2208,7 @@ ${CHAR_CRACKS}
 @group(0) @binding(10) var<storage, read_write> cols: array<vec4<f32>>;
 @group(0) @binding(11) var flameTex: texture_3d<f32>; // the gas's heat release last step (MW/m3), COMBINE's
 @group(0) @binding(12) var vel: texture_3d<f32>; // the gas's velocity (m/s)
+${sparkPool('read_write', 13)}
 const WOOD_LAYERS = ${WOOD_LAYERS}u;
 const WOOD_CELLS = ${WOOD_CELLS}u;
 const GRADED = 9u;
@@ -2349,6 +2381,74 @@ fn crackBurn(tc: f32, aw: f32, o2: f32, h: f32, d: f32) -> f32 {
   let rhoD = 353.0 / tc * 2.0e-5 * pow(tc / 293.0, 1.75);
   let supply = Y_O2_AIR * o2 * charFire(tc).cPerO2 / (1100.0 / h + 0.5 * d / rhoD);
   return charBurn(charKinetics(tc) * pow(o2, 0.68) * aw, supply);
+}
+
+// Sparks (burn-6): flakes of char thrown off as it forms and as it burns, as fragments are (Petersen and Banerjee's
+// embers follow brittle fragmentation's power law in size), so a share of the char, five times as much where the column
+// is fully cracked and half as much under ash. That share is the one number calibrated: so that the ball held in the
+// bonfire throws some 130 sparks over a millimetre a second for each MW of its own flames, as their pile of pine and
+// fir did (some 370 glowing tracks a second from about 2.9 MW). A further share collects on the surface as loose
+// flakes, up to a limit (more where it is cracked), which air moving past the surface faster than 0.6 m/s strips, by the
+// square of the excess, and a jolt of the ball shakes off: in the bonfire's own flow it never collects and simply adds
+// to the stream (the two shares together are 1.7% of the char); on embers in still air it builds over half a minute, and
+// a stir or a drag throws it as a shower. (Nobody has measured the showers stirring throws: its rates are set by eye.)
+// Counted in the gas's time from one wood step to the next at the wood's own rates, so a time-lapse throws them as the
+// real burn would. Each leaves its patch a couple of millimetres out, at 0.1 to 0.5 m/s about the outward normal plus
+// the ball's own velocity, at the char's temperature (a crack's walls' if it comes from a crack), and at a moment spread
+// over the gas's time until the next wood step.
+const SPARK_SHARE = 0.0063;
+const LOOSE_SHARE = 0.0106;
+const LOOSE_MAX = 0.001; // kg/m2 (a few micrometres of char's worth), times 0.3 plus the column's crack share
+const SPARK_CRACKS = 4.0;
+const SHEAR_FROM = 0.6; // m/s
+const SHEAR_RATE = 0.5; // 1/s per (m/s)^2 over it
+const JOLT_RATE = 0.02; // 1/s per m/s2
+const SPARK_MEAN_MASS = ${wf(SPARK_MEAN_MASS)}; // kg
+const SPARK_D_MIN = ${wf(SPARK_D_MIN)};
+const SPARK_D_MAX = ${wf(SPARK_D_MAX)};
+const SPARK_K = ${wf(1 - SPARK_ALPHA)};
+fn emitSparks(t: u32, n: vec3<f32>, east: vec3<f32>, down: vec3<f32>, surface: vec3<f32>, ts: f32, tc: f32, fuel: f32, burnRate: f32, crack: f32, ash: f32, uRel: f32, area: f32) {
+  let gasDt = P.spark.x;
+  let weight = (1.0 + SPARK_CRACKS * crack) * (1.0 - 0.5 * ash);
+  let rate = (fuel * CHAR_YIELD / (1.0 - CHAR_YIELD) + burnRate) * weight;
+  let loose = min(pool.loose[t] + LOOSE_SHARE * rate * gasDt, LOOSE_MAX * (0.3 + crack));
+  let strip = SHEAR_RATE * pow(max(uRel - SHEAR_FROM, 0.0), 2.0) + JOLT_RATE * P.spark.y;
+  let shed = loose * (1.0 - exp(-strip * gasDt));
+  pool.loose[t] = loose - shed;
+  let lam = (SPARK_SHARE * rate * gasDt + shed) * area / SPARK_MEAN_MASS;
+  // How many this step (Poisson, usually none: the ball's 24,576 patches throw some 130 a second between them).
+  let seed = P.dims.w;
+  var k = 0u;
+  var pk = exp(-lam);
+  var cum = pk;
+  let u0 = sparkHash(t, seed, 1u);
+  loop {
+    if (u0 <= cum || k >= 16u) { break; }
+    k++;
+    pk *= lam / f32(k);
+    cum += pk;
+  }
+  if (k == 0u) { return; }
+  let base = atomicAdd(&pool.head, k);
+  let side = sqrt(area);
+  for (var j = 0u; j < k; j++) {
+    let h = vec4<f32>(sparkHash(t, seed, 10u + j * 8u), sparkHash(t, seed, 11u + j * 8u), sparkHash(t, seed, 12u + j * 8u), sparkHash(t, seed, 13u + j * 8u));
+    let h2 = vec4<f32>(sparkHash(t, seed, 14u + j * 8u), sparkHash(t, seed, 15u + j * 8u), sparkHash(t, seed, 16u + j * 8u), sparkHash(t, seed, 17u + j * 8u));
+    let d = pow(pow(SPARK_D_MIN, SPARK_K) + h.x * (pow(SPARK_D_MAX, SPARK_K) - pow(SPARK_D_MIN, SPARK_K)), 1.0 / SPARK_K);
+    let at = surface + n * 0.002 + (east * (h.y - 0.5) + down * (h.z - 0.5)) * side;
+    // Gaussian scatter about the normal (Box-Muller), and the speed it leaves at.
+    let rad = sqrt(-2.0 * log(max(h2.x, 1e-7)));
+    let g = vec3<f32>(rad * cos(6.2831853 * h2.y), rad * sin(6.2831853 * h2.y), sqrt(-2.0 * log(max(h2.z, 1e-7))) * cos(6.2831853 * h2.w));
+    let dir = normalize(n + 0.6 * g);
+    let fromCrack = h.w * (1.0 + SPARK_CRACKS * crack) < SPARK_CRACKS * crack;
+    let temp = max(select(ts, tc, fromCrack), 600.0);
+    var sp: Spark;
+    sp.p = vec4<f32>(at, d);
+    sp.v = vec4<f32>(P.ballVel.xyz + dir * (0.1 + 0.4 * fract(h2.x * 7.31 + h.w)), temp);
+    sp.q = vec4<f32>(0.0, 0.0, 0.0, -fract(h2.z * 5.17 + h.y) * gasDt);
+    sp.s = vec4<f32>(f32(base + j), 0.0, 0.0, 0.0);
+    pool.sparks[(base + j) % SPARK_N] = sp;
+  }
 }
 
 @compute @workgroup_size(64)
@@ -2631,7 +2731,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // the wood until it chars and glows.
   let sootBurn = min(1.085e6 * 0.21 * o2 / sqrt(tsPrev) * exp(-19778.0 / tsPrev), byOxygen);
   let soot = max(cB.z + (sootIn - sootBurn) * dt, 0.0);
-  colOx = burnAll * capK * areaS * dt;
+  let burnRate = burnAll * capK * areaS;
+  colOx = burnRate * dt;
   // The surface's balance, its own radiation linearised about last step's temperature: q0 - lam Ts, over the faces'
   // share of the top. (The heat the cracks' walls trade with the char around them goes to the cell at its mid-depth.)
   let lam = (1.0 - crack) * (hConv + 4.0 * eps * SIGMA * tsPrev * tsPrev * tsPrev);
@@ -2765,6 +2866,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     sheet += burning(skin[texelOf(normalize(n * cos(a) + down * sin(a) + across))].y) * sin(th0 + a);
   }
   sheet = mix(sheetOut[2u * t].x, sheet * r * dth / max(sin(th0), 0.15), 0.15);
+  if (P.spark.z > 0.5) { emitSparks(t, n, east, down, surface, ts, tcNew, sumFuel, burnRate, colCrack, prev.w, uRel, 1.0 / colSide); }
   skinOut[t] = vec4<f32>(ts, sumFuel, 1000.0 * sumChar, 1.0 - exp(-sumAsh / (areaS * ASH_COVER)));
   sheetOut[2u * t] = vec4<f32>(sheet, 1000.0 * wear, tMid, tBase);
   sheetOut[2u * t + 1u] = vec4<f32>(1.0 - exp(-${wf(SOOT_EXTINCTION_633)} * soot), uRel, hConv, tcNew);
@@ -5868,39 +5970,51 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
   return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
 }
 
+// (The first downsample also takes in the sparks, SPARK_DRAW's texture at the image's size, so they glare as the rest
+// of the image does; the other levels never bind it.)
+@group(0) @binding(2) var sparkTex: texture_2d<f32>;
 fn tap(uv: vec2<f32>) -> vec3<f32> { return textureSampleLevel(src, smp, uv, 0.0).xyz; }
+fn tapFirst(uv: vec2<f32>) -> vec3<f32> { return textureSampleLevel(src, smp, uv, 0.0).xyz + textureSampleLevel(sparkTex, smp, uv, 0.0).xyz; }
 fn karis(c: vec3<f32>) -> f32 { return 1.0 / (1.0 + ap1Lum(c)); }
-fn down(fc: vec4<f32>, firstPass: bool) -> vec4<f32> {
+${[false, true]
+  .map(
+    first => /* wgsl */ `
+fn ${first ? 'downFirst' : 'down'}(fc: vec4<f32>) -> vec4<f32> {
   let ts = 1.0 / vec2<f32>(textureDimensions(src));
   let uv = fc.xy * 2.0 * ts;
-  let a = tap(uv + ts * vec2<f32>(-2.0, -2.0));
-  let b = tap(uv + ts * vec2<f32>(0.0, -2.0));
-  let c = tap(uv + ts * vec2<f32>(2.0, -2.0));
-  let d = tap(uv + ts * vec2<f32>(-2.0, 0.0));
-  let e = tap(uv);
-  let f = tap(uv + ts * vec2<f32>(2.0, 0.0));
-  let g = tap(uv + ts * vec2<f32>(-2.0, 2.0));
-  let h = tap(uv + ts * vec2<f32>(0.0, 2.0));
-  let i = tap(uv + ts * vec2<f32>(2.0, 2.0));
-  let j = tap(uv + ts * vec2<f32>(-1.0, -1.0));
-  let k = tap(uv + ts * vec2<f32>(1.0, -1.0));
-  let l = tap(uv + ts * vec2<f32>(-1.0, 1.0));
-  let m = tap(uv + ts * vec2<f32>(1.0, 1.0));
+  let a = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(-2.0, -2.0));
+  let b = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(0.0, -2.0));
+  let c = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(2.0, -2.0));
+  let d = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(-2.0, 0.0));
+  let e = ${first ? 'tapFirst' : 'tap'}(uv);
+  let f = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(2.0, 0.0));
+  let g = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(-2.0, 2.0));
+  let h = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(0.0, 2.0));
+  let i = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(2.0, 2.0));
+  let j = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(-1.0, -1.0));
+  let k = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(1.0, -1.0));
+  let l = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(-1.0, 1.0));
+  let m = ${first ? 'tapFirst' : 'tap'}(uv + ts * vec2<f32>(1.0, 1.0));
   let g0 = (j + k + l + m) * 0.25;
   let g1 = (a + b + d + e) * 0.25;
   let g2 = (b + c + e + f) * 0.25;
   let g3 = (d + e + g + h) * 0.25;
   let g4 = (e + f + h + i) * 0.25;
-  if (!firstPass) { return vec4<f32>(g0 * 0.5 + (g1 + g2 + g3 + g4) * 0.125, 1.0); }
-  let w0 = 0.5 * karis(g0);
+  ${
+    first
+      ? `let w0 = 0.5 * karis(g0);
   let w1 = 0.125 * karis(g1);
   let w2 = 0.125 * karis(g2);
   let w3 = 0.125 * karis(g3);
   let w4 = 0.125 * karis(g4);
-  return vec4<f32>((g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4), 1.0);
-}
-@fragment fn fsDownFirst(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> { return down(fc, true); }
-@fragment fn fsDown(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> { return down(fc, false); }
+  return vec4<f32>((g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4), 1.0);`
+      : `return vec4<f32>(g0 * 0.5 + (g1 + g2 + g3 + g4) * 0.125, 1.0);`
+  }
+}`,
+  )
+  .join('\n')}
+@fragment fn fsDownFirst(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> { return downFirst(fc); }
+@fragment fn fsDown(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> { return down(fc); }
 // Into a level twice this one's size, added to what is there (the pipeline blends by adding).
 @fragment fn fsUp(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let ts = 1.0 / vec2<f32>(textureDimensions(src));
@@ -5922,6 +6036,7 @@ ${VIEW_TRANSFORMS_WGSL}
 @group(0) @binding(4) var smp: sampler;
 @group(0) @binding(5) var lut: texture_2d<f32>; // the ACES 2.0 LUT: 65 slices of 65 x 65 stacked (blue by slice)
 @group(0) @binding(6) var lutSampler: sampler;
+@group(0) @binding(7) var sparkTex: texture_2d<f32>; // the sparks (SPARK_DRAW), drawn after the upsampling, at the image's size
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -5943,7 +6058,7 @@ fn view(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
-  var c = textureLoad(image, vec2<i32>(fc.xy), 0).xyz;
+  var c = textureLoad(image, vec2<i32>(fc.xy), 0).xyz + textureLoad(sparkTex, vec2<i32>(fc.xy), 0).xyz;
   let k = R.camera.y;
   if (k > 0.0) {
     let glare = textureSampleLevel(glareTex, smp, fc.xy / vec2<f32>(textureDimensions(image)), 0.0).xyz / max(R.camera.z, 1.0);
@@ -6120,5 +6235,285 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     s += max(textureLoad(fine, 2u * id + vec3<u32>(k & 1u, (k >> 1u) & 1u, k >> 2u), 0).x, 0.0);
   }
   textureStore(coarse, id, vec4<f32>(0.125 * s, 0.0, 0.0, 0.0));
+}
+`
+
+// 13. Sparks (burn-6): the wood throws them (BALL_HEAT, emitSparks); SPARK_STEP moves them through the gas each step;
+// each frame SPARK_VIEW lists the ones to draw and SPARK_DRAW draws them, after the temporal upsampling (RESOLVE), at the
+// display's own pixels, into a texture of their own that the glare (GLARE) and the display (DISPLAY) add to the image.
+// They never enter the upsampling's history: a spark is small, fast and bright against what is behind it, all that its
+// rejection is built to distrust, and drawn before it a spark came out a soft, faint smudge of the half-scale march.
+//
+// A spark is a sphere of char, moved twice a step through the gas the step has just made. Its drag is a sphere's at its
+// Reynolds number (Schiller and Naumann), worked implicitly so the smallest, which follow the gas exactly, stay stable;
+// its weight pulls it back, so a 0.5 mm spark settles at about 1 m/s and rises in any plume, a millimetre one at 2 m/s
+// and rises only in the bonfire's core (its flames rise some 5 m/s at their centre), and a 5 mm one falls back. The gas
+// is read a cell out from the ball, as the solver reads it (clearOfBall), with the eddies finer than the grid that the
+// smoke's upres takes (the curl of the detail noise, as strong as the next band down in Kolmogorov's spectrum, 2^-5/6
+// of the resolved speed), which bend its path. Its heat: convection (Ranz and Marshall's sphere), its own radiation and
+// the fire's radiant share on it (each band of the fire's height a point source, as the ball takes the fire's from
+// further off; a sphere absorbs a quarter of the flux on its cross-section per unit of its surface), the gas's
+// temperature held to 1550 K as the wood's flame radiation is (the solver's flame gas runs hotter than wood flames
+// measure), and the heat of its char burning: burn-3's chemistry (charKinetics) in series with the oxygen its boundary
+// layer brings (Sherwood by Ranz and Marshall too). Burn-3's char gives off carbon monoxide, which above some 850 to
+// 1000 K burns in the air beside it and gives its heat back, as for Varunkumar's 1 cm char spheres; a spark's boundary
+// layer is so thin that the monoxide crosses it in about a millisecond at 1 mm (some 125 ms at 1 cm), so only the share
+// that burns before it gets out heats the spark: the time to diffuse out, (d/2)^2 / D, over that plus the few
+// milliseconds the monoxide takes to burn (some 0.3 at 1 mm, all of it at 1 cm). So sparks run some 1100 to 1350 K in
+// air, as glowing embers measure (Urban and colleagues 2019; Kim and Sunderland 2019: 1020 to 1340 K), and glow for 0.4
+// s on average, at most 2 or 3 (Petersen and Banerjee tracked 0.4 s on average, at most about 2). A spark shrinks as it
+// burns, at its density, so its diameter squared falls in time (as Tarifa and colleagues measured for burning wood
+// particles). It ends burnt to under 0.04 mm, cooled under 620 K, out of the box, on the floor, or against the ball,
+// whose char it sticks to.
+const SPARK_STEP_COMMON = /* wgsl */ `
+const SIGMA_SB = 5.670374e-8;
+const EPS_CHAR = 0.838;
+const SPARK_RHO = ${wf(SPARK_RHO)};
+const RG_GAS = 8.314;
+const GAS_HELD = 1550.0; // K
+struct SparkFire { cPerO2: f32, heat: f32 }
+fn sparkFire(t: f32, d: f32, tg: f32) -> SparkFire {
+  let co = 2512.0 * exp(-6240.0 / t);
+  let tDiff = 0.25 * d * d / (2.0e-5 * pow(tg / 293.0, 1.75));
+  let near = tDiff / (tDiff + P.spark.w);
+  let away = co / (1.0 + co) * (1.0 - near * smoothstep(850.0, 1000.0, t));
+  return SparkFire(0.375 / (1.0 - 0.5 * away), mix(3.28e7, 9.2e6, away));
+}
+fn sparkKinetics(t: f32) -> f32 {
+  let measured = 0.248 * exp(-39784.0 / (RG_GAS * t));
+  let co = 2512.0 * exp(-6240.0 / t);
+  let away = co / (1.0 + co) * (1.0 - smoothstep(850.0, 1000.0, t));
+  let cone = 13.0 / 1100.0 * Y_O2_AIR * 0.375 / (1.0 - 0.5 * away);
+  return measured / max(1.0 - measured / cone, 0.05);
+}
+fn sparkBurn(kinetics: f32, supply: f32) -> f32 { return 1.0 / (1.0 / max(kinetics, 1e-12) + 1.0 / max(supply, 1e-12)); }
+`
+export const SPARK_STEP = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var vel: texture_3d<f32>;
+@group(0) @binding(3) var scal: texture_3d<f32>;
+${sparkPool('read_write', 4)}
+@group(0) @binding(5) var curlTex: texture_3d<f32>;
+@group(0) @binding(6) var noiseSamp: sampler;
+@group(0) @binding(7) var<storage, read> fireSums: array<vec4<f32>>;
+${SPARK_STEP_COMMON}
+const NOISE_ROT = ${NOISE_ROT};
+
+// The fire's radiant heat on a spark, W/m2 normal to it.
+fn fireOn(w: vec3<f32>) -> f32 {
+  if (P.fire.x < 0.5) { return 0.0; }
+  let vol = P.grid.x * P.grid.x * P.grid.x;
+  var lumAll = 0.0;
+  for (var b = 0u; b < ${FIRE_BANDS}u; b++) { lumAll += fireSums[3u + 2u * b].w * vol; }
+  if (lumAll <= 0.0) { return 0.0; }
+  let radiated = P.fire.w * fireSums[2].y;
+  var q = 0.0;
+  for (var b = 0u; b < ${FIRE_BANDS}u; b++) {
+    let lum = fireSums[3u + 2u * b].w * vol;
+    if (lum <= 0.0) { continue; }
+    let dist = max(length(fireSums[4u + 2u * b].xyz - w), 1e-3);
+    // (Bands within about half a metre are the flames whose gas the spark is in.)
+    q += radiated * lum / lumAll / (12.566371 * dist * dist) * smoothstep(0.35, 0.7, dist);
+  }
+  return q;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= SPARK_N) { return; }
+  var sp = pool.sparks[i];
+  if (sp.p.w <= 0.0) { return; }
+  let stepDt = P.grid.y;
+  // Not yet thrown: it waits, its moment spread over the gas's time between wood steps.
+  if (sp.q.w < 0.0) {
+    sp.q.w += stepDt;
+    if (sp.q.w < 0.0) {
+      pool.sparks[i] = sp;
+      return;
+    }
+  }
+  let h = 0.5 * stepDt;
+  let dx = P.grid.x;
+  let kNoise = 1.0 / (12.0 * dx);
+  var dead = false;
+  for (var k = 0; k < 2; k++) {
+    var x = sp.p.xyz;
+    let d = sp.p.w;
+    let g = clearOfBall((x - P.origin.xyz) / dx);
+    let gas = gasOf(scalAt(scal, samp, g));
+    let tg = min(T_AMB + gas.rise, GAS_HELD);
+    let yO2 = max(Y_O2_AIR * (1.0 - gas.z) - S_O2 * (gas.z - gas.fuel), 0.0);
+    let u0 = velAt(vel, samp, g);
+    let eddy = textureSampleLevel(curlTex, noiseSamp, NOISE_ROT * (x * kNoise + vec3<f32>(0.0, -0.5 * P.grid.z * kNoise, 0.0)), 0.0).xyz;
+    let u = u0 + eddy * 0.5612 * max(length(u0), 0.2);
+    let rhoG = RHO_T / tg;
+    let mu = 1.716e-5 * pow(tg / 273.0, 1.5) * 383.4 / (tg + 110.4);
+    let kG = 0.0241 * pow(tg / 273.0, 0.81);
+    let rhoD = rhoG * 2.0e-5 * pow(tg / 293.0, 1.75);
+    // Drag and weight, implicit in the slip.
+    let re = rhoG * length(u - sp.v.xyz) * d / mu;
+    let tau = SPARK_RHO * d * d / (18.0 * mu * (1.0 + 0.15 * pow(re, 0.687)));
+    let gravity = vec3<f32>(0.0, -9.81 * (1.0 - rhoG / SPARK_RHO), 0.0);
+    let v = (sp.v.xyz + h * (gravity + u / tau)) / (1.0 + h / tau);
+    x += v * h;
+    // Heat and burning, implicit in its temperature (convection, and its radiation linearised).
+    let nu = 2.0 + 0.533 * sqrt(re);
+    let hc = nu * kG / d;
+    let hm = nu * rhoD / d;
+    let temp = sp.v.w;
+    let cf = sparkFire(temp, d, tg);
+    let burn = sparkBurn(sparkKinetics(temp) * pow(yO2 / Y_O2_AIR, 0.68), hm * yO2 * cf.cPerO2);
+    let a = 3.14159265 * d * d;
+    let m = SPARK_RHO * 0.52359878 * d * d * d;
+    let c = 1430.0 + 0.355 * temp - 7.32e7 / (temp * temp);
+    let t3 = temp * temp * temp;
+    let gain = a * (hc * tg + EPS_CHAR * (0.25 * fireOn(x) + SIGMA_SB * (T_AMB * T_AMB * T_AMB * T_AMB + 3.0 * t3 * temp)) + burn * cf.heat);
+    let loss = a * (hc + 4.0 * EPS_CHAR * SIGMA_SB * t3);
+    let kc = h / (m * max(c, 400.0));
+    let tNew = clamp((temp + kc * gain) / (1.0 + kc * loss), 250.0, 2500.0);
+    sp.p = vec4<f32>(x, max(d - 2.0 * burn * h / SPARK_RHO, 0.0));
+    sp.v = vec4<f32>(v, tNew);
+    if (inBall(x) && sp.q.w > 0.05) { dead = true; }
+  }
+  sp.q.w += stepDt;
+  let hi = P.origin.xyz + vec3<f32>(P.dims.xyz) * dx;
+  let x = sp.p.xyz;
+  if (dead || sp.p.w < 4e-5 || (sp.v.w < 620.0 && sp.q.w > 0.2) || x.y < 0.0 || any(x > hi) || x.x < P.origin.x || x.z < P.origin.z) {
+    sp.p.w = 0.0;
+  }
+  pool.sparks[i] = sp;
+}
+`
+
+// Each frame, the sparks to draw: the path each takes over the camera's shutter, centred on the frame's moment (as the
+// paused frame's motion blur is), projected to the display's pixels; dimmed by the soot between it and the camera,
+// marched through the solver's own field a cell at a time, colour by colour as the image pass dims it; and left out
+// where the ball or the reference set's balls hide it, or too cool to see (650 K; Draper's visible red is 798). Their
+// light is the char's blackbody glow at its emissivity, exposed as the image is. Listed for an indirect draw.
+export const SPARK_VIEW = /* wgsl */ `
+${SIM_COMMON}
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var scal: texture_3d<f32>;
+${sparkPool('read', 3)}
+@group(0) @binding(4) var<storage, read_write> draws: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> drawArgs: array<atomic<u32>, 4>;
+// The camera: its position and the tangent of half its field of view; its direction and aspect; right; up and the
+// exposure; the display's size (px), the shutter's open time (s), 0; the soot's extinction per unit of the scalar's
+// first channel (1/m), and its colour (chroma).
+struct SparkView { pos: vec4<f32>, fwd: vec4<f32>, right: vec4<f32>, up: vec4<f32>, size: vec4<f32>, ext: vec4<f32> }
+@group(0) @binding(6) var<uniform> V: SparkView;
+const EPS_DRAWN = 0.838;
+
+fn toScreen(w: vec3<f32>) -> vec3<f32> {
+  let v = w - V.pos.xyz;
+  let z = dot(v, V.fwd.xyz);
+  let x = dot(v, V.right.xyz) / (z * V.pos.w * V.fwd.w);
+  let y = dot(v, V.up.xyz) / (z * V.pos.w);
+  return vec3<f32>((x + 1.0) * 0.5 * V.size.x, (1.0 - y) * 0.5 * V.size.y, z);
+}
+// Whether a sphere (centre c, radius r) lies across the line of sight from the camera to w.
+fn hides(w: vec3<f32>, c: vec3<f32>, r: f32) -> bool {
+  if (r <= 0.0) { return false; }
+  let v = w - V.pos.xyz;
+  let l = length(v);
+  let dir = v / l;
+  let oc = V.pos.xyz - c;
+  let b = dot(oc, dir);
+  let disc = b * b - (dot(oc, oc) - r * r);
+  if (disc < 0.0) { return false; }
+  let t0 = -b - sqrt(disc);
+  return t0 > 0.0 && t0 < l;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= SPARK_N) { return; }
+  let sp = pool.sparks[i];
+  if (sp.p.w <= 0.0 || sp.q.w < 0.0 || sp.v.w < 650.0) { return; }
+  let x = sp.p.xyz;
+  // (The worn ball's radius toward the spark.)
+  let toSpark = x - P.ball.xyz;
+  let rBall = select(0.0, wornRadius(toSpark / max(length(toSpark), 1e-6)), P.ball.w > 0.0);
+  if (hides(x, P.ball.xyz, rBall) || hides(x, P.refGrey.xyz, P.refGrey.w) || hides(x, P.refChrome.xyz, P.refChrome.w)) { return; }
+  let open = 0.5 * V.size.z;
+  let a = toScreen(x - sp.v.xyz * open);
+  let b = toScreen(x + sp.v.xyz * open);
+  if (a.z < 0.05 || b.z < 0.05) { return; }
+  // The soot between it and the camera.
+  let toCam = normalize(V.pos.xyz - x);
+  let dx = P.grid.x;
+  let n = vec3<f32>(P.dims.xyz);
+  var tau = 0.0;
+  for (var k = 0; k < 64; k++) {
+    let g = (x + toCam * (f32(k) + 0.5) * dx - P.origin.xyz) / dx;
+    if (any(g < vec3<f32>(0.0)) || any(g > n)) { break; }
+    tau += V.ext.x * max(scalAt(scal, samp, g).x, 0.0) * dx;
+  }
+  let pxPerM = V.size.y / (2.0 * max(a.z, 1e-3) * V.pos.w);
+  let r = 0.5 * sp.p.w * pxPerM;
+  let slot = atomicAdd(&drawArgs[1], 1u);
+  draws[slot * 3u] = vec4<f32>(a.xy, b.xy);
+  draws[slot * 3u + 1u] = vec4<f32>(sp.v.w, V.up.w * EPS_DRAWN * 3.14159265 * r * r, sqrt(0.25 + 0.25 * r * r), 0.0);
+  draws[slot * 3u + 2u] = vec4<f32>(exp(-tau * V.ext.yzw), 0.0);
+}
+`
+
+// One quad a spark, along its path and wide enough for its blur. Each pixel takes the spark's light spread evenly along
+// the path and blurred by a Gaussian a pixel wide (and as wide as its disc): the Gaussian integrated along the segment,
+// in closed form, so there is no sampling and nothing to average, and a spark narrower than a pixel keeps all its light,
+// a faint line rather than one that flickers in and out. Added into the sparks' texture.
+export const SPARK_DRAW = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> draws: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> size: vec4<f32>;
+${fireCommon(2)}
+struct SparkOut { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) id: u32 }
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> SparkOut {
+  let s0 = draws[ii * 3u];
+  let sig = draws[ii * 3u + 1u].z;
+  let a = s0.xy;
+  let b = s0.zw;
+  let along = b - a;
+  let len = length(along);
+  let dir = select(vec2<f32>(1.0, 0.0), along / max(len, 1e-6), len > 1e-4);
+  let across = vec2<f32>(-dir.y, dir.x);
+  let pad = 3.5 * sig + 1.0;
+  var corner = array<vec2<f32>, 6>(vec2<f32>(0.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0));
+  let c = corner[vi];
+  let p = mix(a - dir * pad, b + dir * pad, c.x) + across * pad * c.y;
+  var o: SparkOut;
+  o.pos = vec4<f32>(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0, 0.0, 1.0);
+  o.id = ii;
+  return o;
+}
+fn erfApprox(x: f32) -> f32 {
+  let a = abs(x);
+  let t = 1.0 / (1.0 + 0.3275911 * a);
+  return sign(x) * (1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a));
+}
+@fragment
+fn fs(i: SparkOut) -> @location(0) vec4<f32> {
+  let s0 = draws[i.id * 3u];
+  let s1 = draws[i.id * 3u + 1u];
+  let s2 = draws[i.id * 3u + 2u];
+  let a = s0.xy;
+  let b = s0.zw;
+  let sig = s1.z;
+  let along = b - a;
+  let len = length(along);
+  let r = i.pos.xy - a;
+  var w = 0.0;
+  if (len < 1e-3) {
+    w = exp(-dot(r, r) / (2.0 * sig * sig)) / (6.2831853 * sig * sig);
+  } else {
+    let dir = along / len;
+    let s = dot(r, dir);
+    let q = dot(r, vec2<f32>(-dir.y, dir.x));
+    w = exp(-q * q / (2.0 * sig * sig)) / (2.5066283 * sig) * 0.5 * (erfApprox(s / (1.4142136 * sig)) - erfApprox((s - len) / (1.4142136 * sig))) / len;
+  }
+  return clamp(vec4<f32>(planck(s1.x) * s1.y * s2.xyz * w, 0.0), vec4<f32>(0.0), vec4<f32>(65504.0));
 }
 `

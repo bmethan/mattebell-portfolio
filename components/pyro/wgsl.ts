@@ -3864,40 +3864,101 @@ fn sheetAt(n: vec3<f32>) -> f32 {
 // as sooty as the tongues it feeds).
 fn flameLayer(s: f32) -> f32 { return 0.008 + 0.022 * smoothstep(0.0, 1.0, s); }
 fn flameSoot(s: f32) -> f32 { return 3.0 * smoothstep(0.05, 0.5, s); }
+// The way the ball's flames go: up, at the 2 m/s buoyancy lifts them along the surface, carried with the air moving
+// past the ball (the gas's velocity at six points around it, less the ball's own as it is dragged), so they lean
+// downwind in a wind and trail behind a dragged ball; never more than some 70 degrees from the vertical. Worked out
+// once a pixel.
+var<private> flameAxisAt: vec4<f32>;
+fn gasVelAt(w: vec3<f32>) -> vec3<f32> {
+  return textureSampleLevel(velTex, samp, ((w - P.origin.xyz) / P.grid.x + 0.25) / (nF() + 1.0), 0.0).xyz;
+}
+fn flameAxis() -> vec3<f32> {
+  if (flameAxisAt.w > 0.5) { return flameAxisAt.xyz; }
+  let c = P.ball.xyz;
+  let o = P.ball.w + 1.5 * P.grid.x;
+  let u = (gasVelAt(c + vec3<f32>(o, 0.0, 0.0)) + gasVelAt(c - vec3<f32>(o, 0.0, 0.0)) + gasVelAt(c + vec3<f32>(0.0, 0.0, o))
+    + gasVelAt(c - vec3<f32>(0.0, 0.0, o)) + gasVelAt(c + vec3<f32>(0.0, o, 0.0)) + gasVelAt(c - vec3<f32>(0.0, o, 0.0))) / 6.0;
+  var a = vec3<f32>(0.0, 2.0, 0.0) + u - P.ballVel.xyz;
+  a.y = max(a.y, 0.35 * length(a.xz));
+  flameAxisAt = vec4<f32>(normalize(a), 1.0);
+  return flameAxisAt.xyz;
+}
+// v turned by the rotation that takes the unit vector a to straight up (back: the rotation back).
+fn turnUp(v: vec3<f32>, a: vec3<f32>, back: bool) -> vec3<f32> {
+  let k = select(1.0, -1.0, back) * vec3<f32>(-a.z, 0.0, a.x);
+  let s2 = dot(k, k);
+  if (s2 < 1e-8) { return v; }
+  return v * a.y + cross(k, v) + k * (dot(k, v) * (1.0 - a.y) / s2);
+}
 fn ballFlame(w: vec3<f32>) -> vec2<f32> {
   if (!ballBurns()) { return vec2<f32>(0.0); }
   let rel = w - P.ball.xyz;
   let dist = length(rel);
-  let d = dist - wornRadius(rel / max(dist, 1e-6));
+  let dir = rel / max(dist, 1e-6);
+  let d = dist - wornRadius(dir);
   if (d < 0.0 || d > BALL_FLAME_REACH) { return vec2<f32>(0.0); }
   var out = vec2<f32>(0.0);
-  // The layer along the surface: licks some 4 cm across and 20 cm long, rising over it at 2 m/s. (The noise has eight
-  // features across its texture, so a lick 4 cm across takes 1 / (8 x 0.04) = 3.1 of the texture a metre. Taken as
-  // one, they were drawn 5 mm across, and finer, rising at 0.4 m/s: the flames over the surface read as fine streaks,
-  // like a texture smeared upward.)
-  let s1 = sheetAt(rel / dist);
+  // The flame is laid out in its own frame, its up the way it goes (flameAxis); the fuel that feeds it is the ball's.
+  let a = flameAxis();
+  let relF = turnUp(rel, a, false);
+  let dirF = relF / max(dist, 1e-6);
+  let r0 = P.ball.w;
+  // It puffs: a fire D across sheds its flame 1.5 / sqrt(D) times a second (Cetegen and Ahmed), some 3 a second for the
+  // 22 cm ball, each puff carried up the flame as it goes.
+  let puffHz = 1.5 / sqrt(2.0 * r0);
+  // The layer along the surface. Its licks are laid along the surface's own flow, up from the ball's lowest point as
+  // the flame goes and over to its top (by the distance up it, and across the flow by where they are across the ball,
+  // so they keep their width and fewer fit round it toward the top), and slide up it at 2 m/s, so they spread round
+  // the lower half and gather over the upper half. Each is a tongue some 4 cm across and 8 cm long, cut from the noise
+  // where it runs high, wrinkled by more of it (the wrinkles changing as they rise), and lying along the surface: the
+  // layer shears, its gas further out carried further up, so each tongue leans up the surface the further out it is
+  // (some 1.5 cm along it for each centimetre out), and the layer is as thick as its fuel makes it. A puff passing up
+  // it brings more tongues and then fewer. (The noise has eight features across its texture: a lick 4 cm across takes
+  // 1 / (8 x 0.04) = 3.1 of the texture a metre, 8 cm long 1.6.) Where the flame begins little fuel has joined it: a
+  // thin sheet, smooth and nearly clear (laminar, its soot not yet formed); as more joins on the way up it wrinkles and
+  // breaks into separate tongues with the char between. Over the top, where the flows meet and leave as the plume, the
+  // tongues merge back into a sheet. (Laid in the world and slid straight up, the licks ran up the ball's face as even,
+  // parallel bands; laid by the way round the ball, they narrowed to hairs near the top; pushed straight out from the
+  // surface by their own strength, they stood off its rim as spikes, as though bursting from it; sheared 2.5 cm a
+  // centimetre out, they blurred into streaks seen face on.)
+  // (The fuel map read only within the thickest layer's reach, 3 cm: read at every step out to the plume's tips, it
+  // cost more than the layer itself.)
+  var s1 = 0.0;
+  if (d < 0.03) { s1 = sheetAt(dir); }
   let thick = flameLayer(s1);
   if (s1 > 0.0 && d < thick) {
-    let q = vec3<f32>(w.x * 3.125, (w.y - R.size.z * 2.0) * 0.625, w.z * 3.125);
-    let lick = smoothstep(0.5, 0.75, textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x);
+    let hz = length(dirF.xz);
+    let along = r0 * acos(clamp(-dirF.y, -1.0, 1.0));
+    let up = along - 2.0 * R.size.z - 1.5 * d;
+    let grown = smoothstep(0.0, 1.0, s1);
+    var q = vec3<f32>(dirF.x * r0 * 3.125, up * 1.56, dirF.z * r0 * 3.125);
+    let wrinkle = textureSampleLevel(noiseTex, noiseSamp, q * 1.3 + vec3<f32>(0.0, 0.0, 0.31 * R.size.z), 0.0).yz - 0.5;
+    q += vec3<f32>(wrinkle.x, 0.5 * wrinkle.y, wrinkle.y) * (0.05 + 0.2 * grown);
+    let v = textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x;
+    let puff = 0.05 * sin(6.2831853 * puffHz * (R.size.z - along / 2.0));
+    // (A sheet where the flame is young, and over the crown, within some 25 degrees of the top.)
+    let crown = select(0.0, 1.0 - smoothstep(0.15, 0.45, hz), dirF.y > 0.0);
+    let lick = mix(smoothstep(0.45 - puff, 0.68 - puff, v), 0.35 + 0.4 * v, max(1.0 - grown, crown));
     out = vec2<f32>(flameSoot(s1) * lick * (1.0 - smoothstep(0.5, 1.0, d / thick)), 1400.0 - 100.0 * d / thick);
   }
   // The tongues: over the top the flows from every side meet and leave the surface together, rising as a plume that
-  // narrows as it climbs (noise stretched upward and rising at 1.6 m/s, thinning toward the tips). Below the top they
-  // stay in the layer above, clinging. (Over the top as it has worn.)
-  let r = wornRadius(vec3<f32>(0.0, 1.0, 0.0));
-  let rho = length(rel.xz);
+  // narrows as it climbs (noise stretched along it and rising at 1.6 m/s, thinning toward the tips), taller and shorter
+  // as the puffs pass up it. Below the top they stay in the layer above, clinging. (Over the top as it has worn, and
+  // as the flame goes. The noise had risen at 0.9 m/s, against the 1.6 meant.)
+  let r = wornRadius(a);
+  let rho = length(relF.xz);
   let cap = 0.8 * r;
-  if (rel.y > 0.0 && rho < cap) {
+  if (relF.y > 0.0 && rho < cap) {
     let ys = sqrt(r * r - rho * rho);
-    let z = rel.y - ys;
-    let s2 = sheetAt(vec3<f32>(rel.x, ys, rel.z) / r);
+    let z = relF.y - ys;
+    let s2 = sheetAt(turnUp(vec3<f32>(relF.x, ys, relF.z) / r, a, true));
     if (z > 0.0 && s2 > 0.0) {
       // h runs to the uppermost tips, twice the height where flame is present half the time (2 to 12 cm).
-      let h = z / (2.1 * (0.02 + 0.10 * smoothstep(0.0, 1.0, s2)));
+      let puff = 1.0 + 0.2 * sin(6.2831853 * puffHz * (R.size.z - z / 1.6));
+      let h = z / (2.1 * (0.02 + 0.10 * smoothstep(0.0, 1.0, s2)) * puff);
       let edge = cap * (1.0 - 0.5 * h);
       if (h < 1.0 && rho < edge) {
-        let q = vec3<f32>(w.x * 7.0, (w.y - R.size.z * 1.6) * 1.8, w.z * 7.0);
+        let q = vec3<f32>(relF.x * 7.0, (relF.y - R.size.z * 1.6) * 1.8, relF.z * 7.0);
         let n = textureSampleLevel(noiseTex, noiseSamp, q, 0.0).x + 0.5 * (textureSampleLevel(noiseTex, noiseSamp, q * 2.3 + 0.37, 0.0).y - 0.5);
         let k = flameSoot(s2) * smoothstep(0.0, 0.15, n - 0.25 - 0.6 * h) * (1.0 - smoothstep(0.6, 1.0, rho / edge));
         if (k > out.x) { out = vec2<f32>(k, mix(1400.0, 1050.0, h)); }

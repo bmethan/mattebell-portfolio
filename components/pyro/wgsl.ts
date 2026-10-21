@@ -2056,14 +2056,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // surface, the end grain, the cells are as wide one way as the other. Its edges are bent by gradient noise (Perlin's,
 // the noise texture's) some 3 cm across, and roughened by more a few millimetres across, so that they wander as cracks
 // do rather than run straight from corner to corner; and each crack has a width of its own, from a hairline to twice
-// the mean. crackEdge returns how far n is from the nearest crack (0 on it, in the pattern's units) and that crack's
-// width over the mean; crackLine is 1 along a crack and 0 off it.
+// the mean. crackEdge returns how far n is from the nearest crack (0 on it, in the pattern's units), that crack's width
+// over the mean, and a number of the block n lies in, the same anywhere in it (0 to 1; the block is the pattern's cell,
+// named by its point, so burn-5 can find a block's columns); crackLine is 1 along a crack and 0 off it.
 const CHAR_CRACKS = /* wgsl */ `
 fn hash33(p: vec3<f32>) -> vec3<f32> {
   let q = vec3<f32>(dot(p, vec3<f32>(127.1, 311.7, 74.7)), dot(p, vec3<f32>(269.5, 183.3, 246.1)), dot(p, vec3<f32>(113.5, 271.9, 124.6)));
   return fract(sin(q) * 43758.5453);
 }
-fn crackEdge(n: vec3<f32>) -> vec2<f32> {
+fn crackEdge(n: vec3<f32>) -> vec3<f32> {
   let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
   // (Nine cells to the ball's radius as their mean, 6.7 across the grain and 12.1 along it. The noise has eight
   // features across its texture, so 0.45 of it to the radius bends the edges over some 3 cm, and 1.6, a few mm.)
@@ -2093,7 +2094,7 @@ fn crackEdge(n: vec3<f32>) -> vec2<f32> {
   // (A crack runs square to the line between the two cells' points: across the grain where that line runs along it.)
   let across = abs(dot(normalize(r2 - r1), axis));
   let width = (0.35 + 1.3 * hash33(c1 + c2 + 0.5).x) * mix(0.75, 1.25, across);
-  return vec2<f32>(sqrt(d2) - sqrt(d1), width);
+  return vec3<f32>(sqrt(d2) - sqrt(d1), width, hash33(c1 + 0.37).z);
 }
 fn crackLine(n: vec3<f32>) -> f32 {
   let e = crackEdge(n);
@@ -3826,20 +3827,23 @@ ${CHAR_CRACKS}
 // taken as straight across its width (the pattern's slope there). Returns how far down it met the char (0 at
 // the surface, 1 at the floor; -1 outside a crack), the surface's normal there, the crack's opening over its walls and
 // opening together, W / (W + 2 D), and how much of the light from outside reaches that far down: the view factor out of
-// a slot, sqrt(1 + x^2) - x, x its depth there over its width.
-struct CrackHit { depth: f32, n: vec3<f32>, slot: f32, view: f32, cover: f32 }
+// a slot, sqrt(1 + x^2) - x, x its depth there over its width. And the face's own normal: the blocks are domed, their
+// edges rounding down into the cracks over half the char layer's depth, as burnt wood's are (the char's hotter top has
+// shrunk more than its base, so each block's face curls), steepest at the crack, some 20 degrees; it is how fine crazing
+// reads in the light before its cracks are a pixel wide.
+struct CrackHit { depth: f32, n: vec3<f32>, slot: f32, view: f32, cover: f32, face: vec3<f32> }
 // A crack finer than the pixel (fp, the pixel's width across the surface, in m; 0 to take each line of sight as it
 // comes) takes its share of the pixel, cover: the overlap of a box the pixel's width with the crack's width. Drawn as
 // a groove only where a line of sight hits it, a crack under a pixel wide sparkles as the rays happen to hit it or
 // not; covering its share, the cracks read from afar as a faint darkening of the char, and as a glow when they glow.
-fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, cw: vec2<f32>, fp: f32) -> CrackHit {
-  var out = CrackHit(-1.0, nb, 1.0, 1.0, 0.0);
+fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, cw: vec2<f32>, e: vec3<f32>, fp: f32) -> CrackHit {
+  var out = CrackHit(-1.0, nb, 1.0, 1.0, 0.0, nb);
   let open = smoothstep(0.8, 2.5, sk.z);
   if (open <= 0.0 || cw.x <= 0.0) { return out; }
-  let e = crackEdge(normalize(lp));
   let e0 = e.x;
-  // (Far from any crack, in the pattern's units: its half-width at no more than 120 of them a metre.)
-  if (e0 >= 0.035 + 0.06 * cw.x * e.y + 6.0 * fp / P.ball.w) { return out; }
+  let rim = 0.0005 * cw.y * open;
+  // (Far from any crack and its rounded edges, in the pattern's units: no more than 120 of them a metre.)
+  if (e0 >= 0.035 + 0.06 * cw.x * e.y + 6.0 * fp / P.ball.w + 120.0 * rim) { return out; }
   let F = tangentFrame(nb);
   let de = 0.004;
   // How fast the pattern rises away from the crack's line, per metre along the surface.
@@ -3848,6 +3852,9 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, cw: vec2
   let across = (g.x * F[0] + g.y * F[1]) / gl;
   let x0 = e0 / gl;
   let w = 0.0005 * cw.x * e.y * open;
+  // (The block's edge rounding down toward the crack.)
+  let xe = max(x0 - w, 0.0) / max(rim, 1e-6);
+  out.face = normalize(nb - 0.36 * open * (1.0 - smoothstep(0.0, 1.0, xe)) * across);
   let cover = select(select(0.0, 1.0, x0 < w), clamp((min(x0 + 0.5 * fp, w) - max(x0 - 0.5 * fp, -w)) / max(fp, 1e-9), 0.0, 1.0), fp > 0.0);
   if (cover <= 0.0) { return out; }
   // (Into the crack, at the nearest point of it where the crack is finer than the pixel.)
@@ -3866,16 +3873,18 @@ fn crackHit(lp: vec3<f32>, nb: vec3<f32>, rd: vec3<f32>, sk: vec4<f32>, cw: vec2
     if (zw < z) { z = zw; nn = normalize(k * nb + across); }
   }
   let x = z / (2.0 * (w - k * z));
-  return CrackHit(z / floorD, nn, w / (w + floorD), sqrt(1.0 + x * x) - x, cover);
+  return CrackHit(z / floorD, nn, w / (w + floorD), sqrt(1.0 + x * x) - x, cover, out.face);
 }
 // The ash: a thin dusting of grains at first, greying the char evenly as far as it covers it, then, as it thickens into
-// a crust, plates that are there or have fallen. Its cover (the share of the surface BALL_HEAT has it covering) sets how
-// much of a pattern of plates some 2 cm across, ragged at a few millimetres, it fills; the plates form as the cover
-// passes a quarter to three fifths, so the char shows black and crazed before the ash greys it.
-fn ashPlates(lp: vec3<f32>, cover: f32) -> f32 {
-  let pn = textureSampleLevel(noiseTex, noiseSamp, lp * 1.3 + 0.5, 0.0).y + 0.35 * (textureSampleLevel(noiseTex, noiseSamp, lp * 6.0 + 0.2, 0.0).x - 0.5);
-  let th = 0.66 - 0.32 * cover;
-  return mix(0.6 * cover, smoothstep(th, th + 0.015, pn), smoothstep(0.25, 0.6, cover));
+// a crust, plates on the char's blocks that are there or have fallen, block by block, their edges ragged at a few
+// millimetres and pulled back from the cracks, as ash lies on embers. Its cover (the share of the surface BALL_HEAT has
+// it covering) sets the share of the blocks that hold it; the plates form as the cover passes a quarter to three fifths,
+// so the char shows black and crazed before the ash greys it. (e: crackEdge's, the block's number in its z.)
+fn ashPlates(lp: vec3<f32>, cover: f32, e: vec3<f32>) -> f32 {
+  let pn = e.z + 0.25 * (textureSampleLevel(noiseTex, noiseSamp, lp * 6.0 + 0.2, 0.0).x - 0.5);
+  let th = 1.0 - cover;
+  let plate = smoothstep(th, th + 0.03, pn) * smoothstep(0.02, 0.08, e.x);
+  return mix(0.6 * cover, plate, smoothstep(0.25, 0.6, cover));
 }
 fn woodAlbedo(lp: vec3<f32>, sk: vec4<f32>, crack: f32, soot: f32, ash: f32) -> vec3<f32> {
   let axis = normalize(vec3<f32>(0.35, 1.0, 0.2));
@@ -4002,11 +4011,14 @@ fn woodAt(p: vec3<f32>, rd: vec3<f32>, pixel: f32) -> WoodHit {
   let maps = ballMapsAt(dir);
   let lp = (p - P.ball.xyz) / P.ball.w;
   let sk = maps.skin;
-  let c = crackHit(lp, nb, rd, sk, maps.crack, pixel * distance(p, R.camPos.xyz) / max(-dot(rd, nb), 0.25));
-  let plates = ashPlates(lp, sk.w);
+  // (The crack pattern where the char has crazed or holds ash.)
+  var e = vec3<f32>(1.0, 1.0, 0.5);
+  if (sk.z > 0.8 || sk.w > 0.0) { e = crackEdge(normalize(lp)); }
+  let c = crackHit(lp, nb, rd, sk, maps.crack, e, pixel * distance(p, R.camPos.xyz) / max(-dot(rd, nb), 0.25));
+  let plates = ashPlates(lp, sk.w, e);
   var m = ballMat(lp, sk, c.cover, maps.soot, plates);
   m.base *= mix(1.0, c.view, c.cover);
-  return WoodHit(p, nb, m, normalize(mix(nb, c.n, c.cover)), charGlow(sk, maps.sheet, c, maps.crackT, plates));
+  return WoodHit(p, nb, m, normalize(mix(c.face, c.n, c.cover)), charGlow(sk, maps.sheet, c, maps.crackT, plates));
 }
 
 @vertex

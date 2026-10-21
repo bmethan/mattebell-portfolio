@@ -2163,10 +2163,11 @@ fn crackLine(n: vec3<f32>) -> f32 {
 // 0.248 exp(-39.8 kJ/mol / RT) kg per m2 a second (Chatani and Harada's measurement on larch, 2024: half a gram at
 // 500 C, next to nothing below 290 C), as the oxygen at the surface allows (to the power 0.68, as Rinta-Paavola and
 // colleagues took it) and no faster than the air brings it, releasing the heat of what it burns to, and leaving pine's
-// ash, 0.4% of the wood (0.2 to 0.7% measured in pine, spruce, birch and aspen; Werkelin and colleagues 2005). Under
-// the ball's own flames there is next to no oxygen, so its char burns once the flames die back, as measured (Richter
-// and colleagues 2021: a flame stops smouldering by taking the oxygen), and glows as embers do: brighter where the air
-// moves past it faster, as a breath over embers makes them flare.
+// ash, 0.4% of the wood (0.2 to 0.7% measured in pine, spruce, birch and aspen; Werkelin and colleagues 2005). The
+// ball's own flame takes the oxygen on its way in, so the char gets only what the flame leaves: none under a strong
+// flame, and its char burns once the flames die back, as measured (Richter and colleagues 2021: a flame stops
+// smouldering by taking the oxygen), and glows as embers do: brighter where the air moves past it faster, as a breath
+// over embers makes them flare.
 //
 // The fire's flames running up the ball are a wall flame too, as thin against it as its own: where the cell beside its
 // surface burns at a flame's own rate (heat released through a flame's volume runs about a megawatt per cubic metre,
@@ -2703,6 +2704,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // bonfire's bed at the solver's flame temperature, some 1200 C, where a log's runs 800 to 1000.
     tGas = mix(T_AMB + near.rise, min(T_AMB + near.rise, cA.y), below);
     o2 = clamp((Y_O2_AIR * (1.0 - near.z) - S_O2 * (near.z - near.fuel)) / Y_O2_AIR, 0.0, 1.0);
+    // The char has only the oxygen the patch's own flame leaves. That flame is a layer a few millimetres thick, far
+    // thinner than the gas's cells, so the cell beside the surface holds the ball's fuel and air mixed: taking its
+    // oxygen, the char burned under its own flames, and in the bonfire the ball wore 27 mm round its middle in 20
+    // minutes, charring 1.7 mm a minute (Eurocode 5 designs softwood for 0.65) at 80 to 140 kW. In the flame's layer,
+    // oxygen diffuses in through the air's film at the rate heat crosses it (h / cp kg per m2 a second, times its mass
+    // fraction), the wood's fuel diffuses out, and they meet in the flame, which burns 1.36 kg of oxygen a kg of fuel;
+    // the char has what is left (the boundary-layer flame of Spalding 1953 and Emmons 1956). Under a strong flame that
+    // is none, and the char waits, as the cone and furnace tests already have it; as the flame weakens toward going out,
+    // and in a breeze, oxygen gets through, and the embers take over.
+    o2 *= clamp(1.0 - S_O2 * burning(prev.y) / max(hConv / 1100.0 * Y_O2_AIR * o2, 1e-9), 0.0, 1.0);
   }
   // The char burning where it is bare, at last step's surface temperature: as its own chemistry allows (charKinetics,
   // measured in a cone's still air with that air's oxygen supply taken out), in series with the oxygen that reaches the

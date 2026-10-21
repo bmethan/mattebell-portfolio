@@ -3733,7 +3733,10 @@ fn ballFlame(w: vec3<f32>) -> vec2<f32> {
   // parallel bands; laid by the way round the ball, they narrowed to hairs near the top; pushed straight out from the
   // surface by their own strength, they stood off its rim as spikes, as though bursting from it; sheared 2.5 cm a
   // centimetre out, they blurred into streaks seen face on.)
-  let s1 = sheetAt(dir);
+  // (The fuel map read only within the thickest layer's reach, 3 cm: read at every step out to the plume's tips, it
+  // cost more than the layer itself.)
+  var s1 = 0.0;
+  if (d < 0.03) { s1 = sheetAt(dir); }
   let thick = flameLayer(s1);
   if (s1 > 0.0 && d < thick) {
     let hz = length(dirF.xz);

@@ -3686,9 +3686,12 @@ fn ballFlame(w: vec3<f32>) -> vec2<f32> {
   // The layer along the surface. Its licks are laid along the surface's own flow, up from the bottom of the ball and
   // over to its top (by the way round the ball and the distance up it), and slide up it at 2 m/s, so they spread round
   // the lower half and gather over the upper half. Each is a tongue some 4 cm across and 8 cm long, cut from the noise
-  // where it runs high, wrinkled by more of it (the wrinkles changing as they rise), and standing off the surface by
-  // its own strength, so the ball's rim is ragged. (The noise has eight features across its texture: a lick 4 cm across
-  // takes 1 / (8 x 0.04) = 3.1 of the texture a metre, 8 cm long 1.6.) Where the flame begins little fuel has joined
+  // where it runs high, wrinkled by more of it (the wrinkles changing as they rise), and lying along the surface: the
+  // layer shears, its gas further out carried further up, so each tongue leans up the surface the further out it is
+  // (some 2.5 cm along it for each centimetre out), and the layer is as thick as its fuel makes it. (Pushed straight
+  // out from the surface by their own strength, the tongues stood off the ball's rim as spikes, as though bursting from
+  // it.) (The noise has eight features across its texture: a lick 4 cm across takes 1 / (8 x 0.04) = 3.1 of the
+  // texture a metre, 8 cm long 1.6.) Where the flame begins little fuel has joined
   // it: a thin sheet, smooth and nearly clear (laminar, its soot not yet formed); as more joins on the way up it
   // wrinkles and breaks into separate tongues with the char between. Over the top, where the flows meet and leave as
   // the plume, the tongues merge back into a sheet. (Laid in the world and slid straight up, the licks ran up the ball's
@@ -3696,12 +3699,12 @@ fn ballFlame(w: vec3<f32>) -> vec2<f32> {
   let dir = rel / dist;
   let s1 = sheetAt(dir);
   let thick = flameLayer(s1);
-  if (s1 > 0.0 && d < 1.3 * thick) {
+  if (s1 > 0.0 && d < thick) {
     // (Across the flow, the licks are laid by where they are across the ball, so they keep their width and fewer fit
     // round it toward the top: laid by the way round, they narrowed to hairs there.)
     let r0 = P.ball.w;
     let hz = length(dir.xz);
-    let up = r0 * acos(clamp(-dir.y, -1.0, 1.0)) - 2.0 * R.size.z;
+    let up = r0 * acos(clamp(-dir.y, -1.0, 1.0)) - 2.0 * R.size.z - 2.5 * d;
     let grown = smoothstep(0.0, 1.0, s1);
     var q = vec3<f32>(dir.x * r0 * 3.125, up * 1.56, dir.z * r0 * 3.125);
     let wrinkle = textureSampleLevel(noiseTex, noiseSamp, q * 1.3 + vec3<f32>(0.0, 0.0, 0.31 * R.size.z), 0.0).yz - 0.5;
@@ -3710,10 +3713,7 @@ fn ballFlame(w: vec3<f32>) -> vec2<f32> {
     // (A sheet where the flame is young, and over the crown, within some 25 degrees of the top.)
     let crown = select(0.0, 1.0 - smoothstep(0.15, 0.45, hz), dir.y > 0.0);
     let lick = mix(smoothstep(0.42, 0.72, v), 0.35 + 0.4 * v, max(1.0 - grown, crown));
-    let top = thick * mix(0.35, 1.3, lick);
-    if (d < top) {
-      out = vec2<f32>(flameSoot(s1) * lick * (1.0 - smoothstep(0.6, 1.0, d / top)), 1400.0 - 100.0 * d / top);
-    }
+    out = vec2<f32>(flameSoot(s1) * lick * (1.0 - smoothstep(0.5, 1.0, d / thick)), 1400.0 - 100.0 * d / thick);
   }
   // The tongues: over the top the flows from every side meet and leave the surface together, rising as a plume that
   // narrows as it climbs (noise stretched upward and rising at 1.6 m/s, thinning toward the tips). Below the top they

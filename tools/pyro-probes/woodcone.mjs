@@ -3,10 +3,15 @@
 // air: air12.4), or the standard furnace fire (ISO 834). The wood's clock runs fast (the
 // engine's woodSpeed, development only), and one column is read as it goes: when it first gives off enough fuel to
 // flame, its surface temperature, how deep the char line (the 300 C isotherm) has gone, the char's own depth, and the
-// temperature below the char line, against which Janssens and White's profile, 20 + 280 (1 - x/a)^2, gives a.
+// temperature below the char line, against which Janssens and White's profile, 20 + 280 (1 - x/a)^2, gives a; and,
+// as the char shrinks and cracks, the char layer against the depth charred (fc, as fire tests report it: the char
+// line's depth less the wear, over the char line's depth) and its crack's width at the mouth and depth.
 // Measured, for southern pine at 8 to 9% moisture (Tran and White 1992; White and Dietenberger, Wood Handbook ch. 18):
 // 0.38 to 0.49 mm/min at 17.4 kW/m2, 0.54 at 25.2, 0.66 to 0.75 at 38.5, 0.77 to 0.85 at 55.5 (averaged to 36 mm), a
 // about 38 mm at 18 kW/m2 and 26.5 at 55; in the furnace about 0.8 mm/min (0.65 in Eurocode 5) and a about 33 mm.
+// Over time, White and Tran's fits to the same pine's char line (1996, Table 1; t in min, x in mm from the surface as
+// made): t = 2.27 x at 17 kW/m2, 0.79 x^1.2 at 26, 0.46 x^1.3 at 39, 0.31 x^1.4 at 56. Each row prints the fit's x at
+// that time, at the case's flux (m and a interpolated between theirs).
 import { launch, openLab, options } from './lib.mjs'
 
 const o = options(
@@ -53,6 +58,17 @@ try {
         e.woodAir = air ? airSpeed : 0
         e.newBall()
         const rows = []
+        // (White and Tran's pine: flux kW/m2, m, a; t = m x^a.)
+        const WT = [[17, 2.27, 1.0], [26, 0.79, 1.2], [39, 0.46, 1.3], [56, 0.31, 1.4]]
+        const fitAt = (q, tMin) => {
+          if (!(q > 0)) return null
+          let i = 0
+          while (i < WT.length - 2 && q > WT[i + 1][0]) i++
+          const f = Math.min(Math.max((q - WT[i][0]) / (WT[i + 1][0] - WT[i][0]), 0), 1)
+          const m = Math.exp(Math.log(WT[i][1]) + f * (Math.log(WT[i + 1][1]) - Math.log(WT[i][1])))
+          const a = WT[i][2] + f * (WT[i + 1][2] - WT[i][2])
+          return (tMin / m) ** (1 / a)
+        }
         let flamedAt = null
         let at644 = null
         let reached36 = null
@@ -111,20 +127,24 @@ try {
               density: +w.density.toFixed(3),
               at6mmC: at6 === null ? null : Math.round(at6 - 273),
               a: t40 === null || line === 0 ? null : +((t40 - line) / 0.7327).toFixed(1),
+              fc: line > 1 ? +((line - w.sheet[1]) / line).toFixed(3) : null,
+              wt: iso || air || chatani ? null : +fitAt(flux / 1000, tMin).toFixed(1),
+              crackW: w.crackWidth === undefined ? null : +w.crackWidth.toFixed(2),
+              crackD: w.crackDepth === undefined ? null : +w.crackDepth.toFixed(1),
             })
             nextRow += every
           }
           if (tMin >= minutes) break
         }
-        return { flamedAt, at644, reached36, rows }
+        return { flamedAt, at644, reached36, rows, cracks: (await e.readWood(dir)).cracks }
       },
       [c, Number(o.minutes), Number(o.speed), Number(o.every), Number(o.flame), o.dir.split(',').map(Number), Number(o.after), Number(o['air-speed'])],
     )
     const label = c === 'iso' ? 'ISO 834 furnace' : c === 'chatani' ? `Chatani and Harada (20 kW/m2 flaming 12 min, then ${o.after} flame out${Number(o['air-speed']) ? `, air at ${o['air-speed']} m/s` : ''})` : c.startsWith('air') ? `${c.slice(3)} kW/m2, flame out` : `${c} kW/m2 flaming${Number(o.flame) ? ` (+${o.flame} its flame)` : ''}`
     const avg36 = out.reached36 ? (36 / (out.reached36 / 60)).toFixed(2) : 'not reached'
     console.log(`${label}: flaming fuel (2 g/m2/s) at ${out.flamedAt?.toFixed(0) ?? 'never'} s, surface 644 K at ${out.at644?.toFixed(0) ?? 'never'} s, char line to 36 mm: ${avg36} mm/min`)
-    console.log(`  (the column read: its wood ${out.rows[0]?.density} times the mean density)`)
-    for (const r of out.rows) console.log(`  ${r.min} min  surface ${r.surfC} C  fuel ${r.fuel} g/m2/s  char line ${r.lineMm} mm (${r.rate} mm/min)  char ${r.charMm} mm  worn ${r.wearMm} mm  6 mm under the line ${r.at6mmC} C  a ${r.a} mm`)
+    console.log(`  (the column read: its wood ${out.rows[0]?.density} times the mean density${out.cracks === undefined ? '' : `, ${Math.round(out.cracks * 100)}% of it under cracks`})`)
+    for (const r of out.rows) console.log(`  ${r.min} min  surface ${r.surfC} C  fuel ${r.fuel} g/m2/s  char line ${r.lineMm} mm (${r.rate} mm/min)  char ${r.charMm} mm  worn ${r.wearMm} mm  6 mm under the line ${r.at6mmC} C  a ${r.a} mm${r.wt === null ? '' : `  (White and Tran ${r.wt} mm)`}${r.fc === null ? '' : `  fc ${r.fc}`}${r.crackW === null ? '' : `  crack ${r.crackW} mm wide, ${r.crackD} deep`}`)
     await page.close()
   }
 } finally {

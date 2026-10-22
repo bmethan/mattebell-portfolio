@@ -444,6 +444,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     url: 'https://doi.org/10.1016/j.firesaf.2017.03.024',
   },
   {
+    id: 'crielaard-self-extinction',
+    group: 'Burning ball',
+    authors: 'Roy Crielaard, Jan-Willem van de Kuilen, Karel Terwel, Geert Ravenshorst, Pascal Steenbakkers',
+    title: 'Self-extinguishment of cross-laminated timber',
+    venue: 'Fire Safety Journal 105, smouldering timber goes out with under 5 to 6 kW/m² from outside, in air slower than 0.5 m/s',
+    year: '2019',
+    url: 'https://doi.org/10.1016/j.firesaf.2019.01.008',
+  },
+  {
     id: 'petersen-banerjee',
     group: 'Burning ball',
     authors: 'Alec J. Petersen, Tirtha Banerjee',
@@ -740,6 +749,15 @@ export const PYRO_CITATIONS: PyroCitation[] = [
     venue: 'Wood & Fire Safety, 3rd International Conference, the char depth over time, t = m x^a, at 15 to 50 kW/m²',
     year: '1996',
     url: 'https://research.fs.usda.gov/download/treesearch/5978.pdf',
+  },
+  {
+    id: 'williams-softwood-transport',
+    group: 'Validation',
+    authors: 'C. Luke Williams, Tyler L. Westover, Lucia M. Petkovic, Austin C. Matthews, Daniel M. Stevens, Kelli R. Nelson',
+    title: 'Determining Thermal Transport Properties for Softwoods Under Pyrolysis Conditions',
+    venue: 'ACS Sustainable Chemistry & Engineering 5(1), six softwoods’ conductivity from 0.198 W/m K cold to 0.091 at 453 °C',
+    year: '2017',
+    url: 'https://doi.org/10.1021/acssuschemeng.6b02326',
   },
   {
     id: 'varunkumar',

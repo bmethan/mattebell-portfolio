@@ -2151,7 +2151,12 @@ fn crackLine(n: vec3<f32>) -> f32 {
 //  - heat capacity: wood 4.4 T - 414 J/(kg K), char 1430 + 0.355 T - 7.32e7 / T^2 (Fredlund's), water 4186;
 //  - conductivity: wood across the grain 3.57e-4 T + 0.0046 W/(m K), about 0.11 cold, and along the grain 1.46 times as
 //    much (Rinta-Paavola and Hostikka 2022 measured 0.259 along it, 0.171 and 0.184 across); char 8.2e-5 T + 0.091
-//    (Alves and Figueiredo's, for pine char);
+//    (Alves and Figueiredo's, for pine char), 0.151 at 453 C. Williams and colleagues measured six softwoods at 0.091
+//    there (2017); scaled to that, the standard furnace's char line came to the 0.81 mm a minute measured for southern
+//    pine (0.76 to 0.89 across the grain, against 0.92 to 1.03 with this), but the cone's, allowing 15 kW/m2 for the
+//    sample's own flame, ran 11 to 30% slower than White and Tran's fits (within 12% with this), and the ball in the
+//    bonfire charred 0.53 mm a minute round its middle (0.64 with this; Eurocode 5 designs softwood for 0.65), so
+//    this is kept;
 //  - emissivity: wood 0.9, char 0.838.
 // The reactions run exactly over each step at the cell's temperature. Heat moves through each column implicitly (a
 // tridiagonal solve, stable at any step), and between neighbouring columns explicitly: along the surface it varies
@@ -2167,7 +2172,10 @@ fn crackLine(n: vec3<f32>) -> f32 {
 // ball's own flame takes the oxygen on its way in, so the char gets only what the flame leaves: none under a strong
 // flame, and its char burns once the flames die back, as measured (Richter and colleagues 2021: a flame stops
 // smouldering by taking the oxygen), and glows as embers do: brighter where the air moves past it faster, as a breath
-// over embers makes them flare.
+// over embers makes them flare. Pulled from the fire into still air, though, a lone ball goes dark with its flames:
+// the oxygen the air's film brings lets its char burn some 25 to 30 kW/m2, while at 800 C it radiates twice that, and
+// smouldering timber goes out with less than 5 to 6 kW/m2 reaching it from outside and the air past it slower than
+// half a metre a second (Crielaard and colleagues 2019). Embers that last have others round them to share heat with.
 //
 // The fire's flames running up the ball are a wall flame too, as thin against it as its own: where the cell beside its
 // surface burns at a flame's own rate (heat released through a flame's volume runs about a megawatt per cubic metre,
@@ -2436,14 +2444,14 @@ fn crackBurn(tc: f32, aw: f32, o2: f32, h: f32, d: f32) -> f32 {
 // fir did (some 370 glowing tracks a second from about 2.9 MW). A further share collects on the surface as loose
 // flakes, up to a limit (more where it is cracked), which air moving past the surface faster than 0.6 m/s strips, by the
 // square of the excess, and a jolt of the ball shakes off: in the bonfire's own flow it never collects and simply adds
-// to the stream (the two shares together are 1.7% of the char); on embers in still air it builds over half a minute, and
+// to the stream (the two shares together are 2.2% of the char); on embers in still air it builds over half a minute, and
 // a stir or a drag throws it as a shower. (Nobody has measured the showers stirring throws: its rates are set by eye.)
 // Counted in the gas's time from one wood step to the next at the wood's own rates, so a time-lapse throws them as the
 // real burn would. Each leaves its patch a couple of millimetres out, at 0.1 to 0.5 m/s about the outward normal plus
 // the ball's own velocity, at the char's temperature (a crack's walls' if it comes from a crack), and at a moment spread
 // over the gas's time until the next wood step.
-const SPARK_SHARE = 0.0063;
-const LOOSE_SHARE = 0.0106;
+const SPARK_SHARE = 0.0084;
+const LOOSE_SHARE = 0.0141;
 const LOOSE_MAX = 0.001; // kg/m2 (a few micrometres of char's worth), times 0.3 plus the column's crack share
 const SPARK_CRACKS = 4.0;
 const SHEAR_FROM = 0.6; // m/s
@@ -2462,7 +2470,7 @@ fn emitSparks(t: u32, n: vec3<f32>, east: vec3<f32>, down: vec3<f32>, surface: v
   let shed = loose * (1.0 - exp(-strip * gasDt));
   pool.loose[t] = loose - shed;
   let lam = (SPARK_SHARE * rate * gasDt + shed) * area / SPARK_MEAN_MASS;
-  // How many this step (Poisson, usually none: the ball's 24,576 patches throw some 130 a second between them).
+  // How many this step (Poisson, usually none: the ball's 24,576 patches throw some 60 a second between them).
   let seed = P.dims.w;
   var k = 0u;
   var pk = exp(-lam);
@@ -2712,7 +2720,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // fraction), the wood's fuel diffuses out, and they meet in the flame, which burns 1.36 kg of oxygen a kg of fuel;
     // the char has what is left (the boundary-layer flame of Spalding 1953 and Emmons 1956). Under a strong flame that
     // is none, and the char waits, as the cone and furnace tests already have it; as the flame weakens toward going out,
-    // and in a breeze, oxygen gets through, and the embers take over.
+    // and in a breeze, oxygen gets through, and the char burns. (Letting air reach the char a share of the time under
+    // the flame, as a flickering flame might, 30% or 50% of what the film brings, wore the ball 6.7 or 9.8 mm round its
+    // middle in 20 minutes instead of 5.1, and its embers out of the fire went dark as soon.)
     o2 *= clamp(1.0 - S_O2 * burning(prev.y) / max(hConv / 1100.0 * Y_O2_AIR * o2, 1e-9), 0.0, 1.0);
   }
   // The char burning where it is bare, at last step's surface temperature: as its own chemistry allows (charKinetics,

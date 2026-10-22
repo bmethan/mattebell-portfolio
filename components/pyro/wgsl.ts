@@ -4138,14 +4138,16 @@ fn envBRDF(f0: f32, rough: f32, nv: f32) -> f32 {
   return f0 * ab.x + ab.y;
 }
 // The surroundings' radiance about a reflected direction, blurred by the lobe: the environment's harmonics with each
-// band weighted as for a Gaussian of the lobe's width (alpha); or the flat sky above, the lit floor below.
+// band weighted as for a Gaussian of the lobe's width (alpha); or the flat sky above, the lit floor below, the horizon
+// between them blurred alike, by the share of such a lobe above it. (Chosen by the reflected direction alone, the sky's
+// edge cut a hard line across a rough surface: across the charred ball's middle, its sheen pale above and dark below.)
 fn glossyEnv(r: vec3<f32>, rough: f32) -> vec3<f32> {
   if (envOn()) {
     let s2 = sq(rough * rough);
     return shAt(toEnv(r), 1.0, exp(-s2), exp(-3.0 * s2));
   }
   let sky = R.skyCol.xyz * INV_PI * mix(1.25, 0.75, sqrt(max(r.y, 0.0)));
-  return select(R.floorCol.xyz * R.skyCol.xyz * INV_PI, sky, r.y > 0.0);
+  return mix(R.floorCol.xyz * R.skyCol.xyz * INV_PI, sky, normCdf(r.y / max(rough * rough, 1e-3)));
 }
 // The fuzz's lobe toward light from l (normalized: it integrates to 1), in the surface's frame F.
 fn fuzzLobe(F: mat3x3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32) -> f32 {
